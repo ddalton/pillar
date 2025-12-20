@@ -14,6 +14,7 @@ pillar-proto = { path = "../pillar-proto" }
 pillar-common = { path = "../pillar-common" }
 
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 
@@ -31,6 +32,7 @@ tracing-subscriber = { workspace = true }
 
 clap = { workspace = true }
 uuid = { workspace = true }
+hostname = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"

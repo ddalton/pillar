@@ -1,0 +1,46 @@
+{{- if .Values.csiDriver.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pillar.fullname" . }}-csi-controller
+  labels:
+    app: {{ include "pillar.name" . }}-csi-controller
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.csiDriver.controller.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "pillar.name" . }}-csi-controller
+  template:
+    metadata:
+      labels:
+        app: {{ include "pillar.name" . }}-csi-controller
+    spec:
+      serviceAccountName: {{ include "pillar.fullname" . }}-csi-controller
+      containers:
+      - name: csi-provisioner
+        image: registry.k8s.io/sig-storage/csi-provisioner:v3.6.0
+        args:
+        - --csi-address=/csi/csi.sock
+        - --v=5
+        - --timeout=150s
+        - --leader-election
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /csi
+      - name: pillar-csi-driver
+        image: "{{ .Values.csiDriver.image.repository }}:{{ .Values.csiDriver.image.tag }}"
+        imagePullPolicy: {{ .Values.csiDriver.image.pullPolicy }}
+        args:
+        - --mode=controller
+        - --socket=/csi/csi.sock
+        - --namenode={{ include "pillar.fullname" . }}-namenode:{{ .Values.namenode.rpcPort }}
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /csi
+        resources:
+          {{- toYaml .Values.csiDriver.controller.resources | nindent 10 }}
+      volumes:
+      - name: socket-dir
+        emptyDir: {}
+{{- end }}

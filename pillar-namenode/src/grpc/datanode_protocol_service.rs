@@ -1,0 +1,209 @@
+use std::sync::Arc;
+use tonic::{Request, Response, Status};
+use tracing::{info, warn};
+
+use crate::datanode::DatanodeManager;
+use crate::metadata::BlockManager;
+use crate::metadata::block_manager::{BlockId, DatanodeId};
+use crate::datanode::manager::StorageInfo;
+
+/// DatanodeProtocol service - handles communication from DataNodes to NameNode
+pub struct DatanodeProtocolService {
+    datanode_manager: Arc<DatanodeManager>,
+    block_manager: Arc<BlockManager>,
+}
+
+impl DatanodeProtocolService {
+    pub fn new(
+        datanode_manager: Arc<DatanodeManager>,
+        block_manager: Arc<BlockManager>,
+    ) -> Self {
+        Self {
+            datanode_manager,
+            block_manager,
+        }
+    }
+
+    /// Handle datanode registration
+    pub async fn handle_register_datanode(
+        &self,
+        uuid: String,
+        hostname: String,
+        rpc_port: u16,
+        capacity: u64,
+    ) -> Result<(), Status> {
+        let datanode_id = DatanodeId::new(uuid.clone(), hostname.clone(), rpc_port);
+
+        self.datanode_manager
+            .register(datanode_id, capacity)
+            .map_err(|e| Status::internal(format!("Registration failed: {}", e)))?;
+
+        info!("Registered datanode: {} ({}:{})", uuid, hostname, rpc_port);
+
+        Ok(())
+    }
+
+    /// Handle heartbeat from datanode
+    pub async fn handle_heartbeat(
+        &self,
+        uuid: String,
+        capacity: u64,
+        used: u64,
+        remaining: u64,
+        block_pool_used: u64,
+        xceiver_count: u32,
+        failed_volumes: u32,
+    ) -> Result<Vec<DatanodeCommand>, Status> {
+        let storage = StorageInfo {
+            capacity,
+            used,
+            remaining,
+            block_pool_used,
+        };
+
+        self.datanode_manager
+            .heartbeat(&uuid, storage, xceiver_count, failed_volumes)
+            .map_err(|e| Status::internal(format!("Heartbeat failed: {}", e)))?;
+
+        // For now, return empty command list
+        // In full implementation, this would return commands like:
+        // - DNA_TRANSFER: replicate blocks
+        // - DNA_INVALIDATE: delete blocks
+        // - DNA_SHUTDOWN: shutdown datanode
+        Ok(Vec::new())
+    }
+
+    /// Handle block report from datanode
+    pub async fn handle_block_report(
+        &self,
+        uuid: String,
+        blocks: Vec<(u64, u64, u64)>, // (block_id, generation_stamp, num_bytes)
+    ) -> Result<(), Status> {
+        let datanode_id = self.datanode_manager
+            .get_datanode(&uuid)
+            .ok_or_else(|| Status::not_found(format!("Datanode not found: {}", uuid)))?
+            .id;
+
+        info!("Received block report from {}: {} blocks", uuid, blocks.len());
+
+        for (block_id, generation_stamp, num_bytes) in blocks {
+            let block = BlockId::new(block_id, generation_stamp);
+
+            // Report block to block manager
+            self.block_manager.report_block(
+                datanode_id.clone(),
+                block,
+                num_bytes,
+            );
+
+            // Add block to datanode's block list
+            let _ = self.datanode_manager.add_block_to_datanode(&uuid, block);
+        }
+
+        Ok(())
+    }
+
+    /// Handle block received notification
+    pub async fn handle_block_received(
+        &self,
+        uuid: String,
+        block_id: u64,
+        generation_stamp: u64,
+        num_bytes: u64,
+    ) -> Result<(), Status> {
+        let block = BlockId::new(block_id, generation_stamp);
+
+        let datanode_id = self.datanode_manager
+            .get_datanode(&uuid)
+            .ok_or_else(|| Status::not_found(format!("Datanode not found: {}", uuid)))?
+            .id;
+
+        // Add block location
+        self.block_manager.add_block_location(block, datanode_id);
+
+        // Add to datanode's block list
+        self.datanode_manager
+            .add_block_to_datanode(&uuid, block)
+            .map_err(|e| Status::internal(format!("Failed to add block: {}", e)))?;
+
+        info!("DataNode {} received block {}", uuid, block_id);
+
+        Ok(())
+    }
+
+    /// Handle error report from datanode
+    pub async fn handle_error_report(
+        &self,
+        uuid: String,
+        error_message: String,
+    ) -> Result<(), Status> {
+        warn!("Error from datanode {}: {}", uuid, error_message);
+        Ok(())
+    }
+}
+
+/// Commands that NameNode can send to DataNode
+#[derive(Debug, Clone)]
+pub enum DatanodeCommand {
+    /// Transfer blocks to another datanode
+    Transfer { blocks: Vec<BlockId>, target: DatanodeId },
+
+    /// Delete invalid blocks
+    Invalidate { blocks: Vec<BlockId> },
+
+    /// Shutdown the datanode
+    Shutdown,
+
+    /// Request full block report
+    RequestBlockReport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_datanode_registration() {
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let service = DatanodeProtocolService::new(datanode_manager.clone(), block_manager);
+
+        service.handle_register_datanode(
+            "dn1".to_string(),
+            "host1".to_string(),
+            9000,
+            1_000_000_000,
+        ).await.unwrap();
+
+        let node = datanode_manager.get_datanode("dn1").unwrap();
+        assert_eq!(node.id.uuid, "dn1");
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat() {
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let service = DatanodeProtocolService::new(datanode_manager.clone(), block_manager);
+
+        // Register first
+        service.handle_register_datanode(
+            "dn1".to_string(),
+            "host1".to_string(),
+            9000,
+            1_000_000_000,
+        ).await.unwrap();
+
+        // Send heartbeat
+        let commands = service.handle_heartbeat(
+            "dn1".to_string(),
+            1_000_000_000,
+            500_000_000,
+            500_000_000,
+            500_000_000,
+            5,
+            0,
+        ).await.unwrap();
+
+        assert_eq!(commands.len(), 0); // No commands for now
+    }
+}

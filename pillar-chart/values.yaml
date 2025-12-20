@@ -1,0 +1,137 @@
+## Pillar HDFS Configuration
+
+## NameNode Configuration
+namenode:
+  image:
+    repository: pillar/namenode
+    tag: v0.1.0
+    pullPolicy: IfNotPresent
+
+  replicas: 1  # Single replica for MVP, can add HA later
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 8Gi
+
+  # RPC port (HDFS protocol)
+  rpcPort: 9000
+
+  # HTTP UI port
+  httpPort: 9870
+
+  # Metadata storage
+  metadata:
+    # Storage class for metadata (can use Flint or default)
+    storageClass: ""
+    size: 10Gi
+
+  # HDFS configuration
+  hdfs:
+    blockSize: 128  # Block size in MB
+    replication: 3  # Default replication factor
+
+## DataNode Configuration
+datanode:
+  image:
+    repository: pillar/datanode
+    tag: v0.1.0
+    pullPolicy: IfNotPresent
+
+  # DaemonSet - runs on every node
+  # Each DataNode gets its own Flint RWO volume
+
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 4Gi
+    limits:
+      cpu: 4000m
+      memory: 16Gi
+
+  # RPC port
+  rpcPort: 9867
+
+  # Data transfer port (block I/O)
+  dataPort: 50010
+
+  # HTTP UI port
+  httpPort: 50075
+
+  # Storage configuration (per DataNode)
+  storage:
+    # Underlying storage class (Flint RWO volumes)
+    storageClass: flint
+    # Size per DataNode (adjust based on node capacity)
+    size: 100Gi
+    # Block pool ID
+    blockPoolId: BP-pillar-001
+
+## CSI Driver Configuration
+csiDriver:
+  enabled: true
+
+  image:
+    repository: pillar/csi-driver
+    tag: v0.1.0
+    pullPolicy: IfNotPresent
+
+  controller:
+    replicas: 1
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  node:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+  # CSI driver name
+  driverName: pillar.csi.hdfs.io
+
+  # Socket paths
+  socketDir: /var/lib/kubelet/plugins/pillar.csi.hdfs.io
+
+## Service Configuration
+service:
+  # NameNode service type (ClusterIP for direct client access)
+  namenode:
+    type: ClusterIP
+    rpcPort: 9000
+    httpPort: 9870
+
+  # DataNode service type (Headless for direct pod access)
+  datanode:
+    type: ClusterIP
+    clusterIP: None  # Headless service
+    rpcPort: 9867
+    dataPort: 50010
+    httpPort: 50075
+
+## Storage Classes
+storageClass:
+  # Create a StorageClass for Pillar volumes
+  create: true
+  name: pillar
+  # Reclaim policy
+  reclaimPolicy: Delete
+  # Volume binding mode
+  volumeBindingMode: Immediate
+  # Allow volume expansion
+  allowVolumeExpansion: true
+  # Parameters passed to CSI driver
+  parameters:
+    replicationFactor: "3"

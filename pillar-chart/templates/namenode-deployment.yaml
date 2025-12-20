@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pillar.fullname" . }}-namenode
+  labels:
+    app: {{ include "pillar.name" . }}-namenode
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "pillar.fullname" . }}-namenode
+  replicas: {{ .Values.namenode.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "pillar.name" . }}-namenode
+  template:
+    metadata:
+      labels:
+        app: {{ include "pillar.name" . }}-namenode
+    spec:
+      containers:
+      - name: namenode
+        image: "{{ .Values.namenode.image.repository }}:{{ .Values.namenode.image.tag }}"
+        imagePullPolicy: {{ .Values.namenode.image.pullPolicy }}
+        args:
+        - --rpc-addr=0.0.0.0:{{ .Values.namenode.rpcPort }}
+        - --http-addr=0.0.0.0:{{ .Values.namenode.httpPort }}
+        - --metadata-path=/var/lib/pillar/metadata/metadata.db
+        - --replication={{ .Values.namenode.hdfs.replication }}
+        - --block-size-mb={{ .Values.namenode.hdfs.blockSize }}
+        ports:
+        - name: rpc
+          containerPort: {{ .Values.namenode.rpcPort }}
+          protocol: TCP
+        - name: http
+          containerPort: {{ .Values.namenode.httpPort }}
+          protocol: TCP
+        volumeMounts:
+        - name: metadata
+          mountPath: /var/lib/pillar/metadata
+        resources:
+          {{- toYaml .Values.namenode.resources | nindent 10 }}
+        livenessProbe:
+          tcpSocket:
+            port: rpc
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: rpc
+          initialDelaySeconds: 10
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: metadata
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      {{- if .Values.namenode.metadata.storageClass }}
+      storageClassName: {{ .Values.namenode.metadata.storageClass }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.namenode.metadata.size }}

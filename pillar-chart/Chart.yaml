@@ -1,0 +1,17 @@
+apiVersion: v2
+name: pillar
+description: Pillar HDFS - High-performance drop-in replacement for Apache Hadoop HDFS in Rust
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - hdfs
+  - hadoop
+  - storage
+  - distributed-filesystem
+  - big-data
+home: https://github.com/ddalton/pillar
+sources:
+  - https://github.com/ddalton/pillar
+maintainers:
+  - name: Pillar HDFS Team

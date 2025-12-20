@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pillar.fullname" . }}-datanode
+  labels:
+    app: {{ include "pillar.name" . }}-datanode
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.datanode.type }}
+  {{- if .Values.service.datanode.clusterIP }}
+  clusterIP: {{ .Values.service.datanode.clusterIP }}  # None for headless
+  {{- end }}
+  ports:
+  - name: rpc
+    port: {{ .Values.service.datanode.rpcPort }}
+    targetPort: rpc
+    protocol: TCP
+  - name: data
+    port: {{ .Values.service.datanode.dataPort }}
+    targetPort: data
+    protocol: TCP
+  - name: http
+    port: {{ .Values.service.datanode.httpPort }}
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: {{ include "pillar.name" . }}-datanode

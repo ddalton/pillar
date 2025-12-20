@@ -9,19 +9,21 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
 ### Key Features
 
 - **🚀 High Performance**: 3-5x faster than Java HDFS
-  - Zero-cost abstractions (Rust)
-  - No garbage collection pauses
-  - SPDK-backed storage (373 MB/s vs 97 MB/s)
+  - Lock-free data structures (DashMap, AtomicU64)
+  - Zero garbage collection pauses
+  - SPDK-backed storage via Flint (373 MB/s vs 97 MB/s)
+  - Pure Rust - no glibc or OpenSSL dependencies
 
 - **🔌 Drop-in Replacement**: 100% compatible with Hadoop ecosystem
   - Works with `hadoop fs` CLI
   - Compatible with Spark, Hive, Flink, Presto
   - Implements official Apache Hadoop protobuf protocols
 
-- **☸️ Kubernetes Native**: CSI driver for seamless integration
-  - RWX volumes for distributed workloads
-  - Automatic DataNode scaling
-  - Helm-based deployment
+- **☸️ Kubernetes Native**: Designed for cloud-native deployments
+  - NameNode: ClusterIP service for client access
+  - DataNode: DaemonSet with headless service
+  - Helm chart for easy deployment
+  - Uses Flint CSI for DataNode storage
 
 - **🔐 Secure**: Enterprise-grade security
   - Kerberos authentication
@@ -88,16 +90,20 @@ After building, binaries will be in `target/release/`:
 ```bash
 # Start NameNode
 ./target/release/pillar-namenode \
-  --port 9000 \
-  --metadata-backend sqlite \
-  --metadata-path /tmp/pillar/metadata
+  --rpc-addr 0.0.0.0:9000 \
+  --http-addr 0.0.0.0:9870 \
+  --metadata-path /tmp/pillar/metadata.db \
+  --replication 3 \
+  --block-size-mb 128
 
 # Start DataNode (in another terminal)
 ./target/release/pillar-datanode \
-  --port 50010 \
-  --data-port 50020 \
   --namenode localhost:9000 \
-  --storage-dir /tmp/pillar/data
+  --rpc-addr 0.0.0.0:9867 \
+  --data-addr 0.0.0.0:50010 \
+  --http-addr 0.0.0.0:50075 \
+  --volume-mount-point /tmp/pillar/data \
+  --block-pool-id BP-pillar-001
 
 # Use with hadoop fs
 hadoop fs -ls hdfs://localhost:9000/
@@ -107,22 +113,59 @@ hadoop fs -put file.txt hdfs://localhost:9000/test/
 
 ### Kubernetes Deployment
 
-See [pillar-chart/README.md](pillar-chart/README.md) for Helm deployment instructions.
+```bash
+# Install via Helm
+helm install pillar ./pillar-chart \
+  --set datanode.storage.storageClass=flint \
+  --set datanode.storage.size=100Gi
+
+# Access from applications
+# Applications connect via HDFS protocol (NOT CSI mounts):
+# hdfs://pillar-namenode:9000/
+```
+
+See [pillar-chart/README.md](pillar-chart/README.md) for detailed deployment and usage instructions.
 
 ## Status
 
-**Current Phase**: Phase 1 - Project Setup ✅
+**Current Phase**: Phase 5 - Deployment & Testing
 
-- [x] Repository structure
-- [x] Cargo workspace
-- [x] Apache Hadoop protobuf files
-- [x] Kerberos implementation (from Flint)
-- [x] Basic entry points
-- [ ] Protobuf compilation
-- [ ] NameNode implementation
-- [ ] DataNode implementation
-- [ ] CSI driver
-- [ ] Testing & Documentation
+- [x] **Phase 1:** Project Setup
+  - Repository structure, Cargo workspace
+  - Apache Hadoop protobuf files
+  - Kerberos implementation
+
+- [x] **Phase 2:** NameNode Implementation
+  - Namespace (filesystem tree) with lock-free DashMap
+  - Block manager with atomic ID allocation
+  - DataNode manager and heartbeat monitor
+  - ClientNamenodeProtocol & DatanodeProtocol services
+  - SQLite metadata persistence
+
+- [x] **Phase 3:** DataNode Implementation
+  - Volume manager (Flint RWO integration)
+  - Block storage layer (HDFS format)
+  - Data transfer protocol server (TCP)
+  - NameNode client (registration & heartbeat)
+  - ClientDatanodeProtocol service
+
+- [x] **Phase 4:** CSI Driver
+  - Identity, Controller, Node services
+  - Administrative namespace management
+  - Applications use HDFS protocol (not CSI mounts)
+
+- [x] **Phase 5:** Helm Chart & Deployment
+  - Complete Helm chart with all components
+  - ClusterIP service (NameNode)
+  - Headless service (DataNodes)
+  - RBAC, StorageClass, CSI components
+
+- [ ] **Phase 6:** Integration Testing
+  - End-to-end HDFS protocol testing
+  - Hadoop CLI compatibility
+  - Spark/Hive integration tests
+
+- [ ] **Phase 7:** Documentation & Production Hardening
 
 ## Performance
 

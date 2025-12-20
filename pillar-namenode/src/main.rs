@@ -1,65 +1,114 @@
+mod metadata;
+mod datanode;
+mod grpc;
+mod server;
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
 use clap::Parser;
 use tracing::{info, error};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, EnvFilter};
+
+use server::{NameNode, NameNodeConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "pillar-namenode")]
-#[command(about = "Pillar HDFS NameNode - Rust implementation of Apache Hadoop HDFS NameNode", long_about = None)]
+#[clap(name = "pillar-namenode")]
+#[clap(about = "Pillar HDFS NameNode - Drop-in replacement for Apache Hadoop HDFS NameNode in Rust", long_about = None)]
 struct Args {
-    /// NameNode RPC port
-    #[arg(long, default_value = "9000")]
-    port: u16,
+    /// RPC server address
+    #[clap(long, default_value = "0.0.0.0:9000")]
+    rpc_addr: String,
 
-    /// Metadata storage backend (sqlite or etcd)
-    #[arg(long, default_value = "sqlite")]
-    metadata_backend: String,
+    /// HTTP server address (UI and metrics)
+    #[clap(long, default_value = "0.0.0.0:9870")]
+    http_addr: String,
 
-    /// Metadata storage path (for sqlite) or etcd endpoints (comma-separated)
-    #[arg(long, default_value = "/var/lib/pillar/metadata")]
-    metadata_path: String,
+    /// Metadata storage path
+    #[clap(long, default_value = "/var/lib/pillar/namenode/metadata.db")]
+    metadata_path: PathBuf,
 
-    /// Block pool ID
-    #[arg(long, default_value = "BP-pillar-001")]
-    block_pool_id: String,
+    /// Default replication factor
+    #[clap(long, default_value = "3")]
+    replication: u16,
 
-    /// Cluster ID
-    #[arg(long, default_value = "CL-pillar")]
-    cluster_id: String,
+    /// Default block size in MB
+    #[clap(long, default_value = "128")]
+    block_size_mb: u64,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[clap(long, default_value = "info")]
+    log_level: String,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pillar_namenode=info,tower_http=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
+async fn main() -> Result<()> {
+    // Parse command line arguments
     let args = Args::parse();
 
+    // Initialize logging
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_level(true)
+        .init();
+
     info!("Starting Pillar HDFS NameNode");
-    info!("  Port: {}", args.port);
-    info!("  Metadata backend: {}", args.metadata_backend);
-    info!("  Metadata path: {}", args.metadata_path);
-    info!("  Block pool ID: {}", args.block_pool_id);
-    info!("  Cluster ID: {}", args.cluster_id);
+    info!("Version: {}", env!("CARGO_PKG_VERSION"));
 
-    info!("NameNode initialization complete");
-    info!("Waiting for DataNode registrations...");
+    // Parse addresses
+    let rpc_addr: SocketAddr = args.rpc_addr.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid RPC address: {}", e))?;
+    let http_addr: SocketAddr = args.http_addr.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid HTTP address: {}", e))?;
 
-    // TODO: Initialize NameNode components
-    // - Metadata store
-    // - Namespace
-    // - Block manager
-    // - DataNode manager
-    // - gRPC services (ClientNamenodeProtocol, DatanodeProtocol)
+    // Create configuration
+    let config = NameNodeConfig {
+        rpc_addr,
+        http_addr,
+        metadata_path: args.metadata_path,
+        default_replication: args.replication,
+        default_block_size: args.block_size_mb * 1024 * 1024,
+    };
 
-    // Keep the server running
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down NameNode");
+    // Create and start NameNode
+    let namenode = Arc::new(NameNode::new(config).await?);
+
+    info!("NameNode initialized successfully");
+
+    // Print startup banner
+    print_banner(&namenode);
+
+    // Start the server
+    if let Err(e) = namenode.start().await {
+        error!("NameNode failed: {}", e);
+        return Err(e);
+    }
 
     Ok(())
+}
+
+fn print_banner(namenode: &NameNode) {
+    let stats = namenode.get_stats();
+
+    println!("\n╔═══════════════════════════════════════════════════════════╗");
+    println!("║         Pillar HDFS NameNode - Ready for Service         ║");
+    println!("╠═══════════════════════════════════════════════════════════╣");
+    println!("║  Version:  {}                                       ║", env!("CARGO_PKG_VERSION"));
+    println!("║  Protocol: Apache Hadoop HDFS (Drop-in Replacement)      ║");
+    println!("║  Language: Rust (High Performance, Zero-Cost Abstractions)║");
+    println!("╠═══════════════════════════════════════════════════════════╣");
+    println!("║  Status:                                                  ║");
+    println!("║    Live DataNodes: {:>3}                                  ║", stats.num_live_datanodes);
+    println!("║    Total Blocks:   {:>6}                               ║", stats.total_blocks);
+    println!("║    Capacity:       {} GB                          ║", stats.total_capacity / 1_000_000_000);
+    println!("║    Used:           {} GB                          ║", stats.total_used / 1_000_000_000);
+    println!("║    Remaining:      {} GB                          ║", stats.total_remaining / 1_000_000_000);
+    println!("╚═══════════════════════════════════════════════════════════╝\n");
 }
