@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hadoop-config
+data:
+  core-site.xml: |
+    <?xml version="1.0"?>
+    <configuration>
+      <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://pillar-namenode:9000</value>
+      </property>
+    </configuration>
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: large-file-writer
+  labels:
+    app: large-file-writer
+spec:
+  restartPolicy: Never
+  containers:
+  - name: writer
+    image: apache/hadoop:3.3.6
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      # Wait for all DataNodes to be available
+      echo "Waiting for NameNode..."
+      until nc -z pillar-namenode 9000; do sleep 2; done
+      sleep 10
+
+      echo "=== Creating large file to test replication ==="
+
+      # Create a 200MB file (will create multiple 64MB blocks)
+      hadoop fs -mkdir -p /replication-test
+
+      echo "Generating 200MB test file..."
+      dd if=/dev/urandom of=/tmp/large-file.bin bs=1M count=200
+
+      echo "Writing file to HDFS..."
+      hadoop fs -put /tmp/large-file.bin /replication-test/
+
+      echo "Listing directory..."
+      hadoop fs -ls /replication-test/
+
+      # Check file system status
+      echo "Running fsck to verify block replication..."
+      hadoop fsck /replication-test/large-file.bin -files -blocks -locations -racks
+
+      # Create success marker
+      echo "WRITE_COMPLETE" > /tmp/write-status.txt
+      hadoop fs -put /tmp/write-status.txt /replication-test/
+
+      echo "=== Write completed successfully ==="
+    volumeMounts:
+    - name: hadoop-config
+      mountPath: /opt/hadoop/etc/hadoop
+  volumes:
+  - name: hadoop-config
+    configMap:
+      name: hadoop-config

@@ -28,7 +28,7 @@ pub enum NamespaceError {
 pub type Result<T> = std::result::Result<T, NamespaceError>;
 
 /// Represents HDFS permissions (rwxrwxrwx)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct FsPermission {
     pub mode: u16,  // Unix-style permission bits
 }
@@ -48,7 +48,7 @@ impl FsPermission {
 }
 
 /// Block information for a file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockInfo {
     pub block_id: u64,
     pub generation_stamp: u64,
@@ -56,7 +56,7 @@ pub struct BlockInfo {
 }
 
 /// INode (Index Node) - represents a file or directory in HDFS
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct INode {
     pub id: u64,
     pub name: String,
@@ -68,6 +68,7 @@ pub struct INode {
     pub atime: u64,  // Access time (milliseconds since epoch)
     pub replication: u16,  // Replication factor (files only)
     pub block_size: u64,   // Block size in bytes (files only)
+    #[serde(skip)]
     pub children: Option<DashMap<String, u64>>,  // For directories: name -> inode_id
     pub blocks: Option<Vec<BlockInfo>>,          // For files: ordered list of blocks
 }

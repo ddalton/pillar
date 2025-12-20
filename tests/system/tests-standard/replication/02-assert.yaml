@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: replication-verifier
+status:
+  phase: Succeeded
+  containerStatuses:
+  - name: verifier
+    state:
+      terminated:
+        exitCode: 0

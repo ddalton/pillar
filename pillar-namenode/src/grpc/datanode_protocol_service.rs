@@ -29,16 +29,26 @@ impl DatanodeProtocolService {
         &self,
         uuid: String,
         hostname: String,
-        rpc_port: u16,
-        capacity: u64,
+        xfer_port: u32,
+        ipc_port: u32,
+        info_port: u32,
     ) -> Result<(), Status> {
-        let datanode_id = DatanodeId::new(uuid.clone(), hostname.clone(), rpc_port);
+        let datanode_id = DatanodeId {
+            uuid: uuid.clone(),
+            hostname: hostname.clone(),
+            rpc_port: ipc_port as u16,
+            data_port: xfer_port as u16,
+            http_port: info_port as u16,
+        };
+
+        // Default capacity - will be updated on first heartbeat
+        let capacity = 0;
 
         self.datanode_manager
             .register(datanode_id, capacity)
             .map_err(|e| Status::internal(format!("Registration failed: {}", e)))?;
 
-        info!("Registered datanode: {} ({}:{})", uuid, hostname, rpc_port);
+        info!("Registered datanode: {} ({}:{})", uuid, hostname, xfer_port);
 
         Ok(())
     }
@@ -46,13 +56,11 @@ impl DatanodeProtocolService {
     /// Handle heartbeat from datanode
     pub async fn handle_heartbeat(
         &self,
-        uuid: String,
+        uuid: &str,
         capacity: u64,
         used: u64,
         remaining: u64,
         block_pool_used: u64,
-        xceiver_count: u32,
-        failed_volumes: u32,
     ) -> Result<Vec<DatanodeCommand>, Status> {
         let storage = StorageInfo {
             capacity,
@@ -61,8 +69,12 @@ impl DatanodeProtocolService {
             block_pool_used,
         };
 
+        // Default values for optional fields
+        let xceiver_count = 0;
+        let failed_volumes = 0;
+
         self.datanode_manager
-            .heartbeat(&uuid, storage, xceiver_count, failed_volumes)
+            .heartbeat(uuid, storage, xceiver_count, failed_volumes)
             .map_err(|e| Status::internal(format!("Heartbeat failed: {}", e)))?;
 
         // For now, return empty command list
@@ -145,17 +157,16 @@ impl DatanodeProtocolService {
 /// Commands that NameNode can send to DataNode
 #[derive(Debug, Clone)]
 pub enum DatanodeCommand {
-    /// Transfer blocks to another datanode
-    Transfer { blocks: Vec<BlockId>, target: DatanodeId },
+    /// Transfer blocks to other datanodes (for replication)
+    TransferBlocks {
+        blocks: Vec<BlockId>,
+        targets: Vec<DatanodeId>,
+    },
 
     /// Delete invalid blocks
-    Invalidate { blocks: Vec<BlockId> },
-
-    /// Shutdown the datanode
-    Shutdown,
-
-    /// Request full block report
-    RequestBlockReport,
+    InvalidateBlocks {
+        blocks: Vec<BlockId>,
+    },
 }
 
 #[cfg(test)]

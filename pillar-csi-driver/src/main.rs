@@ -6,12 +6,17 @@ use std::path::Path;
 use anyhow::Result;
 use clap::Parser;
 use tonic::transport::Server;
-use tracing::{info, error};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-use identity::{IdentityService, csi::identity_server::IdentityServer};
-use controller::{ControllerService, csi::controller_server::ControllerServer};
-use node::{NodeService, csi::node_server::NodeServer};
+use identity::IdentityService;
+use identity::csi::{
+    identity_server::IdentityServer,
+    controller_server::ControllerServer,
+    node_server::NodeServer,
+};
+use controller::ControllerService;
+use node::NodeService;
 
 #[derive(Parser, Debug)]
 #[clap(name = "pillar-csi-driver")]
@@ -90,24 +95,22 @@ async fn main() -> Result<()> {
     info!("CSI socket created at: {}", args.socket);
 
     // Build server based on mode
-    let mut server = Server::builder();
-
-    // Identity service (always enabled)
     let identity_service = IdentityService::new();
-    server = server.add_service(IdentityServer::new(identity_service));
+    let mut router = Server::builder()
+        .add_service(IdentityServer::new(identity_service));
     info!("✓ Identity service enabled");
 
     // Controller service (if mode is "controller" or "all")
     if args.mode == "controller" || args.mode == "all" {
         let controller_service = ControllerService::new(args.namenode.clone());
-        server = server.add_service(ControllerServer::new(controller_service));
+        router = router.add_service(ControllerServer::new(controller_service));
         info!("✓ Controller service enabled (manages HDFS namespace)");
     }
 
     // Node service (if mode is "node" or "all")
     if args.mode == "node" || args.mode == "all" {
         let node_service = NodeService::new(node_id.clone());
-        server = server.add_service(NodeServer::new(node_service));
+        router = router.add_service(NodeServer::new(node_service));
         info!("✓ Node service enabled (minimal - apps use HDFS protocol)");
     }
 
@@ -120,7 +123,7 @@ async fn main() -> Result<()> {
     info!("");
 
     // Start server
-    server
+    router
         .serve_with_incoming(uds_stream)
         .await
         .map_err(|e| anyhow::anyhow!("CSI server failed: {}", e))?;

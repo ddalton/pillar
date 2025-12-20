@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pillar.fullname" . }}-namenode-config
+  labels:
+    app: {{ include "pillar.name" . }}-namenode
+    {{- include "pillar.labels" . | nindent 4 }}
+data:
+  # NameNode-specific configuration
+  NAMENODE_RPC_PORT: {{ .Values.namenode.rpcPort | quote }}
+  NAMENODE_HTTP_PORT: {{ .Values.namenode.httpPort | quote }}
+  NAMENODE_METADATA_PATH: "/var/lib/pillar/metadata/metadata.db"
+
+  # NameNode performance tuning
+  {{- if .Values.namenode.config.handlerCount }}
+  NAMENODE_HANDLER_COUNT: {{ .Values.namenode.config.handlerCount | quote }}
+  {{- end }}
+  {{- if .Values.namenode.config.serviceHandlerCount }}
+  NAMENODE_SERVICE_HANDLER_COUNT: {{ .Values.namenode.config.serviceHandlerCount | quote }}
+  {{- end }}
+  {{- if .Values.namenode.config.heartbeatRecheckInterval }}
+  NAMENODE_HEARTBEAT_RECHECK_INTERVAL: {{ .Values.namenode.config.heartbeatRecheckInterval | quote }}
+  {{- end }}
+  {{- if .Values.namenode.config.staleDatanodeInterval }}
+  NAMENODE_STALE_DATANODE_INTERVAL: {{ .Values.namenode.config.staleDatanodeInterval | quote }}
+  {{- end }}
+
+  # Block management
+  {{- if .Values.namenode.config.replicationCheckInterval }}
+  NAMENODE_REPLICATION_CHECK_INTERVAL: {{ .Values.namenode.config.replicationCheckInterval | quote }}
+  {{- end }}
+  {{- if .Values.namenode.config.replicationWorkMultiplier }}
+  NAMENODE_REPLICATION_WORK_MULTIPLIER: {{ .Values.namenode.config.replicationWorkMultiplier | quote }}
+  {{- end }}
+
+  # Additional NameNode configuration
+  {{- range $key, $value := .Values.namenode.config.extra }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

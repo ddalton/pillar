@@ -12,7 +12,9 @@ use crate::identity::csi::{
     ListVolumesRequest, ListVolumesResponse,
     GetCapacityRequest, GetCapacityResponse,
     ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
-    controller_service_capability::{Rpc, rpc::Type as RpcType},
+    CreateSnapshotRequest, CreateSnapshotResponse,
+    DeleteSnapshotRequest, DeleteSnapshotResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse,
     ControllerServiceCapability,
     Volume,
     validate_volume_capabilities_response,
@@ -143,15 +145,16 @@ impl Controller for ControllerService {
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
         info!("ControllerGetCapabilities called");
 
+        use crate::identity::csi;
         let capabilities = vec![
             ControllerServiceCapability {
-                r#type: Some(controller_service_capability::Type::Rpc(Rpc {
-                    r#type: RpcType::CreateDeleteVolume as i32,
+                r#type: Some(csi::controller_service_capability::Type::Rpc(csi::controller_service_capability::Rpc {
+                    r#type: csi::controller_service_capability::rpc::Type::CreateDeleteVolume as i32,
                 })),
             },
             ControllerServiceCapability {
-                r#type: Some(controller_service_capability::Type::Rpc(Rpc {
-                    r#type: RpcType::ListVolumes as i32,
+                r#type: Some(csi::controller_service_capability::Type::Rpc(csi::controller_service_capability::Rpc {
+                    r#type: csi::controller_service_capability::rpc::Type::ListVolumes as i32,
                 })),
             },
         ];
@@ -173,7 +176,8 @@ impl Controller for ControllerService {
             confirmed: Some(validate_volume_capabilities_response::Confirmed {
                 volume_context: req.volume_context,
                 volume_capabilities: req.volume_capabilities,
-                parameters: req.parameters,
+                parameters: req.parameters.clone(),
+                mutable_parameters: req.parameters,
             }),
             message: "".to_string(),
         };
@@ -274,6 +278,13 @@ impl Controller for ControllerService {
         _request: Request<crate::identity::csi::ControllerModifyVolumeRequest>,
     ) -> Result<Response<crate::identity::csi::ControllerModifyVolumeResponse>, Status> {
         Err(Status::unimplemented("Not yet supported"))
+    }
+
+    async fn get_snapshot(
+        &self,
+        _request: Request<crate::identity::csi::GetSnapshotRequest>,
+    ) -> Result<Response<crate::identity::csi::GetSnapshotResponse>, Status> {
+        Err(Status::unimplemented("Snapshots not yet supported"))
     }
 }
 

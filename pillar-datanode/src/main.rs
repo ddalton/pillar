@@ -73,33 +73,29 @@ async fn main() -> Result<()> {
     info!("Starting Pillar HDFS DataNode");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
 
-    // Parse addresses
-    let rpc_addr: SocketAddr = args.rpc_addr.parse()
+    // Load configuration from environment variables first
+    let mut config = DataNodeConfig::from_env();
+
+    // Override with command-line arguments (CLI args take precedence)
+    config.namenode_addr = args.namenode;
+    config.uuid = args.uuid;
+
+    // Get hostname from args, env, or auto-detect
+    if let Some(hostname) = args.hostname {
+        config.hostname = hostname;
+    }
+    // Otherwise, config.hostname is already set from env or auto-detected
+
+    config.rpc_addr = args.rpc_addr.parse()
         .map_err(|e| anyhow::anyhow!("Invalid RPC address: {}", e))?;
-    let data_addr: SocketAddr = args.data_addr.parse()
+    config.data_addr = args.data_addr.parse()
         .map_err(|e| anyhow::anyhow!("Invalid data address: {}", e))?;
-    let http_addr: SocketAddr = args.http_addr.parse()
+    config.http_addr = args.http_addr.parse()
         .map_err(|e| anyhow::anyhow!("Invalid HTTP address: {}", e))?;
+    config.volume_mount_point = args.volume_mount_point;
+    config.block_pool_id = args.block_pool_id;
 
-    // Get hostname
-    let hostname = args.hostname.unwrap_or_else(|| {
-        hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "localhost".to_string())
-    });
-
-    // Create configuration
-    let config = DataNodeConfig {
-        namenode_addr: args.namenode,
-        uuid: args.uuid,
-        hostname,
-        rpc_addr,
-        data_addr,
-        http_addr,
-        volume_mount_point: args.volume_mount_point,
-        block_pool_id: args.block_pool_id,
-    };
+    info!("Configuration loaded from environment and CLI arguments");
 
     // Create and start DataNode
     let datanode = Arc::new(DataNode::new(config).await?);

@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: data-verifier
+  labels:
+    app: data-verifier
+spec:
+  restartPolicy: Never
+  containers:
+  - name: verifier
+    image: apache/hadoop:3.3.6
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      echo "=== Verifying Data Persistence ==="
+
+      # Verify success marker exists
+      echo "Checking for success marker..."
+      hadoop fs -test -e /test/test-result.txt
+      echo "Success marker found!"
+
+      # Read and verify the marker content
+      RESULT=$(hadoop fs -cat /test/test-result.txt)
+      if [ "$RESULT" != "ALL_TESTS_PASSED" ]; then
+        echo "ERROR: Test result marker has unexpected content: $RESULT"
+        exit 1
+      fi
+      echo "Test result marker verified!"
+
+      # Verify original file still exists
+      echo "Verifying original file..."
+      hadoop fs -test -e /test/test-file.txt
+
+      # Verify copied file exists
+      echo "Verifying copied file..."
+      hadoop fs -test -e /test/test-file-copy.txt
+
+      # Compare file contents
+      echo "Comparing file contents..."
+      ORIG_CONTENT=$(hadoop fs -cat /test/test-file.txt)
+      COPY_CONTENT=$(hadoop fs -cat /test/test-file-copy.txt)
+
+      if [ "$ORIG_CONTENT" != "$COPY_CONTENT" ]; then
+        echo "ERROR: File contents don't match!"
+        exit 1
+      fi
+      echo "File contents match!"
+
+      # Verify file has correct replication
+      echo "Verifying replication..."
+      REPLICATION=$(hadoop fs -stat "%r" /test/test-file.txt)
+      if [ "$REPLICATION" != "2" ]; then
+        echo "ERROR: Expected replication 2, got $REPLICATION"
+        exit 1
+      fi
+      echo "Replication verified: $REPLICATION"
+
+      echo "=== All verifications passed ==="
+    volumeMounts:
+    - name: hadoop-config
+      mountPath: /opt/hadoop/etc/hadoop
+  volumes:
+  - name: hadoop-config
+    configMap:
+      name: hadoop-config

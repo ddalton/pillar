@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pillar-namenode
+spec:
+  type: ClusterIP
+  ports:
+    - name: rpc
+      port: 9000
+      targetPort: 9000
+    - name: http
+      port: 9870
+      targetPort: 9870
+  selector:
+    app: pillar-namenode
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pillar-namenode
+spec:
+  serviceName: pillar-namenode
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pillar-namenode
+  template:
+    metadata:
+      labels:
+        app: pillar-namenode
+    spec:
+      containers:
+      - name: namenode
+        image: pillar/namenode:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: HDFS_BLOCK_SIZE
+          value: "128"
+        - name: HDFS_REPLICATION
+          value: "2"
+        - name: HDFS_BLOCK_POOL_ID
+          value: "BP-pillar-test-001"
+        - name: RUST_LOG
+          value: "info"
+        ports:
+        - name: rpc
+          containerPort: 9000
+        - name: http
+          containerPort: 9870
+        volumeMounts:
+        - name: metadata
+          mountPath: /var/lib/pillar/metadata
+  volumeClaimTemplates:
+  - metadata:
+      name: metadata
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi

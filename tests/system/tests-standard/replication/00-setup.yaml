@@ -1,0 +1,127 @@
+# Reuse the same NameNode and DataNode setup from basic-operations
+# This test focuses on verifying replication behavior with 3 DataNodes
+apiVersion: v1
+kind: Service
+metadata:
+  name: pillar-namenode
+spec:
+  type: ClusterIP
+  ports:
+    - name: rpc
+      port: 9000
+      targetPort: 9000
+    - name: http
+      port: 9870
+      targetPort: 9870
+  selector:
+    app: pillar-namenode
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pillar-namenode
+spec:
+  serviceName: pillar-namenode
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pillar-namenode
+  template:
+    metadata:
+      labels:
+        app: pillar-namenode
+    spec:
+      containers:
+      - name: namenode
+        image: pillar/namenode:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: HDFS_BLOCK_SIZE
+          value: "64"  # Smaller block size to generate more blocks
+        - name: HDFS_REPLICATION
+          value: "3"  # 3-way replication
+        - name: HDFS_BLOCK_POOL_ID
+          value: "BP-pillar-repl-test"
+        - name: RUST_LOG
+          value: "info"
+        ports:
+        - name: rpc
+          containerPort: 9000
+        - name: http
+          containerPort: 9870
+        volumeMounts:
+        - name: metadata
+          mountPath: /var/lib/pillar/metadata
+  volumeClaimTemplates:
+  - metadata:
+      name: metadata
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pillar-datanode
+spec:
+  clusterIP: None
+  ports:
+    - name: rpc
+      port: 9867
+    - name: data
+      port: 50010
+    - name: http
+      port: 50075
+  selector:
+    app: pillar-datanode
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pillar-datanode
+spec:
+  serviceName: pillar-datanode
+  replicas: 3  # 3 DataNodes for replication testing
+  selector:
+    matchLabels:
+      app: pillar-datanode
+  template:
+    metadata:
+      labels:
+        app: pillar-datanode
+    spec:
+      containers:
+      - name: datanode
+        image: pillar/datanode:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: HDFS_NAMENODE_RPC_ADDRESS
+          value: "pillar-namenode:9000"
+        - name: HDFS_BLOCK_POOL_ID
+          value: "BP-pillar-repl-test"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: RUST_LOG
+          value: "info"
+        ports:
+        - name: rpc
+          containerPort: 9867
+        - name: data
+          containerPort: 50010
+        - name: http
+          containerPort: 50075
+        volumeMounts:
+        - name: storage
+          mountPath: /mnt/pillar-data
+  volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi

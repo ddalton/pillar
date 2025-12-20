@@ -19,18 +19,38 @@ spec:
       - name: datanode
         image: "{{ .Values.datanode.image.repository }}:{{ .Values.datanode.image.tag }}"
         imagePullPolicy: {{ .Values.datanode.image.pullPolicy }}
+        env:
+        # Pod and node information
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        envFrom:
+        # Inject common HDFS configuration
+        - configMapRef:
+            name: {{ include "pillar.fullname" . }}-common-config
+        # Inject DataNode-specific configuration
+        - configMapRef:
+            name: {{ include "pillar.fullname" . }}-datanode-config
         args:
         - --namenode={{ include "pillar.fullname" . }}-namenode:{{ .Values.namenode.rpcPort }}
         - --rpc-addr=0.0.0.0:{{ .Values.datanode.rpcPort }}
         - --data-addr=0.0.0.0:{{ .Values.datanode.dataPort }}
         - --http-addr=0.0.0.0:{{ .Values.datanode.httpPort }}
         - --volume-mount-point=/mnt/pillar-data
-        - --block-pool-id={{ .Values.datanode.storage.blockPoolId }}
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
+        - --block-pool-id={{ .Values.hdfs.blockPoolId }}
         ports:
         - name: rpc
           containerPort: {{ .Values.datanode.rpcPort }}

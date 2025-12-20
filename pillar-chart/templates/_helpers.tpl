@@ -47,3 +47,33 @@ Selector labels
 app.kubernetes.io/name: {{ include "pillar.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+Generate etcd initial cluster string for StatefulSet
+*/}}
+{{- define "pillar.etcdInitialCluster" -}}
+{{- $fullname := include "pillar.fullname" . -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $replicas := int .Values.etcd.replicas -}}
+{{- $cluster := list -}}
+{{- range $i := until $replicas -}}
+  {{- $member := printf "%s-etcd-%d=http://%s-etcd-%d.%s-etcd.%s.svc.cluster.local:2380" $fullname $i $fullname $i $fullname $namespace -}}
+  {{- $cluster = append $cluster $member -}}
+{{- end -}}
+{{- join "," $cluster -}}
+{{- end }}
+
+{{/*
+Generate etcd endpoints for NameNode
+*/}}
+{{- define "pillar.etcdEndpoints" -}}
+{{- $fullname := include "pillar.fullname" . -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $replicas := int .Values.etcd.replicas -}}
+{{- $endpoints := list -}}
+{{- range $i := until $replicas -}}
+  {{- $endpoint := printf "%s-etcd-%d.%s-etcd.%s.svc.cluster.local:2379" $fullname $i $fullname $namespace -}}
+  {{- $endpoints = append $endpoints $endpoint -}}
+{{- end -}}
+{{- join "," $endpoints -}}
+{{- end }}

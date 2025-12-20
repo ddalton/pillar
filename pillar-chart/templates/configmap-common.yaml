@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pillar.fullname" . }}-common-config
+  labels:
+    app: {{ include "pillar.name" . }}
+    {{- include "pillar.labels" . | nindent 4 }}
+data:
+  # Core HDFS configuration
+  HDFS_BLOCK_SIZE: {{ .Values.hdfs.blockSize | quote }}
+  HDFS_REPLICATION: {{ .Values.hdfs.replication | quote }}
+  HDFS_BLOCK_POOL_ID: {{ .Values.hdfs.blockPoolId | quote }}
+
+  # Network configuration
+  HDFS_NAMENODE_RPC_ADDRESS: "{{ include "pillar.fullname" . }}-namenode:{{ .Values.namenode.rpcPort }}"
+  HDFS_NAMENODE_HTTP_ADDRESS: "{{ include "pillar.fullname" . }}-namenode:{{ .Values.namenode.httpPort }}"
+
+  # Performance tuning
+  {{- if .Values.hdfs.ioFileBufferSize }}
+  HDFS_IO_FILE_BUFFER_SIZE: {{ .Values.hdfs.ioFileBufferSize | quote }}
+  {{- end }}
+  {{- if .Values.hdfs.checksumType }}
+  HDFS_CHECKSUM_TYPE: {{ .Values.hdfs.checksumType | quote }}
+  {{- end }}
+  {{- if .Values.hdfs.bytesPerChecksum }}
+  HDFS_BYTES_PER_CHECKSUM: {{ .Values.hdfs.bytesPerChecksum | quote }}
+  {{- end }}
+
+  # Security
+  {{- if .Values.security.kerberos.enabled }}
+  HDFS_SECURITY_AUTHENTICATION: "kerberos"
+  HDFS_SECURITY_AUTHORIZATION: "true"
+  {{- end }}
+
+  # Additional custom configuration
+  {{- range $key, $value := .Values.hdfs.config }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

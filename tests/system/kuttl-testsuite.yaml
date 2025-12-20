@@ -1,0 +1,14 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestSuite
+metadata:
+  name: pillar-hdfs-system-tests
+# Global configuration for all standard HDFS tests
+testDirs:
+  - tests-standard/
+timeout: 600
+# Parallel execution for faster test runs
+parallel: 3
+# Suppress logs for cleaner output (set to empty array for debugging)
+suppress:
+  - events
+skipDelete: false

@@ -18,7 +18,7 @@ pub enum BlockManagerError {
 pub type Result<T> = std::result::Result<T, BlockManagerError>;
 
 /// Unique block identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BlockId {
     pub block_id: u64,
     pub generation_stamp: u64,
@@ -36,16 +36,24 @@ pub struct DatanodeId {
     pub uuid: String,
     pub hostname: String,
     pub rpc_port: u16,
+    pub data_port: u16,
+    pub http_port: u16,
 }
 
 impl DatanodeId {
     pub fn new(uuid: String, hostname: String, rpc_port: u16) -> Self {
-        Self { uuid, hostname, rpc_port }
+        Self {
+            uuid,
+            hostname,
+            rpc_port,
+            data_port: 50010,      // Default HDFS data transfer port
+            http_port: 50075,      // Default HDFS HTTP UI port
+        }
     }
 }
 
 /// Information about a block
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockInfo {
     pub block_id: BlockId,
     pub num_bytes: u64,

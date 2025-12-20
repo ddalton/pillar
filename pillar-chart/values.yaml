@@ -1,5 +1,67 @@
 ## Pillar HDFS Configuration
 
+## Etcd Configuration (for NameNode metadata HA)
+etcd:
+  # Enable etcd for high-availability metadata storage
+  enabled: true
+
+  image:
+    repository: quay.io/coreos/etcd
+    tag: v3.5.11
+    pullPolicy: IfNotPresent
+
+  # Number of etcd replicas (3 or 5 recommended for HA)
+  replicas: 3
+
+  # Storage configuration for etcd data
+  storage:
+    storageClass: ""  # Use default storage class
+    size: 10Gi
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Etcd configuration
+  initialClusterState: "new"
+  initialClusterToken: "pillar-etcd-cluster"
+  autoCompactionRetention: "1"  # Hours
+  snapshotCount: "10000"
+
+  # Additional environment variables
+  extraEnv: []
+
+## Global HDFS Configuration
+hdfs:
+  # Block size in MB
+  blockSize: 128
+
+  # Default replication factor
+  replication: 3
+
+  # Block pool ID (unique cluster identifier)
+  blockPoolId: "BP-pillar-001"
+
+  # I/O buffer size in bytes (optional)
+  # ioFileBufferSize: 131072
+
+  # Checksum type: CRC32C, CRC32, MD5
+  # checksumType: "CRC32C"
+
+  # Bytes per checksum (optional)
+  # bytesPerChecksum: 512
+
+  # Additional custom HDFS configuration as key-value pairs
+  config: {}
+    # Example:
+    # HDFS_PERMISSIONS_ENABLED: "true"
+    # HDFS_SUPPORT_APPEND: "true"
+
 ## NameNode Configuration
 namenode:
   image:
@@ -23,16 +85,37 @@ namenode:
   # HTTP UI port
   httpPort: 9870
 
-  # Metadata storage
-  metadata:
-    # Storage class for metadata (can use Flint or default)
+  # Optional local persistence (logs, temp files)
+  # Note: Metadata is stored in etcd, not here
+  persistence:
+    enabled: false
     storageClass: ""
-    size: 10Gi
+    size: 1Gi
 
-  # HDFS configuration
-  hdfs:
-    blockSize: 128  # Block size in MB
-    replication: 3  # Default replication factor
+  # NameNode-specific configuration
+  config:
+    # Number of RPC handler threads (optional)
+    # handlerCount: 10
+
+    # Number of service RPC handler threads (optional)
+    # serviceHandlerCount: 10
+
+    # Heartbeat recheck interval in milliseconds (optional)
+    # heartbeatRecheckInterval: 300000
+
+    # Stale DataNode interval in milliseconds (optional)
+    # staleDatanodeInterval: 30000
+
+    # Replication check interval in milliseconds (optional)
+    # replicationCheckInterval: 3000
+
+    # Replication work multiplier (optional)
+    # replicationWorkMultiplier: 2
+
+    # Additional NameNode-specific configuration
+    extra: {}
+      # Example:
+      # NAMENODE_SAFEMODE_THRESHOLD_PCT: "0.999"
 
 ## DataNode Configuration
 datanode:
@@ -67,8 +150,48 @@ datanode:
     storageClass: flint
     # Size per DataNode (adjust based on node capacity)
     size: 100Gi
-    # Block pool ID
-    blockPoolId: BP-pillar-001
+
+  # DataNode-specific configuration
+  config:
+    # Number of RPC handler threads (optional)
+    # handlerCount: 10
+
+    # Maximum number of concurrent data transfer threads (optional)
+    # maxXceiverCount: 4096
+
+    # Maximum number of transfer threads (optional)
+    # maxTransferThreads: 4096
+
+    # Heartbeat interval in seconds (optional)
+    # heartbeatInterval: 3
+
+    # Block report interval in milliseconds (optional)
+    # blockReportInterval: 21600000
+
+    # Reserved disk space in bytes (optional)
+    # duReservedBytes: 1073741824
+
+    # Additional DataNode-specific configuration
+    extra: {}
+      # Example:
+      # DATANODE_MAX_LOCKED_MEMORY: "0"
+
+  # Node-specific configuration overrides
+  # For per-node customization, create node-specific ConfigMaps manually
+  # and reference them using nodeSelector in separate DaemonSet definitions.
+  # This is the recommended Kubernetes pattern for node-specific configuration.
+  nodeConfigs: []
+    # Example ConfigMaps to create manually:
+    # apiVersion: v1
+    # kind: ConfigMap
+    # metadata:
+    #   name: pillar-datanode-node1-config
+    # data:
+    #   DATANODE_MAX_TRANSFER_THREADS: "8192"
+    #   DATANODE_DU_RESERVED_BYTES: "2147483648"
+    #
+    # Then create a separate DaemonSet with nodeSelector:
+    #   kubernetes.io/hostname: worker-node-1
 
 ## CSI Driver Configuration
 csiDriver:
@@ -120,6 +243,16 @@ service:
     rpcPort: 9867
     dataPort: 50010
     httpPort: 50075
+
+## Security Configuration
+security:
+  # Kerberos authentication
+  kerberos:
+    enabled: false
+    # realm: "EXAMPLE.COM"
+    # kdcServer: "kdc.example.com"
+    # principal: "hdfs/_HOST@EXAMPLE.COM"
+    # keytabPath: "/etc/security/keytabs/hdfs.keytab"
 
 ## Storage Classes
 storageClass:

@@ -26,9 +26,9 @@ struct Args {
     #[clap(long, default_value = "0.0.0.0:9870")]
     http_addr: String,
 
-    /// Metadata storage path
-    #[clap(long, default_value = "/var/lib/pillar/namenode/metadata.db")]
-    metadata_path: PathBuf,
+    /// Etcd endpoints (comma-separated) for HA metadata storage
+    #[clap(long, default_value = "localhost:2379", value_delimiter = ',')]
+    etcd_endpoints: Vec<String>,
 
     /// Default replication factor
     #[clap(long, default_value = "3")]
@@ -62,20 +62,20 @@ async fn main() -> Result<()> {
     info!("Starting Pillar HDFS NameNode");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
 
-    // Parse addresses
-    let rpc_addr: SocketAddr = args.rpc_addr.parse()
-        .map_err(|e| anyhow::anyhow!("Invalid RPC address: {}", e))?;
-    let http_addr: SocketAddr = args.http_addr.parse()
-        .map_err(|e| anyhow::anyhow!("Invalid HTTP address: {}", e))?;
+    // Load configuration from environment variables first
+    let mut config = NameNodeConfig::from_env();
 
-    // Create configuration
-    let config = NameNodeConfig {
-        rpc_addr,
-        http_addr,
-        metadata_path: args.metadata_path,
-        default_replication: args.replication,
-        default_block_size: args.block_size_mb * 1024 * 1024,
-    };
+    // Override with command-line arguments (CLI args take precedence)
+    config.rpc_addr = args.rpc_addr.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid RPC address: {}", e))?;
+    config.http_addr = args.http_addr.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid HTTP address: {}", e))?;
+    config.etcd_endpoints = args.etcd_endpoints;
+    config.default_replication = args.replication;
+    config.default_block_size = args.block_size_mb * 1024 * 1024;
+
+    info!("Configuration loaded from environment and CLI arguments");
+    info!("Etcd endpoints: {:?}", config.etcd_endpoints);
 
     // Create and start NameNode
     let namenode = Arc::new(NameNode::new(config).await?);

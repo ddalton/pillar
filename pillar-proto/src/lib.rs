@@ -7,6 +7,10 @@
 pub mod hadoop {
     pub mod hdfs {
         tonic::include_proto!("hadoop.hdfs");
+
+        pub mod datanode {
+            tonic::include_proto!("hadoop.hdfs.datanode");
+        }
     }
     pub mod common {
         tonic::include_proto!("hadoop.common");

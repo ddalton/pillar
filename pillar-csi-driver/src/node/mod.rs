@@ -11,7 +11,6 @@ use crate::identity::csi::{
     NodeGetInfoRequest, NodeGetInfoResponse,
     NodeGetVolumeStatsRequest, NodeGetVolumeStatsResponse,
     NodeExpandVolumeRequest, NodeExpandVolumeResponse,
-    node_service_capability::{Rpc, rpc::Type as RpcType},
     NodeServiceCapability,
 };
 
@@ -93,10 +92,11 @@ impl Node for NodeService {
         info!("NodeGetCapabilities called");
 
         // Minimal capabilities since we don't do actual mounts
+        use crate::identity::csi;
         let capabilities = vec![
             NodeServiceCapability {
-                r#type: Some(node_service_capability::Type::Rpc(Rpc {
-                    r#type: RpcType::StageUnstageVolume as i32,
+                r#type: Some(csi::node_service_capability::Type::Rpc(csi::node_service_capability::Rpc {
+                    r#type: csi::node_service_capability::rpc::Type::StageUnstageVolume as i32,
                 })),
             },
         ];

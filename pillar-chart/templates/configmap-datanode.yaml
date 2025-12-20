@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pillar.fullname" . }}-datanode-config
+  labels:
+    app: {{ include "pillar.name" . }}-datanode
+    {{- include "pillar.labels" . | nindent 4 }}
+data:
+  # DataNode-specific configuration
+  DATANODE_RPC_PORT: {{ .Values.datanode.rpcPort | quote }}
+  DATANODE_DATA_PORT: {{ .Values.datanode.dataPort | quote }}
+  DATANODE_HTTP_PORT: {{ .Values.datanode.httpPort | quote }}
+  DATANODE_VOLUME_MOUNT_POINT: "/mnt/pillar-data"
+
+  # DataNode performance tuning
+  {{- if .Values.datanode.config.handlerCount }}
+  DATANODE_HANDLER_COUNT: {{ .Values.datanode.config.handlerCount | quote }}
+  {{- end }}
+  {{- if .Values.datanode.config.maxXceiverCount }}
+  DATANODE_MAX_XCEIVER_COUNT: {{ .Values.datanode.config.maxXceiverCount | quote }}
+  {{- end }}
+  {{- if .Values.datanode.config.maxTransferThreads }}
+  DATANODE_MAX_TRANSFER_THREADS: {{ .Values.datanode.config.maxTransferThreads | quote }}
+  {{- end }}
+
+  # Heartbeat and registration
+  {{- if .Values.datanode.config.heartbeatInterval }}
+  DATANODE_HEARTBEAT_INTERVAL: {{ .Values.datanode.config.heartbeatInterval | quote }}
+  {{- end }}
+  {{- if .Values.datanode.config.blockReportInterval }}
+  DATANODE_BLOCK_REPORT_INTERVAL: {{ .Values.datanode.config.blockReportInterval | quote }}
+  {{- end }}
+
+  # Storage
+  {{- if .Values.datanode.config.duReservedBytes }}
+  DATANODE_DU_RESERVED_BYTES: {{ .Values.datanode.config.duReservedBytes | quote }}
+  {{- end }}
+
+  # Additional DataNode configuration
+  {{- range $key, $value := .Values.datanode.config.extra }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

@@ -35,6 +35,24 @@ pub struct DataNodeConfig {
 
     /// Block pool ID
     pub block_pool_id: String,
+
+    /// Handler count (RPC threads)
+    pub handler_count: Option<u32>,
+
+    /// Maximum xceiver count (concurrent transfers)
+    pub max_xceiver_count: Option<u32>,
+
+    /// Maximum transfer threads
+    pub max_transfer_threads: Option<u32>,
+
+    /// Heartbeat interval (seconds)
+    pub heartbeat_interval: Option<u64>,
+
+    /// Block report interval (milliseconds)
+    pub block_report_interval: Option<u64>,
+
+    /// Reserved disk space (bytes)
+    pub du_reserved_bytes: Option<u64>,
 }
 
 impl Default for DataNodeConfig {
@@ -51,7 +69,98 @@ impl Default for DataNodeConfig {
             http_addr: "0.0.0.0:50075".parse().unwrap(),
             volume_mount_point: PathBuf::from("/mnt/pillar-data"),
             block_pool_id: "BP-pillar-001".to_string(),
+            handler_count: None,
+            max_xceiver_count: None,
+            max_transfer_threads: None,
+            heartbeat_interval: None,
+            block_report_interval: None,
+            du_reserved_bytes: None,
         }
+    }
+}
+
+impl DataNodeConfig {
+    /// Load configuration from environment variables with fallbacks
+    pub fn from_env() -> Self {
+        use std::env;
+
+        let mut config = Self::default();
+
+        // Read from environment variables
+        if let Ok(val) = env::var("HDFS_NAMENODE_RPC_ADDRESS") {
+            config.namenode_addr = val;
+        }
+
+        if let Ok(val) = env::var("HDFS_BLOCK_POOL_ID") {
+            config.block_pool_id = val;
+        }
+
+        if let Ok(val) = env::var("DATANODE_VOLUME_MOUNT_POINT") {
+            config.volume_mount_point = PathBuf::from(val);
+        }
+
+        if let Ok(val) = env::var("DATANODE_RPC_PORT") {
+            if let Ok(port) = val.parse::<u16>() {
+                config.rpc_addr = format!("0.0.0.0:{}", port).parse().unwrap();
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_DATA_PORT") {
+            if let Ok(port) = val.parse::<u16>() {
+                config.data_addr = format!("0.0.0.0:{}", port).parse().unwrap();
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_HTTP_PORT") {
+            if let Ok(port) = val.parse::<u16>() {
+                config.http_addr = format!("0.0.0.0:{}", port).parse().unwrap();
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_HANDLER_COUNT") {
+            if let Ok(count) = val.parse() {
+                config.handler_count = Some(count);
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_MAX_XCEIVER_COUNT") {
+            if let Ok(count) = val.parse() {
+                config.max_xceiver_count = Some(count);
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_MAX_TRANSFER_THREADS") {
+            if let Ok(count) = val.parse() {
+                config.max_transfer_threads = Some(count);
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_HEARTBEAT_INTERVAL") {
+            if let Ok(interval) = val.parse() {
+                config.heartbeat_interval = Some(interval);
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_BLOCK_REPORT_INTERVAL") {
+            if let Ok(interval) = val.parse() {
+                config.block_report_interval = Some(interval);
+            }
+        }
+
+        if let Ok(val) = env::var("DATANODE_DU_RESERVED_BYTES") {
+            if let Ok(bytes) = val.parse() {
+                config.du_reserved_bytes = Some(bytes);
+            }
+        }
+
+        // Get hostname from environment if available (useful in Kubernetes)
+        if let Ok(val) = env::var("NODE_NAME") {
+            config.hostname = val;
+        } else if let Ok(val) = env::var("POD_NAME") {
+            config.hostname = val;
+        }
+
+        config
     }
 }
 

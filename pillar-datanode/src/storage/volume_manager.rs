@@ -110,8 +110,8 @@ impl VolumeManager {
             .map_err(|e| VolumeError::SystemError(format!("statvfs failed: {}", e)))?;
 
         let block_size = stats.block_size();
-        let capacity_bytes = stats.blocks() * block_size;
-        let available_bytes = stats.blocks_available() * block_size;
+        let capacity_bytes = stats.blocks() as u64 * block_size;
+        let available_bytes = stats.blocks_available() as u64 * block_size;
         let used_bytes = capacity_bytes - available_bytes;
 
         // Calculate block pool usage

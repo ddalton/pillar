@@ -1,0 +1,107 @@
+{{- if .Values.etcd.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pillar.fullname" . }}-etcd
+  labels:
+    app: {{ include "pillar.name" . }}-etcd
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for StatefulSet
+  ports:
+  - name: client
+    port: 2379
+    targetPort: 2379
+  - name: peer
+    port: 2380
+    targetPort: 2380
+  selector:
+    app: {{ include "pillar.name" . }}-etcd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pillar.fullname" . }}-etcd
+  labels:
+    app: {{ include "pillar.name" . }}-etcd
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "pillar.fullname" . }}-etcd
+  replicas: {{ .Values.etcd.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "pillar.name" . }}-etcd
+  template:
+    metadata:
+      labels:
+        app: {{ include "pillar.name" . }}-etcd
+    spec:
+      containers:
+      - name: etcd
+        image: "{{ .Values.etcd.image.repository }}:{{ .Values.etcd.image.tag }}"
+        imagePullPolicy: {{ .Values.etcd.image.pullPolicy }}
+        ports:
+        - name: client
+          containerPort: 2379
+        - name: peer
+          containerPort: 2380
+        env:
+        - name: ETCD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: ETCD_DATA_DIR
+          value: /var/lib/etcd
+        - name: ETCD_INITIAL_CLUSTER_STATE
+          value: {{ .Values.etcd.initialClusterState | default "new" | quote }}
+        - name: ETCD_INITIAL_CLUSTER_TOKEN
+          value: {{ .Values.etcd.initialClusterToken | default "pillar-etcd-cluster" | quote }}
+        - name: ETCD_INITIAL_CLUSTER
+          value: {{ include "pillar.etcdInitialCluster" . }}
+        - name: ETCD_LISTEN_CLIENT_URLS
+          value: "http://0.0.0.0:2379"
+        - name: ETCD_LISTEN_PEER_URLS
+          value: "http://0.0.0.0:2380"
+        - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+          value: "http://$(ETCD_NAME).{{ include "pillar.fullname" . }}-etcd.{{ .Release.Namespace }}.svc.cluster.local:2380"
+        - name: ETCD_ADVERTISE_CLIENT_URLS
+          value: "http://$(ETCD_NAME).{{ include "pillar.fullname" . }}-etcd.{{ .Release.Namespace }}.svc.cluster.local:2379"
+        - name: ETCD_AUTO_COMPACTION_RETENTION
+          value: {{ .Values.etcd.autoCompactionRetention | default "1" | quote }}
+        - name: ETCD_SNAPSHOT_COUNT
+          value: {{ .Values.etcd.snapshotCount | default "10000" | quote }}
+        {{- if .Values.etcd.extraEnv }}
+        {{- toYaml .Values.etcd.extraEnv | nindent 8 }}
+        {{- end }}
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/etcd
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 2379
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 2379
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+        resources:
+          {{- toYaml .Values.etcd.resources | nindent 10 }}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      {{- if .Values.etcd.storage.storageClass }}
+      storageClassName: {{ .Values.etcd.storage.storageClass }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.etcd.storage.size }}
+{{- end }}

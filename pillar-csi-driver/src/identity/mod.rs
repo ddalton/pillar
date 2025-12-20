@@ -11,7 +11,6 @@ use csi::{
     GetPluginInfoRequest, GetPluginInfoResponse,
     GetPluginCapabilitiesRequest, GetPluginCapabilitiesResponse,
     ProbeRequest, ProbeResponse,
-    plugin_capability::{Service, service::Type as ServiceType},
     PluginCapability,
 };
 
@@ -51,13 +50,13 @@ impl Identity for IdentityService {
 
         let capabilities = vec![
             PluginCapability {
-                r#type: Some(plugin_capability::Type::Service(Service {
-                    r#type: ServiceType::ControllerService as i32,
+                r#type: Some(csi::plugin_capability::Type::Service(csi::plugin_capability::Service {
+                    r#type: csi::plugin_capability::service::Type::ControllerService as i32,
                 })),
             },
             PluginCapability {
-                r#type: Some(plugin_capability::Type::Service(Service {
-                    r#type: ServiceType::VolumeAccessibilityConstraints as i32,
+                r#type: Some(csi::plugin_capability::Type::Service(csi::plugin_capability::Service {
+                    r#type: csi::plugin_capability::service::Type::VolumeAccessibilityConstraints as i32,
                 })),
             },
         ];

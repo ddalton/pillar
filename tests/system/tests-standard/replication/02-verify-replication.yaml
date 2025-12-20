@@ -1,0 +1,61 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+commands:
+  - command: kubectl exec pillar-namenode-0 -- /bin/sh -c "echo 'Checking DataNode registration...'"
+    ignoreFailure: false
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: replication-verifier
+  labels:
+    app: replication-verifier
+spec:
+  restartPolicy: Never
+  containers:
+  - name: verifier
+    image: apache/hadoop:3.3.6
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -ex
+
+      echo "=== Verifying Block Replication ==="
+
+      # Run fsck and capture output
+      FSCK_OUTPUT=$(hadoop fsck /replication-test/large-file.bin -files -blocks)
+      echo "$FSCK_OUTPUT"
+
+      # Verify the file has replication factor 3
+      REPLICATION=$(hadoop fs -stat "%r" /replication-test/large-file.bin)
+      echo "Replication factor: $REPLICATION"
+
+      if [ "$REPLICATION" != "3" ]; then
+        echo "ERROR: Expected replication 3, got $REPLICATION"
+        exit 1
+      fi
+
+      # Verify file status is HEALTHY
+      if ! echo "$FSCK_OUTPUT" | grep -q "HEALTHY"; then
+        echo "ERROR: File is not HEALTHY"
+        exit 1
+      fi
+
+      # Count number of blocks (200MB file with 64MB blocks = ~4 blocks)
+      BLOCK_COUNT=$(echo "$FSCK_OUTPUT" | grep -c "^blk_" || true)
+      echo "Number of blocks: $BLOCK_COUNT"
+
+      if [ "$BLOCK_COUNT" -lt "3" ]; then
+        echo "ERROR: Expected at least 3 blocks, got $BLOCK_COUNT"
+        exit 1
+      fi
+
+      echo "=== Replication verification passed ==="
+    volumeMounts:
+    - name: hadoop-config
+      mountPath: /opt/hadoop/etc/hadoop
+  volumes:
+  - name: hadoop-config
+    configMap:
+      name: hadoop-config

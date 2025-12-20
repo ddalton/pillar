@@ -5,7 +5,7 @@ use anyhow::Result;
 use tonic::transport::Server;
 use tracing::{info, error};
 
-use crate::metadata::{Namespace, BlockManager, SqliteMetadataStore};
+use crate::metadata::{Namespace, BlockManager, EtcdMetadataStore};
 use crate::datanode::{DatanodeManager, HeartbeatMonitor, BlockPlacementPolicy};
 use crate::grpc::{ClientNamenodeService, DatanodeProtocolService};
 
@@ -18,14 +18,26 @@ pub struct NameNodeConfig {
     /// HTTP server address (for UI/metrics)
     pub http_addr: SocketAddr,
 
-    /// Metadata storage path
-    pub metadata_path: PathBuf,
+    /// Etcd endpoints for metadata storage (HA)
+    pub etcd_endpoints: Vec<String>,
 
     /// Default replication factor
     pub default_replication: u16,
 
     /// Default block size (bytes)
     pub default_block_size: u64,
+
+    /// Handler count (RPC threads)
+    pub handler_count: Option<u32>,
+
+    /// Service handler count
+    pub service_handler_count: Option<u32>,
+
+    /// Heartbeat recheck interval (milliseconds)
+    pub heartbeat_recheck_interval: Option<u64>,
+
+    /// Stale datanode interval (milliseconds)
+    pub stale_datanode_interval: Option<u64>,
 }
 
 impl Default for NameNodeConfig {
@@ -33,10 +45,78 @@ impl Default for NameNodeConfig {
         Self {
             rpc_addr: "0.0.0.0:9000".parse().unwrap(),
             http_addr: "0.0.0.0:9870".parse().unwrap(),
-            metadata_path: PathBuf::from("/var/lib/pillar/namenode/metadata.db"),
+            etcd_endpoints: vec!["localhost:2379".to_string()],
             default_replication: 3,
             default_block_size: 128 * 1024 * 1024, // 128 MB
+            handler_count: None,
+            service_handler_count: None,
+            heartbeat_recheck_interval: None,
+            stale_datanode_interval: None,
         }
+    }
+}
+
+impl NameNodeConfig {
+    /// Load configuration from environment variables with fallbacks
+    pub fn from_env() -> Self {
+        use std::env;
+
+        let mut config = Self::default();
+
+        // Read from environment variables
+        if let Ok(val) = env::var("HDFS_REPLICATION") {
+            if let Ok(replication) = val.parse() {
+                config.default_replication = replication;
+            }
+        }
+
+        if let Ok(val) = env::var("HDFS_BLOCK_SIZE") {
+            if let Ok(block_size_mb) = val.parse::<u64>() {
+                config.default_block_size = block_size_mb * 1024 * 1024;
+            }
+        }
+
+        if let Ok(val) = env::var("ETCD_ENDPOINTS") {
+            config.etcd_endpoints = val.split(',').map(|s| s.to_string()).collect();
+        }
+
+        if let Ok(val) = env::var("NAMENODE_RPC_PORT") {
+            if let Ok(port) = val.parse::<u16>() {
+                config.rpc_addr = format!("0.0.0.0:{}", port).parse().unwrap();
+            }
+        }
+
+        if let Ok(val) = env::var("NAMENODE_HTTP_PORT") {
+            if let Ok(port) = val.parse::<u16>() {
+                config.http_addr = format!("0.0.0.0:{}", port).parse().unwrap();
+            }
+        }
+
+        if let Ok(val) = env::var("NAMENODE_HANDLER_COUNT") {
+            if let Ok(count) = val.parse() {
+                config.handler_count = Some(count);
+            }
+        }
+
+        if let Ok(val) = env::var("NAMENODE_SERVICE_HANDLER_COUNT") {
+            if let Ok(count) = val.parse() {
+                config.service_handler_count = Some(count);
+            }
+        }
+
+        if let Ok(val) = env::var("NAMENODE_HEARTBEAT_RECHECK_INTERVAL") {
+            if let Ok(interval) = val.parse() {
+                config.heartbeat_recheck_interval = Some(interval);
+            }
+        }
+
+        if let Ok(val) = env::var("NAMENODE_STALE_DATANODE_INTERVAL") {
+            if let Ok(interval) = val.parse() {
+                config.stale_datanode_interval = Some(interval);
+            }
+        }
+
+        config
     }
 }
 
@@ -54,12 +134,17 @@ impl NameNode {
     pub async fn new(config: NameNodeConfig) -> Result<Self> {
         info!("Initializing NameNode with config: {:?}", config);
 
-        // Initialize metadata store
-        let metadata_store = Arc::new(SqliteMetadataStore::new(&config.metadata_path));
+        // Initialize etcd metadata store for HA
+        let metadata_store = Arc::new(
+            EtcdMetadataStore::new(config.etcd_endpoints.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))?
+        );
+
         metadata_store.initialize().await
             .map_err(|e| anyhow::anyhow!("Failed to initialize metadata store: {}", e))?;
 
-        info!("Metadata store initialized at: {:?}", config.metadata_path);
+        info!("Metadata store initialized with etcd: {:?}", config.etcd_endpoints);
 
         // Initialize core components
         let namespace = Arc::new(Namespace::new());
@@ -108,15 +193,51 @@ impl NameNode {
 
         info!("gRPC services initialized");
 
-        // Note: Actual gRPC server implementation would go here
-        // For now, this is a placeholder as we need the protobuf-generated code
-        // to create the actual tonic server
+        // Create high-performance gRPC server
+        use pillar_proto::hadoop::hdfs::{
+            client_namenode_protocol_server::ClientNamenodeProtocolServer as ClientNamenodeProtoServer,
+            datanode::datanode_protocol_service_server::DatanodeProtocolServiceServer as DatanodeProtoServer,
+        };
+        use crate::grpc::{ClientNamenodeProtocolServer, DatanodeProtocolServer};
+        use tower::ServiceBuilder;
+
+        // Wrap services in Arc for the gRPC implementation
+        let client_service_arc = Arc::new(client_service);
+        let datanode_service_arc = Arc::new(datanode_service);
+
+        // Create protocol servers
+        let client_proto_server = ClientNamenodeProtocolServer::new(client_service_arc);
+        let datanode_proto_server = DatanodeProtocolServer::new(datanode_service_arc);
+
+        info!("Starting high-performance gRPC server on {}", self.config.rpc_addr);
+
+        // Build server with performance optimizations
+        let server = tonic::transport::Server::builder()
+            // High concurrency settings
+            .concurrency_limit_per_connection(1024)
+            // Large message sizes for block transfers
+            .max_frame_size(Some(256 * 1024 * 1024)) // 256MB max frame
+            // Connection keep-alive
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            // HTTP/2 settings for performance
+            .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+            .http2_adaptive_window(Some(true))
+            // Add services
+            .add_service(ClientNamenodeProtoServer::new(client_proto_server))
+            .add_service(DatanodeProtoServer::new(datanode_proto_server))
+            .serve_with_shutdown(self.config.rpc_addr, async {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Shutdown signal received");
+            });
 
         info!("NameNode RPC server started on {}", self.config.rpc_addr);
         info!("NameNode HTTP UI available on {}", self.config.http_addr);
+        info!("NameNode ready to accept connections");
 
-        // Keep the server running
-        tokio::signal::ctrl_c().await?;
+        // Start server
+        server.await?;
 
         info!("Shutting down NameNode");
 

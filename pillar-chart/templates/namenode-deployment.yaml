@@ -20,12 +20,30 @@ spec:
       - name: namenode
         image: "{{ .Values.namenode.image.repository }}:{{ .Values.namenode.image.tag }}"
         imagePullPolicy: {{ .Values.namenode.image.pullPolicy }}
+        env:
+        # Pod information
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Etcd endpoints for HA metadata storage
+        - name: ETCD_ENDPOINTS
+          value: {{ include "pillar.etcdEndpoints" . | quote }}
+        envFrom:
+        - configMapRef:
+            name: {{ include "pillar.fullname" . }}-common-config
+        - configMapRef:
+            name: {{ include "pillar.fullname" . }}-namenode-config
         args:
         - --rpc-addr=0.0.0.0:{{ .Values.namenode.rpcPort }}
         - --http-addr=0.0.0.0:{{ .Values.namenode.httpPort }}
-        - --metadata-path=/var/lib/pillar/metadata/metadata.db
-        - --replication={{ .Values.namenode.hdfs.replication }}
-        - --block-size-mb={{ .Values.namenode.hdfs.blockSize }}
+        - --etcd-endpoints={{ include "pillar.etcdEndpoints" . }}
+        - --replication={{ .Values.hdfs.replication }}
+        - --block-size-mb={{ .Values.hdfs.blockSize }}
         ports:
         - name: rpc
           containerPort: {{ .Values.namenode.rpcPort }}
@@ -33,9 +51,6 @@ spec:
         - name: http
           containerPort: {{ .Values.namenode.httpPort }}
           protocol: TCP
-        volumeMounts:
-        - name: metadata
-          mountPath: /var/lib/pillar/metadata
         resources:
           {{- toYaml .Values.namenode.resources | nindent 10 }}
         livenessProbe:
@@ -48,14 +63,16 @@ spec:
             port: rpc
           initialDelaySeconds: 10
           periodSeconds: 5
+  {{- if .Values.namenode.persistence.enabled }}
   volumeClaimTemplates:
   - metadata:
-      name: metadata
+      name: data
     spec:
       accessModes: [ "ReadWriteOnce" ]
-      {{- if .Values.namenode.metadata.storageClass }}
-      storageClassName: {{ .Values.namenode.metadata.storageClass }}
+      {{- if .Values.namenode.persistence.storageClass }}
+      storageClassName: {{ .Values.namenode.persistence.storageClass }}
       {{- end }}
       resources:
         requests:
-          storage: {{ .Values.namenode.metadata.size }}
+          storage: {{ .Values.namenode.persistence.size }}
+  {{- end }}
