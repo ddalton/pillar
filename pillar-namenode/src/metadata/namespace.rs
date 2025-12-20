@@ -530,4 +530,149 @@ mod tests {
         let children = ns.list_directory("/test").await.unwrap();
         assert_eq!(children.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_rename_file() {
+        let ns = Namespace::new();
+
+        // Create directory
+        ns.mkdir("/src", "user".to_string(), "group".to_string(), FsPermission::default_dir())
+            .await
+            .unwrap();
+        ns.mkdir("/dst", "user".to_string(), "group".to_string(), FsPermission::default_dir())
+            .await
+            .unwrap();
+
+        // Create file
+        let file_id = ns.create_file(
+            "/src/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            FsPermission::default_file(),
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Add some blocks to the file
+        let file_inode = ns.lookup("/src/file.txt").await.unwrap();
+        {
+            let mut file_guard = file_inode.write().await;
+            file_guard.add_block(BlockInfo {
+                block_id: 100,
+                generation_stamp: 1000,
+                num_bytes: 1024,
+            });
+            file_guard.add_block(BlockInfo {
+                block_id: 101,
+                generation_stamp: 1001,
+                num_bytes: 2048,
+            });
+        }
+
+        // Rename file
+        ns.rename("/src/file.txt", "/dst/renamed.txt").await.unwrap();
+
+        // Verify old path doesn't exist
+        assert!(ns.lookup("/src/file.txt").await.is_err());
+
+        // Verify new path exists with same inode ID and blocks
+        let renamed_inode = ns.lookup("/dst/renamed.txt").await.unwrap();
+        let renamed_guard = renamed_inode.read().await;
+        assert_eq!(renamed_guard.id, file_id);
+        assert_eq!(renamed_guard.name, "renamed.txt");
+        assert_eq!(renamed_guard.blocks.as_ref().unwrap().len(), 2);
+        assert_eq!(renamed_guard.blocks.as_ref().unwrap()[0].block_id, 100);
+        assert_eq!(renamed_guard.blocks.as_ref().unwrap()[1].block_id, 101);
+
+        // Verify source directory is empty
+        let src_children = ns.list_directory("/src").await.unwrap();
+        assert_eq!(src_children.len(), 0);
+
+        // Verify destination directory has the file
+        let dst_children = ns.list_directory("/dst").await.unwrap();
+        assert_eq!(dst_children.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory() {
+        let ns = Namespace::new();
+
+        // Create directory structure
+        ns.mkdir("/old", "user".to_string(), "group".to_string(), FsPermission::default_dir())
+            .await
+            .unwrap();
+        ns.mkdir("/old/subdir", "user".to_string(), "group".to_string(), FsPermission::default_dir())
+            .await
+            .unwrap();
+        ns.create_file(
+            "/old/file1.txt",
+            "user".to_string(),
+            "group".to_string(),
+            FsPermission::default_file(),
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+        ns.create_file(
+            "/old/subdir/file2.txt",
+            "user".to_string(),
+            "group".to_string(),
+            FsPermission::default_file(),
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Rename directory
+        ns.rename("/old", "/new").await.unwrap();
+
+        // Verify old paths don't exist
+        assert!(ns.lookup("/old").await.is_err());
+        assert!(ns.lookup("/old/file1.txt").await.is_err());
+        assert!(ns.lookup("/old/subdir").await.is_err());
+        assert!(ns.lookup("/old/subdir/file2.txt").await.is_err());
+
+        // Verify new paths exist
+        assert!(ns.lookup("/new").await.is_ok());
+        assert!(ns.lookup("/new/file1.txt").await.is_ok());
+        assert!(ns.lookup("/new/subdir").await.is_ok());
+        assert!(ns.lookup("/new/subdir/file2.txt").await.is_ok());
+
+        // Verify directory has correct children
+        let new_children = ns.list_directory("/new").await.unwrap();
+        assert_eq!(new_children.len(), 2); // file1.txt and subdir
+
+        let subdir_children = ns.list_directory("/new/subdir").await.unwrap();
+        assert_eq!(subdir_children.len(), 1); // file2.txt
+    }
+
+    #[tokio::test]
+    async fn test_rename_errors() {
+        let ns = Namespace::new();
+
+        // Create a file
+        ns.create_file(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            FsPermission::default_file(),
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Cannot rename root
+        assert!(ns.rename("/", "/newroot").await.is_err());
+
+        // Cannot rename to existing path
+        ns.create_file(
+            "/existing.txt",
+            "user".to_string(),
+            "group".to_string(),
+            FsPermission::default_file(),
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+        assert!(ns.rename("/file.txt", "/existing.txt").await.is_err());
+
+        // Cannot rename non-existent path
+        assert!(ns.rename("/nonexistent", "/new").await.is_err());
+    }
 }

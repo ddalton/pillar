@@ -182,8 +182,9 @@ mod tests {
         service.handle_register_datanode(
             "dn1".to_string(),
             "host1".to_string(),
-            9000,
-            1_000_000_000,
+            50010,  // xfer_port
+            9000,   // ipc_port
+            50075,  // info_port
         ).await.unwrap();
 
         let node = datanode_manager.get_datanode("dn1").unwrap();
@@ -200,19 +201,18 @@ mod tests {
         service.handle_register_datanode(
             "dn1".to_string(),
             "host1".to_string(),
-            9000,
-            1_000_000_000,
+            50010,  // xfer_port
+            9000,   // ipc_port
+            50075,  // info_port
         ).await.unwrap();
 
         // Send heartbeat
         let commands = service.handle_heartbeat(
-            "dn1".to_string(),
-            1_000_000_000,
-            500_000_000,
-            500_000_000,
-            500_000_000,
-            5,
-            0,
+            "dn1",
+            1_000_000_000, // capacity
+            500_000_000,   // used
+            500_000_000,   // remaining
+            500_000_000,   // block_pool_used
         ).await.unwrap();
 
         assert_eq!(commands.len(), 0); // No commands for now

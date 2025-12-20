@@ -444,4 +444,326 @@ mod tests {
         let listing = service.handle_get_listing("/").await.unwrap();
         assert_eq!(listing.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_append_operations() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1)); // Use 1 for testing
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode for block allocation
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "localhost".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+            },
+            1_000_000_000, // 1GB
+        ).unwrap();
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,  // replication = 1 for test
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Add a partial block (not full)
+        let block1 = service.handle_add_block("/test.txt").await.unwrap();
+
+        // Simulate partial block by updating its size
+        let file_inode = namespace.lookup("/test.txt").await.unwrap();
+        {
+            let mut file_guard = file_inode.write().await;
+            if let Some(blocks) = &mut file_guard.blocks {
+                if let Some(last_block) = blocks.last_mut() {
+                    last_block.num_bytes = 64 * 1024 * 1024; // Half full
+                }
+            }
+        }
+
+        // Append should return the existing partial block
+        let append_block = service.handle_append("/test.txt").await.unwrap();
+        assert_eq!(append_block.block_id, block1.block_id);
+        assert_eq!(append_block.num_bytes, 64 * 1024 * 1024);
+
+        // Mark block as full
+        {
+            let mut file_guard = file_inode.write().await;
+            if let Some(blocks) = &mut file_guard.blocks {
+                if let Some(last_block) = blocks.last_mut() {
+                    last_block.num_bytes = 128 * 1024 * 1024; // Full
+                }
+            }
+        }
+
+        // Append should allocate a new block since last one is full
+        let append_block2 = service.handle_append("/test.txt").await.unwrap();
+        assert_ne!(append_block2.block_id, block1.block_id);
+    }
+
+    #[tokio::test]
+    async fn test_abandon_block() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1)); // Use 1 for testing
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "localhost".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file and add blocks
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,  // replication = 1 for test
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        let block1 = service.handle_add_block("/test.txt").await.unwrap();
+        let block2 = service.handle_add_block("/test.txt").await.unwrap();
+
+        // Verify 2 blocks exist
+        let file_inode = namespace.lookup("/test.txt").await.unwrap();
+        {
+            let file_guard = file_inode.read().await;
+            assert_eq!(file_guard.blocks.as_ref().unwrap().len(), 2);
+        }
+
+        // Abandon the second block
+        service.handle_abandon_block("/test.txt", block2.block_id).await.unwrap();
+
+        // Verify only 1 block remains
+        {
+            let file_guard = file_inode.read().await;
+            assert_eq!(file_guard.blocks.as_ref().unwrap().len(), 1);
+            assert_eq!(file_guard.blocks.as_ref().unwrap()[0].block_id, block1.block_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_service() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create directories and file
+        service.handle_mkdir("/src", "user".to_string(), "group".to_string(), 0o755)
+            .await
+            .unwrap();
+        service.handle_mkdir("/dst", "user".to_string(), "group".to_string(), 0o755)
+            .await
+            .unwrap();
+        service.handle_create(
+            "/src/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Rename file
+        let result = service.handle_rename("/src/file.txt", "/dst/renamed.txt").await.unwrap();
+        assert!(result);
+
+        // Verify old path doesn't exist
+        assert!(service.handle_get_file_info("/src/file.txt").await.is_err());
+
+        // Verify new path exists
+        let info = service.handle_get_file_info("/dst/renamed.txt").await.unwrap();
+        assert_eq!(info.path, "/dst/renamed.txt");
+        assert!(!info.is_dir);
+
+        // Test directory rename
+        service.handle_mkdir("/olddir", "user".to_string(), "group".to_string(), 0o755)
+            .await
+            .unwrap();
+        service.handle_create(
+            "/olddir/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        let result = service.handle_rename("/olddir", "/newdir").await.unwrap();
+        assert!(result);
+
+        // Verify directory rename worked
+        assert!(service.handle_get_file_info("/olddir").await.is_err());
+        assert!(service.handle_get_file_info("/newdir").await.is_ok());
+        assert!(service.handle_get_file_info("/newdir/file.txt").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_datanode_report() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace,
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Initially no datanodes
+        let report = service.handle_get_datanode_report().await.unwrap();
+        assert_eq!(report.len(), 0);
+
+        // Register datanodes
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+            },
+            1_000_000_000, // 1GB
+        ).unwrap();
+
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn2".to_string(),
+                hostname: "host2".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+            },
+            2_000_000_000, // 2GB
+        ).unwrap();
+
+        // Get report
+        let report = service.handle_get_datanode_report().await.unwrap();
+        assert_eq!(report.len(), 2);
+
+        // Verify datanode info
+        let dn1 = report.iter().find(|dn| dn.uuid == "dn1").unwrap();
+        assert_eq!(dn1.hostname, "host1");
+        assert_eq!(dn1.capacity, 1_000_000_000);
+
+        let dn2 = report.iter().find(|dn| dn.uuid == "dn2").unwrap();
+        assert_eq!(dn2.hostname, "host2");
+        assert_eq!(dn2.capacity, 2_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_fs_stats() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Initially no capacity
+        let stats = service.handle_get_fs_stats_real().await.unwrap();
+        assert_eq!(stats.capacity, 0);
+        assert_eq!(stats.used, 0);
+        assert_eq!(stats.remaining, 0);
+
+        // Register datanodes with different capacities
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+            },
+            1_000_000_000, // 1GB
+        ).unwrap();
+
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn2".to_string(),
+                hostname: "host2".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+            },
+            2_000_000_000, // 2GB
+        ).unwrap();
+
+        // Simulate heartbeat to update storage stats
+        use crate::datanode::manager::StorageInfo;
+        datanode_manager.heartbeat(
+            "dn1",
+            StorageInfo {
+                capacity: 1_000_000_000,
+                used: 100_000_000,
+                remaining: 900_000_000,
+                block_pool_used: 100_000_000,
+            },
+            0,
+            0,
+        ).unwrap();
+
+        datanode_manager.heartbeat(
+            "dn2",
+            StorageInfo {
+                capacity: 2_000_000_000,
+                used: 500_000_000,
+                remaining: 1_500_000_000,
+                block_pool_used: 500_000_000,
+            },
+            0,
+            0,
+        ).unwrap();
+
+        // Get aggregated stats
+        let stats = service.handle_get_fs_stats_real().await.unwrap();
+        assert_eq!(stats.capacity, 3_000_000_000);
+        assert_eq!(stats.used, 600_000_000);
+        assert_eq!(stats.remaining, 2_400_000_000);
+    }
 }
