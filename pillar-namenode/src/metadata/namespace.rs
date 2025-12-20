@@ -381,6 +381,109 @@ impl Namespace {
         Ok(result)
     }
 
+    /// Rename a file or directory (atomic operation)
+    pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
+        // Validate paths
+        if src == "/" {
+            return Err(NamespaceError::PermissionDenied("Cannot rename root".to_string()));
+        }
+
+        if dst == "/" {
+            return Err(NamespaceError::InvalidPath("Cannot rename to root".to_string()));
+        }
+
+        // Check if source exists
+        let src_inode_arc = self.lookup(src).await?;
+        let src_inode = src_inode_arc.read().await;
+        let src_id = src_inode.id;
+        let is_dir = src_inode.is_dir;
+        drop(src_inode);
+
+        // Check if destination already exists
+        if self.lookup(dst).await.is_ok() {
+            return Err(NamespaceError::PathAlreadyExists(dst.to_string()));
+        }
+
+        // Parse source path components
+        let src_parent_path = src.rfind('/').map(|i| &src[..i.max(1)]).unwrap_or("/");
+        let src_name = src.rfind('/').map(|i| &src[i+1..]).unwrap_or(src);
+
+        // Parse destination path components
+        let dst_parent_path = dst.rfind('/').map(|i| &dst[..i.max(1)]).unwrap_or("/");
+        let dst_name = dst.rfind('/').map(|i| &dst[i+1..]).unwrap_or(dst);
+
+        if dst_name.is_empty() {
+            return Err(NamespaceError::InvalidPath(dst.to_string()));
+        }
+
+        // Get source parent
+        let src_parent = self.lookup(src_parent_path).await?;
+        let src_parent_guard = src_parent.read().await;
+
+        if !src_parent_guard.is_dir {
+            return Err(NamespaceError::NotADirectory(src_parent_path.to_string()));
+        }
+
+        let src_parent_children = src_parent_guard.children.as_ref()
+            .ok_or_else(|| NamespaceError::NotADirectory(src_parent_path.to_string()))?;
+
+        // Get destination parent
+        let dst_parent = self.lookup(dst_parent_path).await?;
+        let dst_parent_guard = dst_parent.read().await;
+
+        if !dst_parent_guard.is_dir {
+            return Err(NamespaceError::NotADirectory(dst_parent_path.to_string()));
+        }
+
+        let dst_parent_children = dst_parent_guard.children.as_ref()
+            .ok_or_else(|| NamespaceError::NotADirectory(dst_parent_path.to_string()))?;
+
+        // Remove from source parent
+        src_parent_children.remove(src_name);
+
+        // Add to destination parent
+        dst_parent_children.insert(dst_name.to_string(), src_id);
+
+        // Update inode name
+        let mut src_inode_mut = src_inode_arc.write().await;
+        src_inode_mut.name = dst_name.to_string();
+        drop(src_inode_mut);
+
+        // Update path cache - remove old path
+        self.path_cache.remove(src);
+
+        // Add new path
+        self.path_cache.insert(dst.to_string(), src_id);
+
+        // If it's a directory, we need to recursively update all descendant paths in cache
+        // This is needed because path_cache stores full paths
+        if is_dir {
+            let src_prefix = if src == "/" { "".to_string() } else { src.to_string() };
+            let dst_prefix = if dst == "/" { "".to_string() } else { dst.to_string() };
+
+            // Collect all paths to update (can't modify while iterating)
+            let mut paths_to_update = Vec::new();
+            for entry in self.path_cache.iter() {
+                let path = entry.key();
+                if path.starts_with(&src_prefix) && (path.len() == src_prefix.len() || path.as_bytes().get(src_prefix.len()) == Some(&b'/')) {
+                    paths_to_update.push((path.clone(), *entry.value()));
+                }
+            }
+
+            // Update paths
+            for (old_path, inode_id) in paths_to_update {
+                if &old_path != src { // Skip the root of rename, already handled
+                    let suffix = &old_path[src_prefix.len()..];
+                    let new_path = format!("{}{}", dst_prefix, suffix);
+                    self.path_cache.remove(&old_path);
+                    self.path_cache.insert(new_path, inode_id);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get inode by ID
     pub fn get_inode(&self, inode_id: u64) -> Option<Arc<RwLock<INode>>> {
         self.inodes.get(&inode_id).map(|entry| entry.clone())

@@ -465,17 +465,22 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         _request: Request<GetFsStatusRequestProto>,
     ) -> Result<Response<GetFsStatsResponseProto>, Status> {
-        Ok(Response::new(GetFsStatsResponseProto {
-            capacity: 1_000_000_000_000, // 1TB
-            used: 0,
-            remaining: 1_000_000_000_000,
-            under_replicated: 0,
-            corrupt_blocks: 0,
-            missing_blocks: 0,
-            missing_repl_one_blocks: Some(0),
-            blocks_in_future: Some(0),
-            pending_deletion_blocks: Some(0),
-        }))
+        match self.service.handle_get_fs_stats_real().await {
+            Ok(stats) => {
+                Ok(Response::new(GetFsStatsResponseProto {
+                    capacity: stats.capacity,
+                    used: stats.used,
+                    remaining: stats.remaining,
+                    under_replicated: stats.under_replicated,
+                    corrupt_blocks: stats.corrupt_blocks,
+                    missing_blocks: stats.missing_blocks,
+                    missing_repl_one_blocks: Some(0),
+                    blocks_in_future: Some(0),
+                    pending_deletion_blocks: Some(0),
+                }))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn get_preferred_block_size(
@@ -534,15 +539,83 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn append(
         &self,
-        _request: Request<AppendRequestProto>,
+        request: Request<AppendRequestProto>,
     ) -> Result<Response<AppendResponseProto>, Status> {
-        Err(Status::unimplemented("append not yet implemented"))
+        let req = request.into_inner();
+        let path = req.src;
+
+        info!("append: {}", path);
+
+        match self.service.handle_append(&path).await {
+            Ok(block) => {
+                let response = AppendResponseProto {
+                    block: Some(LocatedBlockProto {
+                        b: ExtendedBlockProto {
+                            pool_id: "BP-pillar-001".to_string(),
+                            block_id: block.block_id,
+                            generation_stamp: block.generation_stamp,
+                            num_bytes: Some(block.num_bytes),
+                        },
+                        offset: block.offset,
+                        locs: block.locations
+                            .into_iter()
+                            .map(|loc| DatanodeInfoProto {
+                                id: DatanodeIdProto {
+                                    ip_addr: loc.hostname.clone(),
+                                    host_name: loc.hostname,
+                                    datanode_uuid: loc.uuid,
+                                    xfer_port: loc.data_port as u32,
+                                    info_port: loc.http_port as u32,
+                                    ipc_port: loc.rpc_port as u32,
+                                    info_secure_port: Some(0),
+                                },
+                                capacity: Some(0),
+                                dfs_used: Some(0),
+                                remaining: Some(0),
+                                block_pool_used: Some(0),
+                                cache_capacity: Some(0),
+                                cache_used: Some(0),
+                                last_update: Some(0),
+                                last_update_monotonic: Some(0),
+                                xceiver_count: Some(0),
+                                location: None,
+                                non_dfs_used: Some(0),
+                                admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
+                                upgrade_domain: None,
+                                last_block_report_time: Some(0),
+                                last_block_report_monotonic: Some(0),
+                                num_blocks: Some(0),
+                                software_version: None,
+                            })
+                            .collect(),
+                        corrupt: false,
+                        block_token: Default::default(),
+                        is_cached: vec![],
+                        storage_types: vec![],
+                        storage_i_ds: vec![],
+                        block_indices: None,
+                        block_tokens: vec![],
+                    }),
+                    stat: None,
+                };
+                Ok(Response::new(response))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn abandon_block(
         &self,
-        _request: Request<AbandonBlockRequestProto>,
+        request: Request<AbandonBlockRequestProto>,
     ) -> Result<Response<AbandonBlockResponseProto>, Status> {
+        let req = request.into_inner();
+        let path = req.src;
+        let block = req.b;
+
+        info!("abandon_block: {} block_id={}", path, block.block_id);
+
+        self.service.handle_abandon_block(&path, block.block_id).await?;
+
         Ok(Response::new(AbandonBlockResponseProto {}))
     }
 
@@ -666,15 +739,56 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         _request: Request<GetDatanodeReportRequestProto>,
     ) -> Result<Response<GetDatanodeReportResponseProto>, Status> {
-        Ok(Response::new(GetDatanodeReportResponseProto {
-            di: vec![],
-        }))
+        info!("get_datanode_report called");
+
+        match self.service.handle_get_datanode_report().await {
+            Ok(report) => {
+                let datanode_infos = report
+                    .into_iter()
+                    .map(|dn| DatanodeInfoProto {
+                        id: DatanodeIdProto {
+                            ip_addr: dn.hostname.clone(),
+                            host_name: dn.hostname.clone(),
+                            datanode_uuid: dn.uuid,
+                            xfer_port: 9867,  // Default datanode port
+                            info_port: 50075, // Default http port
+                            ipc_port: 9867,
+                            info_secure_port: Some(0),
+                        },
+                        capacity: Some(dn.capacity),
+                        dfs_used: Some(dn.used),
+                        remaining: Some(dn.remaining),
+                        block_pool_used: Some(0),
+                        cache_capacity: Some(0),
+                        cache_used: Some(0),
+                        last_update: Some(dn.last_update),
+                        last_update_monotonic: Some(0),
+                        xceiver_count: Some(0),
+                        location: None,
+                        non_dfs_used: Some(0),
+                        admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
+                        upgrade_domain: None,
+                        last_block_report_time: Some(0),
+                        last_block_report_monotonic: Some(0),
+                        num_blocks: Some(dn.num_blocks),
+                        software_version: None,
+                    })
+                    .collect();
+
+                Ok(Response::new(GetDatanodeReportResponseProto {
+                    di: datanode_infos,
+                }))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn get_datanode_storage_report(
         &self,
         _request: Request<GetDatanodeStorageReportRequestProto>,
     ) -> Result<Response<GetDatanodeStorageReportResponseProto>, Status> {
+        // Similar to get_datanode_report but with storage details
+        // For now, return empty - can be implemented similarly to get_datanode_report
         Ok(Response::new(GetDatanodeStorageReportResponseProto {
             datanode_storage_reports: vec![],
         }))

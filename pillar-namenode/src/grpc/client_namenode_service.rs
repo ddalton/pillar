@@ -144,43 +144,12 @@ impl ClientNamenodeService {
         Ok(true)
     }
 
-    /// Rename a file or directory
+    /// Rename a file or directory (atomic operation)
     pub async fn handle_rename(&self, src: &str, dst: &str) -> Result<bool, Status> {
-        // For MVP, implement as copy metadata + delete old
-        // Full implementation would be atomic
-        let src_inode = self.namespace
-            .lookup(src)
-            .await
-            .map_err(|e| Status::not_found(format!("Source not found: {}", e)))?;
-
-        let src_guard = src_inode.read().await;
-
-        if src_guard.is_dir {
-            return Err(Status::unimplemented("Directory rename not yet implemented"));
-        }
-
-        // Create new file at destination
         self.namespace
-            .create_file(
-                dst,
-                src_guard.owner.clone(),
-                src_guard.group.clone(),
-                src_guard.permissions,
-                src_guard.replication,
-                src_guard.block_size,
-            )
+            .rename(src, dst)
             .await
-            .map_err(|e| Status::internal(format!("Failed to create destination: {}", e)))?;
-
-        // Copy blocks (simplified - would need to copy block list)
-        // For MVP, this is a placeholder
-
-        // Delete source
-        drop(src_guard);
-        self.namespace
-            .delete(src, false)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to delete source: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to rename: {}", e)))?;
 
         info!("Renamed: {} -> {}", src, dst);
 
@@ -289,6 +258,100 @@ impl ClientNamenodeService {
         Ok(true)
     }
 
+    /// Append to an existing file
+    pub async fn handle_append(&self, path: &str) -> Result<LocatedBlock, Status> {
+        let inode = self.namespace
+            .lookup(path)
+            .await
+            .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
+
+        let inode_guard = inode.read().await;
+
+        if inode_guard.is_dir {
+            return Err(Status::invalid_argument("Cannot append to directory"));
+        }
+
+        // Get the last block if it exists and isn't full
+        if let Some(blocks) = &inode_guard.blocks {
+            if let Some(last_block) = blocks.last() {
+                if last_block.num_bytes < inode_guard.block_size {
+                    // Return the last block for appending
+                    let block_id = BlockId::new(last_block.block_id, last_block.generation_stamp);
+                    let locations = self.block_manager
+                        .get_block_locations(&block_id)
+                        .unwrap_or_default();
+
+                    info!("Appending to existing block {} for file: {}", last_block.block_id, path);
+
+                    return Ok(LocatedBlock {
+                        block_id: last_block.block_id,
+                        generation_stamp: last_block.generation_stamp,
+                        num_bytes: last_block.num_bytes,
+                        offset: (blocks.len() - 1) as u64 * inode_guard.block_size,
+                        locations,
+                    });
+                }
+            }
+        }
+
+        // If no partial block exists, allocate a new one (same as add_block)
+        drop(inode_guard);
+        self.handle_add_block(path).await
+    }
+
+    /// Abandon a block allocation (cleanup failed writes)
+    pub async fn handle_abandon_block(&self, path: &str, block_id: u64) -> Result<(), Status> {
+        let inode = self.namespace
+            .lookup(path)
+            .await
+            .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
+
+        let mut inode_guard = inode.write().await;
+
+        if let Some(blocks) = &mut inode_guard.blocks {
+            blocks.retain(|b| b.block_id != block_id);
+            info!("Abandoned block {} for file: {}", block_id, path);
+        }
+
+        Ok(())
+    }
+
+    /// Get DataNode report (cluster health)
+    pub async fn handle_get_datanode_report(&self) -> Result<Vec<DatanodeReportInfo>, Status> {
+        let datanodes = self.datanode_manager.get_live_datanodes();
+
+        let mut report = Vec::new();
+        for dn in datanodes {
+            report.push(DatanodeReportInfo {
+                hostname: dn.id.hostname.clone(),
+                uuid: dn.id.uuid.clone(),
+                capacity: dn.storage.capacity,
+                used: dn.storage.used,
+                remaining: dn.storage.remaining,
+                num_blocks: dn.blocks.len() as u32,
+                last_update: dn.last_update.elapsed().as_secs(),
+            });
+        }
+
+        Ok(report)
+    }
+
+    /// Get filesystem stats from actual DataNodes
+    pub async fn handle_get_fs_stats_real(&self) -> Result<FsStats, Status> {
+        let total_capacity = self.datanode_manager.get_total_capacity();
+        let total_used = self.datanode_manager.get_total_used();
+        let total_remaining = self.datanode_manager.get_total_remaining();
+
+        Ok(FsStats {
+            capacity: total_capacity,
+            used: total_used,
+            remaining: total_remaining,
+            under_replicated: 0, // TODO: Calculate from block manager
+            corrupt_blocks: 0,
+            missing_blocks: 0,
+        })
+    }
+
     /// Get file length
     async fn get_file_length(&self, inode: &INode) -> u64 {
         if inode.is_dir {
@@ -299,6 +362,29 @@ impl ClientNamenodeService {
             .map(|blocks| blocks.iter().map(|b| b.num_bytes).sum())
             .unwrap_or(0)
     }
+}
+
+/// DataNode report information
+#[derive(Debug, Clone)]
+pub struct DatanodeReportInfo {
+    pub hostname: String,
+    pub uuid: String,
+    pub capacity: u64,
+    pub used: u64,
+    pub remaining: u64,
+    pub num_blocks: u32,
+    pub last_update: u64,
+}
+
+/// Filesystem statistics
+#[derive(Debug, Clone)]
+pub struct FsStats {
+    pub capacity: u64,
+    pub used: u64,
+    pub remaining: u64,
+    pub under_replicated: u64,
+    pub corrupt_blocks: u64,
+    pub missing_blocks: u64,
 }
 
 /// File information returned to client
