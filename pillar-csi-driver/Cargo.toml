@@ -1,0 +1,36 @@
+[package]
+name = "pillar-csi-driver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pillar-csi-driver"
+path = "src/main.rs"
+
+[dependencies]
+pillar-proto = { path = "../pillar-proto" }
+pillar-common = { path = "../pillar-common" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+clap = { workspace = true }
+uuid = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"

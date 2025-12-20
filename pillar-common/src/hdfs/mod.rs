@@ -1,0 +1,16 @@
+// HDFS core abstractions and utilities
+
+pub mod block;
+pub mod inode;
+pub mod namespace;
+pub mod replica;
+pub mod placement;
+pub mod checksums;
+
+// Re-exports for convenience
+pub use block::*;
+pub use inode::*;
+pub use namespace::*;
+pub use replica::*;
+pub use placement::*;
+pub use checksums::*;
