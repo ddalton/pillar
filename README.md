@@ -12,6 +12,9 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
   - Lock-free data structures (DashMap, AtomicU64)
   - Zero garbage collection pauses
   - SPDK-backed storage via Flint (373 MB/s vs 97 MB/s)
+  - **RDMA support** for client-to-DataNode and inter-DataNode communication
+  - Heterogeneous clusters (mixed RDMA/TCP DataNodes)
+  - Auto-fallback to TCP when RDMA unavailable
   - Pure Rust - no glibc or OpenSSL dependencies
 
 - **🔌 Drop-in Replacement**: 100% compatible with Hadoop ecosystem
@@ -288,6 +291,13 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - Block replication pipeline
   - Performance benchmarking
   - Production deployment guide
+
+- [ ] **Phase 9:** RDMA Support
+  - Client-to-DataNode RDMA for high-performance reads/writes
+  - Inter-DataNode RDMA for fast block replication
+  - Heterogeneous cluster support (mixed RDMA/TCP)
+  - Auto-fallback to TCP when RDMA unavailable
+  - See [RDMA_IMPLEMENTATION_PLAN.md](RDMA_IMPLEMENTATION_PLAN.md) for details
 
 ## Performance
 

@@ -48,6 +48,10 @@ pub struct DatanodeInfo {
     pub rpc_port: u16,
     pub data_port: u16,
     pub http_port: u16,
+    /// List of supported transports (e.g., ["tcp", "rdma"])
+    pub supported_transports: Vec<String>,
+    /// RDMA port (0 if RDMA not available)
+    pub rdma_port: u16,
 }
 
 /// Client for communicating with the NameNode
@@ -95,6 +99,9 @@ impl NamenodeClient {
             info_port: self.datanode_info.http_port as u32,
             ipc_port: self.datanode_info.rpc_port as u32,
             info_secure_port: Some(0),
+            // Advertise transport capabilities to NameNode
+            supported_transports: self.datanode_info.supported_transports.clone(),
+            rdma_port: Some(self.datanode_info.rdma_port as u32),
         }
     }
 
@@ -365,6 +372,8 @@ mod tests {
             rpc_port: 9000,
             data_port: 50010,
             http_port: 50075,
+            supported_transports: vec!["tcp".to_string()],
+            rdma_port: 0,
         };
 
         let client = NamenodeClient::new(

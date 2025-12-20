@@ -330,6 +330,8 @@ impl ClientNamenodeService {
                 remaining: dn.storage.remaining,
                 num_blocks: dn.blocks.len() as u32,
                 last_update: dn.last_update.elapsed().as_secs(),
+                supported_transports: dn.id.supported_transports.clone(),
+                rdma_port: dn.id.rdma_port,
             });
         }
 
@@ -374,6 +376,8 @@ pub struct DatanodeReportInfo {
     pub remaining: u64,
     pub num_blocks: u32,
     pub last_update: u64,
+    pub supported_transports: Vec<String>,
+    pub rdma_port: u16,
 }
 
 /// Filesystem statistics
@@ -467,6 +471,8 @@ mod tests {
                 rpc_port: 9867,
                 data_port: 50010,
                 http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
             },
             1_000_000_000, // 1GB
         ).unwrap();
@@ -537,6 +543,8 @@ mod tests {
                 rpc_port: 9867,
                 data_port: 50010,
                 http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
             },
             1_000_000_000,
         ).unwrap();
@@ -662,6 +670,8 @@ mod tests {
                 rpc_port: 9867,
                 data_port: 50010,
                 http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
             },
             1_000_000_000, // 1GB
         ).unwrap();
@@ -673,6 +683,8 @@ mod tests {
                 rpc_port: 9867,
                 data_port: 50010,
                 http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
             },
             2_000_000_000, // 2GB
         ).unwrap();
@@ -719,6 +731,8 @@ mod tests {
                 rpc_port: 9867,
                 data_port: 50010,
                 http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
             },
             1_000_000_000, // 1GB
         ).unwrap();
@@ -730,6 +744,8 @@ mod tests {
                 rpc_port: 9867,
                 data_port: 50010,
                 http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
             },
             2_000_000_000, // 2GB
         ).unwrap();

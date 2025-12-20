@@ -38,6 +38,10 @@ pub struct DatanodeId {
     pub rpc_port: u16,
     pub data_port: u16,
     pub http_port: u16,
+    /// Supported transports (e.g., ["tcp", "rdma"])
+    pub supported_transports: Vec<String>,
+    /// RDMA port (0 if not available)
+    pub rdma_port: u16,
 }
 
 impl DatanodeId {
@@ -48,6 +52,21 @@ impl DatanodeId {
             rpc_port,
             data_port: 50010,      // Default HDFS data transfer port
             http_port: 50075,      // Default HDFS HTTP UI port
+            supported_transports: vec!["tcp".to_string()],  // Default to TCP only
+            rdma_port: 0,          // No RDMA by default
+        }
+    }
+
+    /// Create a DatanodeId from protobuf DatanodeIDProto
+    pub fn from_proto(proto: &pillar_proto::hdfs::DatanodeIdProto) -> Self {
+        Self {
+            uuid: proto.datanode_uuid.clone(),
+            hostname: proto.host_name.clone(),
+            rpc_port: proto.ipc_port as u16,
+            data_port: proto.xfer_port as u16,
+            http_port: proto.info_port as u16,
+            supported_transports: proto.supported_transports.clone(),
+            rdma_port: proto.rdma_port.unwrap_or(0) as u16,
         }
     }
 }

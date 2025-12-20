@@ -27,28 +27,37 @@ impl DatanodeProtocolService {
     /// Handle datanode registration
     pub async fn handle_register_datanode(
         &self,
-        uuid: String,
-        hostname: String,
-        xfer_port: u32,
-        ipc_port: u32,
-        info_port: u32,
+        datanode_id_proto: &pillar_proto::hdfs::DatanodeIdProto,
     ) -> Result<(), Status> {
-        let datanode_id = DatanodeId {
-            uuid: uuid.clone(),
-            hostname: hostname.clone(),
-            rpc_port: ipc_port as u16,
-            data_port: xfer_port as u16,
-            http_port: info_port as u16,
-        };
+        // Convert protobuf to internal representation (includes RDMA capabilities)
+        let datanode_id = DatanodeId::from_proto(datanode_id_proto);
 
         // Default capacity - will be updated on first heartbeat
         let capacity = 0;
 
         self.datanode_manager
-            .register(datanode_id, capacity)
+            .register(datanode_id.clone(), capacity)
             .map_err(|e| Status::internal(format!("Registration failed: {}", e)))?;
 
-        info!("Registered datanode: {} ({}:{})", uuid, hostname, xfer_port);
+        // Log registration with transport capabilities
+        let transports_str = if datanode_id.supported_transports.is_empty() {
+            "tcp (legacy)".to_string()
+        } else {
+            datanode_id.supported_transports.join(", ")
+        };
+
+        info!(
+            "Registered datanode: {} ({}:{}) - transports: {}{}",
+            datanode_id.uuid,
+            datanode_id.hostname,
+            datanode_id.data_port,
+            transports_str,
+            if datanode_id.rdma_port > 0 {
+                format!(", RDMA port: {}", datanode_id.rdma_port)
+            } else {
+                String::new()
+            }
+        );
 
         Ok(())
     }
@@ -179,13 +188,19 @@ mod tests {
         let block_manager = Arc::new(BlockManager::new());
         let service = DatanodeProtocolService::new(datanode_manager.clone(), block_manager);
 
-        service.handle_register_datanode(
-            "dn1".to_string(),
-            "host1".to_string(),
-            50010,  // xfer_port
-            9000,   // ipc_port
-            50075,  // info_port
-        ).await.unwrap();
+        let datanode_id_proto = pillar_proto::hdfs::DatanodeIdProto {
+            ip_addr: "192.168.1.1".to_string(),
+            host_name: "host1".to_string(),
+            datanode_uuid: "dn1".to_string(),
+            xfer_port: 50010,
+            info_port: 50075,
+            ipc_port: 9000,
+            info_secure_port: Some(0),
+            supported_transports: vec!["tcp".to_string()],
+            rdma_port: Some(0),
+        };
+
+        service.handle_register_datanode(&datanode_id_proto).await.unwrap();
 
         let node = datanode_manager.get_datanode("dn1").unwrap();
         assert_eq!(node.id.uuid, "dn1");
@@ -198,13 +213,19 @@ mod tests {
         let service = DatanodeProtocolService::new(datanode_manager.clone(), block_manager);
 
         // Register first
-        service.handle_register_datanode(
-            "dn1".to_string(),
-            "host1".to_string(),
-            50010,  // xfer_port
-            9000,   // ipc_port
-            50075,  // info_port
-        ).await.unwrap();
+        let datanode_id_proto = pillar_proto::hdfs::DatanodeIdProto {
+            ip_addr: "192.168.1.1".to_string(),
+            host_name: "host1".to_string(),
+            datanode_uuid: "dn1".to_string(),
+            xfer_port: 50010,
+            info_port: 50075,
+            ipc_port: 9000,
+            info_secure_port: Some(0),
+            supported_transports: vec!["tcp".to_string()],
+            rdma_port: Some(0),
+        };
+
+        service.handle_register_datanode(&datanode_id_proto).await.unwrap();
 
         // Send heartbeat
         let commands = service.handle_heartbeat(

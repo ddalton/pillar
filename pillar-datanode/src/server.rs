@@ -2,10 +2,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use uuid::Uuid;
 
-use crate::storage::{VolumeManager, BlockStorage, DataTransferServer};
+use crate::storage::{VolumeManager, BlockStorage};
+use crate::transport::tcp::TcpTransport;
+use crate::transport::selector::TransportSelector;
 use crate::grpc::{NamenodeClient, ClientDatanodeService};
 use crate::grpc::namenode_client::DatanodeInfo;
 
@@ -53,6 +55,28 @@ pub struct DataNodeConfig {
 
     /// Reserved disk space (bytes)
     pub du_reserved_bytes: Option<u64>,
+
+    /// Transport mode: "auto", "tcp", "rdma"
+    /// - "auto": Enable RDMA if hardware available, fallback to TCP (default)
+    /// - "tcp": Force TCP only (disable RDMA)
+    /// - "rdma": Force RDMA, fail if unavailable
+    pub transport: String,
+
+    /// RDMA data transfer port (when RDMA enabled)
+    #[cfg(feature = "rdma")]
+    pub rdma_addr: SocketAddr,
+
+    /// RDMA queue depth
+    #[cfg(feature = "rdma")]
+    pub rdma_queue_depth: u32,
+
+    /// RDMA max inline data size (bytes)
+    #[cfg(feature = "rdma")]
+    pub rdma_max_inline_data: u32,
+
+    /// RDMA buffer pool size (pre-allocated buffers)
+    #[cfg(feature = "rdma")]
+    pub rdma_buffer_pool_size: usize,
 }
 
 impl Default for DataNodeConfig {
@@ -75,6 +99,15 @@ impl Default for DataNodeConfig {
             heartbeat_interval: None,
             block_report_interval: None,
             du_reserved_bytes: None,
+            transport: "auto".to_string(),
+            #[cfg(feature = "rdma")]
+            rdma_addr: "0.0.0.0:50011".parse().unwrap(),
+            #[cfg(feature = "rdma")]
+            rdma_queue_depth: 128,
+            #[cfg(feature = "rdma")]
+            rdma_max_inline_data: 256,
+            #[cfg(feature = "rdma")]
+            rdma_buffer_pool_size: 1024,
         }
     }
 }
@@ -153,6 +186,38 @@ impl DataNodeConfig {
             }
         }
 
+        // Transport configuration
+        if let Ok(val) = env::var("DATANODE_TRANSPORT") {
+            config.transport = val;
+        }
+
+        #[cfg(feature = "rdma")]
+        {
+            if let Ok(val) = env::var("DATANODE_RDMA_PORT") {
+                if let Ok(port) = val.parse::<u16>() {
+                    config.rdma_addr = format!("0.0.0.0:{}", port).parse().unwrap();
+                }
+            }
+
+            if let Ok(val) = env::var("DATANODE_RDMA_QUEUE_DEPTH") {
+                if let Ok(depth) = val.parse() {
+                    config.rdma_queue_depth = depth;
+                }
+            }
+
+            if let Ok(val) = env::var("DATANODE_RDMA_MAX_INLINE_DATA") {
+                if let Ok(size) = val.parse() {
+                    config.rdma_max_inline_data = size;
+                }
+            }
+
+            if let Ok(val) = env::var("DATANODE_RDMA_BUFFER_POOL_SIZE") {
+                if let Ok(size) = val.parse() {
+                    config.rdma_buffer_pool_size = size;
+                }
+            }
+        }
+
         // Get hostname from environment if available (useful in Kubernetes)
         if let Ok(val) = env::var("NODE_NAME") {
             config.hostname = val;
@@ -171,7 +236,7 @@ pub struct DataNode {
     volume_manager: Arc<VolumeManager>,
     block_storage: Arc<BlockStorage>,
     namenode_client: Arc<NamenodeClient>,
-    data_transfer_server: Arc<DataTransferServer>,
+    transport_selector: Arc<TransportSelector>,
     client_service: Arc<ClientDatanodeService>,
 }
 
@@ -198,13 +263,98 @@ impl DataNode {
 
         info!("Block storage initialized ({} existing blocks)", block_storage.get_block_count());
 
-        // Create datanode info
+        // Create TCP transport
+        let tcp_transport = Arc::new(TcpTransport::new(
+            block_storage.clone(),
+            config.data_addr,
+        ));
+
+        // Create transport selector with optional RDMA
+        let transport_selector = {
+            #[cfg(feature = "rdma")]
+            {
+                use crate::transport::rdma::RdmaTransport;
+
+                // Check if RDMA should be enabled based on config
+                let enable_rdma = match config.transport.as_str() {
+                    "rdma" => true,  // Force RDMA
+                    "auto" => true,  // Try RDMA, will fallback to TCP if it fails
+                    "tcp" => false,  // Force TCP only
+                    _ => {
+                        warn!("Unknown transport mode '{}', defaulting to TCP", config.transport);
+                        false
+                    }
+                };
+
+                if enable_rdma {
+                    match RdmaTransport::new(
+                        block_storage.clone(),
+                        config.rdma_addr,
+                        config.rdma_queue_depth,
+                        config.rdma_max_inline_data,
+                        config.rdma_buffer_pool_size,
+                    ) {
+                        Ok(rdma_transport) => {
+                            info!("RDMA transport enabled on {}", config.rdma_addr);
+                            Arc::new(TransportSelector::new_with_rdma(
+                                tcp_transport,
+                                Arc::new(rdma_transport),
+                            ))
+                        }
+                        Err(e) => {
+                            if config.transport == "rdma" {
+                                // RDMA was explicitly requested but failed
+                                return Err(anyhow::anyhow!("Failed to initialize RDMA (required by config): {}", e));
+                            } else {
+                                // Auto mode: fallback to TCP
+                                warn!("RDMA initialization failed, falling back to TCP: {}", e);
+                                Arc::new(TransportSelector::new_tcp_only(tcp_transport))
+                            }
+                        }
+                    }
+                } else {
+                    info!("Using TCP-only transport (RDMA disabled by config)");
+                    Arc::new(TransportSelector::new_tcp_only(tcp_transport))
+                }
+            }
+
+            #[cfg(not(feature = "rdma"))]
+            {
+                if config.transport != "tcp" && config.transport != "auto" {
+                    warn!("RDMA requested but not compiled in (use --features rdma), using TCP");
+                }
+                Arc::new(TransportSelector::new_tcp_only(tcp_transport))
+            }
+        };
+
+        // Create client service
+        let client_service = Arc::new(ClientDatanodeService::new(
+            block_storage.clone(),
+            volume_manager.clone(),
+        ));
+
+        info!("DataNode core components initialized");
+
+        // Determine which transports are actually available
+        let supported_transports = transport_selector.supported_transports();
+        let rdma_port = if supported_transports.contains(&"rdma".to_string()) {
+            #[cfg(feature = "rdma")]
+            { config.rdma_addr.port() }
+            #[cfg(not(feature = "rdma"))]
+            { 0 }
+        } else {
+            0
+        };
+
+        // Create datanode info with detected transport capabilities
         let datanode_info = DatanodeInfo {
             uuid: uuid.clone(),
             hostname: config.hostname.clone(),
             rpc_port: config.rpc_addr.port(),
             data_port: config.data_addr.port(),
             http_port: config.http_addr.port(),
+            supported_transports: supported_transports.clone(),
+            rdma_port,
         };
 
         // Create NameNode client
@@ -215,19 +365,17 @@ impl DataNode {
             block_storage.clone(),
         ));
 
-        // Create data transfer server
-        let data_transfer_server = Arc::new(DataTransferServer::new(
-            block_storage.clone(),
-            config.data_addr,
-        ));
+        // Log transport configuration
+        if supported_transports.contains(&"rdma".to_string()) {
+            #[cfg(feature = "rdma")]
+            info!("Transport: TCP on {} + RDMA on {}", config.data_addr, config.rdma_addr);
 
-        // Create client service
-        let client_service = Arc::new(ClientDatanodeService::new(
-            block_storage.clone(),
-            volume_manager.clone(),
-        ));
-
-        info!("DataNode core components initialized");
+            #[cfg(not(feature = "rdma"))]
+            info!("Transport: TCP on {} + RDMA (not compiled)", config.data_addr);
+        } else {
+            info!("Transport: TCP on {}", config.data_addr);
+        }
+        info!("Advertising transports to NameNode: {:?}", supported_transports);
 
         Ok(Self {
             config,
@@ -235,7 +383,7 @@ impl DataNode {
             volume_manager,
             block_storage,
             namenode_client,
-            data_transfer_server,
+            transport_selector,
             client_service,
         })
     }
@@ -252,13 +400,8 @@ impl DataNode {
         self.namenode_client.send_block_report().await
             .map_err(|e| anyhow::anyhow!("Failed to send block report: {}", e))?;
 
-        // Start data transfer server in background
-        let data_transfer_server = self.data_transfer_server.clone();
-        tokio::spawn(async move {
-            if let Err(e) = data_transfer_server.start().await {
-                error!("Data transfer server failed: {}", e);
-            }
-        });
+        // Start transport servers (TCP, and RDMA if available)
+        self.transport_selector.start_all_servers().await;
 
         // Start heartbeat loop in background
         let namenode_client = self.namenode_client.clone();
@@ -269,6 +412,7 @@ impl DataNode {
         info!("DataNode RPC server started on {}", self.config.rpc_addr);
         info!("DataNode data transfer server started on {}", self.config.data_addr);
         info!("DataNode HTTP UI available on {}", self.config.http_addr);
+        info!("Supported transports: {}", self.transport_selector.supported_transports().join(", "));
 
         // Keep the server running
         tokio::signal::ctrl_c().await?;

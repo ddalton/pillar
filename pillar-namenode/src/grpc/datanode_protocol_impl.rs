@@ -42,13 +42,7 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
         );
 
         match self.service
-            .handle_register_datanode(
-                datanode_id.datanode_uuid.clone(),
-                datanode_id.host_name.clone(),
-                datanode_id.xfer_port,
-                datanode_id.ipc_port,
-                datanode_id.info_port,
-            )
+            .handle_register_datanode(datanode_id)
             .await
         {
             Ok(()) => {

@@ -36,6 +36,13 @@ uuid = { workspace = true }
 nix = { workspace = true }
 hostname = "0.4"
 
+# Optional RDMA support
+ibverbs = { workspace = true, optional = true }
+
+[features]
+default = []
+rdma = ["dep:ibverbs"]
+
 [dev-dependencies]
 tempfile = "3.8"
 

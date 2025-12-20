@@ -1,6 +1,7 @@
 mod storage;
 mod grpc;
 mod server;
+mod transport;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +50,20 @@ struct Args {
     #[clap(long, default_value = "BP-pillar-001")]
     block_pool_id: String,
 
+    /// Transport mode (auto, tcp, rdma)
+    #[clap(long, default_value = "auto")]
+    transport: String,
+
+    /// RDMA port (when RDMA enabled)
+    #[cfg(feature = "rdma")]
+    #[clap(long, default_value = "50011")]
+    rdma_port: u16,
+
+    /// RDMA queue depth
+    #[cfg(feature = "rdma")]
+    #[clap(long, default_value = "128")]
+    rdma_queue_depth: u32,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -94,6 +109,14 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid HTTP address: {}", e))?;
     config.volume_mount_point = args.volume_mount_point;
     config.block_pool_id = args.block_pool_id;
+    config.transport = args.transport;
+
+    #[cfg(feature = "rdma")]
+    {
+        config.rdma_addr = format!("0.0.0.0:{}", args.rdma_port).parse()
+            .map_err(|e| anyhow::anyhow!("Invalid RDMA port: {}", e))?;
+        config.rdma_queue_depth = args.rdma_queue_depth;
+    }
 
     info!("Configuration loaded from environment and CLI arguments");
 
