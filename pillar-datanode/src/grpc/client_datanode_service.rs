@@ -134,7 +134,7 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
-    async fn test_client_datanode_service() {
+    async fn test_client_datanode_service_volume_info() {
         let temp_dir = TempDir::new().unwrap();
         let mount_point = temp_dir.path();
 
@@ -150,5 +150,73 @@ mod tests {
         let stats = service.handle_get_volume_info().await.unwrap();
         assert!(stats.capacity > 0);
         assert_eq!(stats.num_blocks, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_replica_visible_length_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount_point = temp_dir.path();
+
+        let volume_manager = Arc::new(VolumeManager::new(mount_point, "BP-test".to_string()).unwrap());
+        let finalized_dir = volume_manager.get_finalized_dir();
+        let tmp_dir = volume_manager.get_tmp_dir();
+        let block_storage = Arc::new(BlockStorage::new(finalized_dir, tmp_dir).unwrap());
+
+        let service = ClientDatanodeService::new(block_storage, volume_manager);
+
+        // Try to get non-existent block
+        let result = service.handle_get_replica_visible_length(99999).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_block_local_path_info_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount_point = temp_dir.path();
+
+        let volume_manager = Arc::new(VolumeManager::new(mount_point, "BP-test".to_string()).unwrap());
+        let finalized_dir = volume_manager.get_finalized_dir();
+        let tmp_dir = volume_manager.get_tmp_dir();
+        let block_storage = Arc::new(BlockStorage::new(finalized_dir, tmp_dir).unwrap());
+
+        let service = ClientDatanodeService::new(block_storage, volume_manager);
+
+        // Try to get non-existent block
+        let result = service.handle_get_block_local_path_info(99999, 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_namenodes() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount_point = temp_dir.path();
+
+        let volume_manager = Arc::new(VolumeManager::new(mount_point, "BP-test".to_string()).unwrap());
+        let finalized_dir = volume_manager.get_finalized_dir();
+        let tmp_dir = volume_manager.get_tmp_dir();
+        let block_storage = Arc::new(BlockStorage::new(finalized_dir, tmp_dir).unwrap());
+
+        let service = ClientDatanodeService::new(block_storage, volume_manager);
+
+        // Should succeed (no-op in MVP)
+        let result = service.handle_refresh_namenodes().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_hdfs_block_locations_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount_point = temp_dir.path();
+
+        let volume_manager = Arc::new(VolumeManager::new(mount_point, "BP-test".to_string()).unwrap());
+        let finalized_dir = volume_manager.get_finalized_dir();
+        let tmp_dir = volume_manager.get_tmp_dir();
+        let block_storage = Arc::new(BlockStorage::new(finalized_dir, tmp_dir).unwrap());
+
+        let service = ClientDatanodeService::new(block_storage, volume_manager);
+
+        // Request non-existent blocks
+        let result = service.handle_get_hdfs_block_locations(vec![1, 2, 3]).await.unwrap();
+        assert_eq!(result.len(), 0);
     }
 }

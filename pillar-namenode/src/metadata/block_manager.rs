@@ -221,6 +221,39 @@ impl BlockManager {
     pub fn get_default_block_size(&self) -> u64 {
         self.default_block_size
     }
+
+    /// Allocate a new generation stamp for pipeline updates
+    pub async fn allocate_generation_stamp(&self) -> u64 {
+        self.next_generation_stamp.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Update block generation stamp (for pipeline recovery)
+    pub fn update_generation_stamp(&self, old_block_id: BlockId, new_block_id: BlockId) {
+        // Get the block info with old generation stamp
+        if let Some(block_info) = self.blocks.remove(&old_block_id) {
+            // Create new block info with updated generation stamp
+            let new_block_info = BlockInfo {
+                block_id: new_block_id,
+                num_bytes: block_info.1.num_bytes,
+                inode_id: block_info.1.inode_id,
+            };
+
+            // Insert with new generation stamp
+            self.blocks.insert(new_block_id, new_block_info);
+
+            // Update block locations if they exist
+            if let Some(locations) = self.block_locations.remove(&old_block_id) {
+                self.block_locations.insert(new_block_id, locations.1);
+            }
+
+            // Update file blocks mapping
+            if let Some(mut file_blocks) = self.file_blocks.get_mut(&block_info.1.inode_id) {
+                if let Some(pos) = file_blocks.iter().position(|b| *b == old_block_id) {
+                    file_blocks[pos] = new_block_id;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

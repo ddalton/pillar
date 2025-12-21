@@ -627,16 +627,170 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn get_additional_datanode(
         &self,
-        _request: Request<GetAdditionalDatanodeRequestProto>,
+        request: Request<GetAdditionalDatanodeRequestProto>,
     ) -> Result<Response<GetAdditionalDatanodeResponseProto>, Status> {
-        Err(Status::unimplemented("get_additional_datanode not yet implemented"))
+        let req = request.into_inner();
+        let path = req.src;
+        let block = req.blk;
+
+        info!(
+            "get_additional_datanode: {} block_id={} num_additional={}",
+            path, block.block_id, req.num_additional_nodes
+        );
+
+        // Convert existing and excluded datanodes from proto
+        use crate::metadata::block_manager::DatanodeId;
+        let existing_datanodes: Vec<DatanodeId> = req.existings
+            .iter()
+            .map(|dn| DatanodeId::from_proto(&dn.id))
+            .collect();
+
+        let excluded_datanodes: Vec<DatanodeId> = req.excludes
+            .iter()
+            .map(|dn| DatanodeId::from_proto(&dn.id))
+            .collect();
+
+        // Get additional datanode(s)
+        let located_block = self.service.handle_get_additional_datanode(
+            block.block_id,
+            block.generation_stamp,
+            &existing_datanodes,
+            &excluded_datanodes,
+            req.num_additional_nodes,
+        ).await?;
+
+        // Convert to proto
+        let locs = located_block.locations
+            .into_iter()
+            .map(|dn| DatanodeInfoProto {
+                id: DatanodeIdProto {
+                    datanode_uuid: dn.uuid,
+                    ip_addr: dn.hostname.clone(),
+                    host_name: dn.hostname,
+                    xfer_port: dn.data_port as u32,
+                    info_port: dn.http_port as u32,
+                    ipc_port: dn.rpc_port as u32,
+                    info_secure_port: Some(0),
+                    supported_transports: dn.supported_transports,
+                    rdma_port: Some(dn.rdma_port as u32),
+                },
+                capacity: Some(0),
+                dfs_used: Some(0),
+                remaining: Some(0),
+                block_pool_used: Some(0),
+                cache_capacity: Some(0),
+                cache_used: Some(0),
+                last_update: Some(0),
+                last_update_monotonic: Some(0),
+                xceiver_count: Some(0),
+                location: None,
+                non_dfs_used: Some(0),
+                admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
+                upgrade_domain: None,
+                last_block_report_time: Some(0),
+                last_block_report_monotonic: Some(0),
+                num_blocks: Some(0),
+                software_version: None,
+            })
+            .collect();
+
+        let response = GetAdditionalDatanodeResponseProto {
+            block: LocatedBlockProto {
+                b: ExtendedBlockProto {
+                    pool_id: "BP-pillar-001".to_string(),
+                    block_id: located_block.block_id,
+                    generation_stamp: located_block.generation_stamp,
+                    num_bytes: Some(located_block.num_bytes),
+                },
+                offset: located_block.offset,
+                locs,
+                corrupt: false,
+                block_token: Default::default(),
+                is_cached: vec![],
+                storage_types: vec![],
+                storage_i_ds: vec![],
+                block_indices: None,
+                block_tokens: vec![],
+            },
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn update_block_for_pipeline(
         &self,
-        _request: Request<UpdateBlockForPipelineRequestProto>,
+        request: Request<UpdateBlockForPipelineRequestProto>,
     ) -> Result<Response<UpdateBlockForPipelineResponseProto>, Status> {
-        Err(Status::unimplemented("update_block_for_pipeline not yet implemented"))
+        let req = request.into_inner();
+        let block = req.block;
+
+        info!(
+            "update_block_for_pipeline: block_id={} client={}",
+            block.block_id, req.client_name
+        );
+
+        // Update block with new generation stamp
+        let located_block = self.service.handle_update_block_for_pipeline(
+            block.block_id,
+            block.generation_stamp,
+        ).await?;
+
+        // Convert to proto
+        let locs = located_block.locations
+            .into_iter()
+            .map(|dn| DatanodeInfoProto {
+                id: DatanodeIdProto {
+                    datanode_uuid: dn.uuid,
+                    ip_addr: dn.hostname.clone(),
+                    host_name: dn.hostname,
+                    xfer_port: dn.data_port as u32,
+                    info_port: dn.http_port as u32,
+                    ipc_port: dn.rpc_port as u32,
+                    info_secure_port: Some(0),
+                    supported_transports: dn.supported_transports,
+                    rdma_port: Some(dn.rdma_port as u32),
+                },
+                capacity: Some(0),
+                dfs_used: Some(0),
+                remaining: Some(0),
+                block_pool_used: Some(0),
+                cache_capacity: Some(0),
+                cache_used: Some(0),
+                last_update: Some(0),
+                last_update_monotonic: Some(0),
+                xceiver_count: Some(0),
+                location: None,
+                non_dfs_used: Some(0),
+                admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
+                upgrade_domain: None,
+                last_block_report_time: Some(0),
+                last_block_report_monotonic: Some(0),
+                num_blocks: Some(0),
+                software_version: None,
+            })
+            .collect();
+
+        let response = UpdateBlockForPipelineResponseProto {
+            block: LocatedBlockProto {
+                b: ExtendedBlockProto {
+                    pool_id: "BP-pillar-001".to_string(),
+                    block_id: located_block.block_id,
+                    generation_stamp: located_block.generation_stamp,
+                    num_bytes: Some(located_block.num_bytes),
+                },
+                offset: located_block.offset,
+                locs,
+                corrupt: false,
+                block_token: Default::default(),
+                is_cached: vec![],
+                storage_types: vec![],
+                storage_i_ds: vec![],
+                block_indices: None,
+                block_tokens: vec![],
+            },
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn update_pipeline(
@@ -722,9 +876,17 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn recover_lease(
         &self,
-        _request: Request<RecoverLeaseRequestProto>,
+        request: Request<RecoverLeaseRequestProto>,
     ) -> Result<Response<RecoverLeaseResponseProto>, Status> {
-        Err(Status::unimplemented("Lease recovery not yet implemented"))
+        let req = request.into_inner();
+        let path = req.src;
+        let client_name = req.client_name;
+
+        info!("recover_lease: {} client={}", path, client_name);
+
+        let result = self.service.handle_recover_lease(&path, &client_name).await?;
+
+        Ok(Response::new(RecoverLeaseResponseProto { result }))
     }
 
     async fn get_fs_replicated_block_stats(

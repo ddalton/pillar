@@ -213,6 +213,25 @@ mod tests {
     use tempfile::TempDir;
     use std::fs;
 
+    #[test]
+    fn test_data_transfer_op_from_u8() {
+        assert_eq!(DataTransferOp::from_u8(80).unwrap() as u8, DataTransferOp::WriteBlock as u8);
+        assert_eq!(DataTransferOp::from_u8(81).unwrap() as u8, DataTransferOp::ReadBlock as u8);
+        assert_eq!(DataTransferOp::from_u8(82).unwrap() as u8, DataTransferOp::ReplaceBlock as u8);
+        assert_eq!(DataTransferOp::from_u8(83).unwrap() as u8, DataTransferOp::CopyBlock as u8);
+        assert_eq!(DataTransferOp::from_u8(84).unwrap() as u8, DataTransferOp::BlockChecksum as u8);
+        assert!(DataTransferOp::from_u8(99).is_none());
+    }
+
+    #[test]
+    fn test_data_transfer_op_values() {
+        assert_eq!(DataTransferOp::WriteBlock as u8, 80);
+        assert_eq!(DataTransferOp::ReadBlock as u8, 81);
+        assert_eq!(DataTransferOp::ReplaceBlock as u8, 82);
+        assert_eq!(DataTransferOp::CopyBlock as u8, 83);
+        assert_eq!(DataTransferOp::BlockChecksum as u8, 84);
+    }
+
     #[tokio::test]
     async fn test_data_transfer_server_creation() {
         let temp_dir = TempDir::new().unwrap();
