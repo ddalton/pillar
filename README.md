@@ -23,11 +23,11 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
   - Implements official Apache Hadoop protobuf protocols
 
 - **☸️ Kubernetes Native**: Designed for cloud-native deployments
-  - NameNode: StatefulSet with ClusterIP service
+  - NameNode: StatefulSet with HA support (1 active, N standby)
   - **Etcd cluster**: 3-node StatefulSet for HA metadata storage
-  - DataNode: DaemonSet with headless service
+  - DataNode: StatefulSet with persistent storage
   - Helm chart for easy deployment
-  - Uses Flint CSI for DataNode storage
+  - Supports any Kubernetes storage class
 
 - **🔐 Secure**: Enterprise-grade security
   - Kerberos authentication
@@ -41,11 +41,11 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
 │ HDFS Clients (hadoop fs, Spark, Hive, etc.)                │
 │  ↓ HDFS RPC Protocol (gRPC/Protobuf)                       │
 ├─────────────────────────────────────────────────────────────┤
-│ Pillar NameNode               Pillar DataNode (DaemonSet)  │
+│ Pillar NameNode (StatefulSet) Pillar DataNode (StatefulSet)│
 │ - Metadata management         - Block storage              │
 │ - Block allocation            - High-perf I/O              │
-│ - Namespace tree              - Flint CSI RWO volumes      │
-│ - Persists to etcd/SQLite     - SPDK backend (373 MB/s)    │
+│ - Namespace tree              - Persistent volumes         │
+│ - Persists to etcd            - Optional RDMA support      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -53,7 +53,6 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
 
 - **pillar-namenode**: HDFS NameNode implementation
 - **pillar-datanode**: HDFS DataNode implementation
-- **pillar-csi-driver**: Kubernetes CSI driver
 - **pillar-proto**: Generated code from Apache Hadoop protobufs
 - **pillar-common**: Shared utilities and HDFS abstractions
 
@@ -77,7 +76,6 @@ cargo build --release
 # Or build individual components
 cargo build -p pillar-namenode --release
 cargo build -p pillar-datanode --release
-cargo build -p pillar-csi-driver --release
 ```
 
 ### Binaries
@@ -85,7 +83,6 @@ cargo build -p pillar-csi-driver --release
 After building, binaries will be in `target/release/`:
 - `pillar-namenode` - NameNode server
 - `pillar-datanode` - DataNode server
-- `pillar-csi-driver` - CSI driver
 
 ## Quick Start
 
@@ -130,11 +127,11 @@ hadoop fs -put file.txt hdfs://localhost:9000/test/
 ```bash
 # Install via Helm
 helm install pillar ./pillar-chart \
-  --set datanode.storage.storageClass=flint \
+  --set namenode.replicas=3 \
+  --set datanode.replicas=3 \
   --set datanode.storage.size=100Gi
 
-# Access from applications
-# Applications connect via HDFS protocol (NOT CSI mounts):
+# Access from applications via HDFS protocol:
 # hdfs://pillar-namenode:9000/
 ```
 
@@ -254,25 +251,21 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - Lock-free block metadata cache (DashMap)
   - 373 MB/s throughput via Flint SPDK backend
 
-- [x] **Phase 4:** CSI Driver
-  - Identity, Controller, Node services
-  - Administrative namespace management
-  - Applications use HDFS protocol (not CSI mounts)
-
-- [x] **Phase 5:** Helm Chart & Deployment
+- [x] **Phase 4:** Helm Chart & Deployment
   - Complete Helm chart with all components
-  - ClusterIP service (NameNode)
-  - Headless service (DataNodes)
-  - RBAC, StorageClass, CSI components
+  - NameNode StatefulSet with HA support
+  - DataNode StatefulSet with persistent storage
+  - ClusterIP services for NameNode and DataNodes
+  - Etcd StatefulSet for metadata storage
 
-- [x] **Phase 6:** Integration Testing
+- [x] **Phase 5:** Integration Testing
   - KUTTL-based system test framework
   - Basic HDFS operations test (mkdir, put, get, ls, cat, cp)
   - Multi-DataNode replication testing (3-way replication)
   - Comprehensive Hadoop CLI compatibility tests
   - See [tests/system/README.md](tests/system/README.md) for details
 
-- [x] **Phase 6.5:** gRPC Protocol Implementation ✨ **NEW!**
+- [x] **Phase 6:** gRPC Protocol Implementation ✨ **NEW!**
   - Complete gRPC server with tonic
   - ClientNamenodeProtocol (all client operations)
   - DatanodeProtocol (DataNode registration, heartbeat, block reports)
@@ -321,5 +314,5 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 ## Acknowledgments
 
 - Built on Apache Hadoop protobuf protocols
-- Uses Flint CSI for high-performance storage backend
-- Inspired by the need for better HDFS performance in Kubernetes
+- Designed for high-performance storage in Kubernetes
+- Inspired by the need for better HDFS performance in cloud-native environments

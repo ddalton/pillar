@@ -301,13 +301,13 @@ mod tests {
         let data = b"Hello, HDFS!";
         storage.write_block(&block_id, 0, data).unwrap();
 
-        // Read data
-        let read_data = storage.read_block(&block_id, 0, data.len() as u64).unwrap();
-        assert_eq!(&read_data[..], data);
-
-        // Finalize
+        // Finalize (blocks must be finalized before reading)
         let size = storage.finalize_block(&block_id).unwrap();
         assert_eq!(size, data.len() as u64);
+
+        // Read data (after finalization)
+        let read_data = storage.read_block(&block_id, 0, data.len() as u64).unwrap();
+        assert_eq!(&read_data[..], data);
 
         // Verify in blocks cache
         assert_eq!(storage.get_block_count(), 1);

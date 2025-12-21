@@ -1,17 +1,17 @@
-# Pillar CSI Driver - Implementation Plan
+# Pillar HDFS - Implementation Plan
 
 ## Overview
 
-Extract pNFS code from Flint into a new CSI driver called "Pillar" that implements a **drop-in replacement for Apache Hadoop HDFS** in Rust.
+Pillar is a **drop-in replacement for Apache Hadoop HDFS** written in Rust, designed for cloud-native deployments.
 
-**Key Changes:**
-- Remove pNFS from Flint (keep only standalone NFS for RWX)
-- Create new project "Pillar" at `/Users/ddalton/github/pillar`
-- Implement official Apache Hadoop HDFS protobuf protocols
+**Key Features:**
+- Project "Pillar" at `/Users/ddalton/github/pillar`
+- Implements official Apache Hadoop HDFS protobuf protocols
 - NameNode and DataNode implement gRPC interfaces from Apache Hadoop
 - Compatible with hadoop fs, Spark, Hive, and all Hadoop ecosystem tools
-- DataNodes use Flint CSI RWO volumes for high-performance storage
-- NameNode persists metadata to etcd or PVC
+- Deployed as Kubernetes StatefulSets for both NameNode and DataNode
+- NameNode persists metadata to etcd cluster for HA
+- DataNodes use persistent volumes for block storage
 
 **Performance Goal:** Provide 3-5x performance improvement over Java HDFS by leveraging Rust's zero-cost abstractions and Flint's SPDK storage backend.
 
@@ -22,23 +22,21 @@ Extract pNFS code from Flint into a new CSI driver called "Pillar" that implemen
 │ HDFS Clients (hadoop fs, Spark, Hive, etc.)                │
 │  ↓ HDFS RPC Protocol (gRPC/Protobuf)                       │
 ├─────────────────────────────────────────────────────────────┤
-│ Pillar NameNode               Pillar DataNode (DaemonSet)  │
+│ Pillar NameNode (StatefulSet) Pillar DataNode (StatefulSet)│
 │ ┌──────────────────────┐      ┌──────────────────────────┐ │
 │ │ClientNamenodeProtocol│      │ClientDatanodeProtocol    │ │
 │ │DatanodeProtocol      │      │DatanodeProtocol          │ │
 │ │- File operations     │      │- Block I/O               │ │
 │ │- Block allocation    │      │- Block reporting         │ │
 │ │- Metadata mgmt       │◄─────┤- Heartbeats              │ │
-│ │- Namespace tree      │ gRPC │- Uses Flint RWO volume   │ │
-│ │- Persists to etcd    │      │- High-perf SPDK backend  │ │
+│ │- Namespace tree      │ gRPC │- Persistent volumes      │ │
+│ │- Persists to etcd    │      │- Optional RDMA support   │ │
 │ └──────────────────────┘      └──────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
                                     ↓
-                           Flint CSI RWO Volume
+                           Persistent Volumes (PVC)
                                     ↓
-                              SPDK Storage (373 MB/s)
-
-Note: Also includes Pillar CSI driver for Kubernetes integration
+                         Storage Backend (any StorageClass)
 ```
 
 **Protocol Stack:**
@@ -52,12 +50,6 @@ Note: Also includes Pillar CSI driver for Kubernetes integration
 ```
 /Users/ddalton/github/pillar/
 ├── Cargo.toml                    # Workspace root
-├── pillar-csi-driver/            # CSI driver (new)
-│   └── src/
-│       ├── main.rs
-│       ├── controller.rs         # CreateVolume, DeleteVolume
-│       ├── node.rs               # NodePublishVolume (mount HDFS)
-│       └── identity.rs
 ├── pillar-namenode/              # HDFS NameNode
 │   └── src/
 │       ├── main.rs
@@ -81,7 +73,7 @@ Note: Also includes Pillar CSI driver for Kubernetes integration
 │       │   ├── client_datanode_service.rs  # ClientDatanodeProtocol
 │       │   └── namenode_client.rs          # Client for NameNode
 │       ├── storage/
-│       │   ├── volume_manager.rs           # Manage Flint RWO volume
+│       │   ├── volume_manager.rs           # Manage persistent volumes
 │       │   ├── block_storage.rs            # HDFS block file storage
 │       │   └── data_transfer.rs            # HDFS data transfer protocol
 │       └── heartbeat.rs          # Heartbeat loop
@@ -683,38 +675,7 @@ This is the most complex phase as it implements the full HDFS NameNode protocol.
 5. Block reporting
 6. Data transfer protocol (client I/O)
 
-### Phase 4: CSI Driver Implementation (3-4 days)
-
-1. Implement CSI Controller:
-   ```rust
-   // pillar-csi-driver/src/controller.rs
-   async fn create_volume(&self, req: CreateVolumeRequest) -> Result<CreateVolumeResponse> {
-       // Call NameNode gRPC: CreateVolume
-       // NameNode allocates blocks across DataNodes
-       // Return volume_id
-   }
-   ```
-
-2. Implement CSI Node:
-   ```rust
-   // pillar-csi-driver/src/node.rs
-   async fn node_publish_volume(&self, req: NodePublishVolumeRequest) -> Result<NodePublishVolumeResponse> {
-       // Mount NFS from NameNode:
-       // mount -t nfs4 namenode-service:2049:/pillar/volumes/{volume_id} {target_path}
-   }
-   ```
-
-3. Create protobuf definitions:
-   - Copy `proto/csi.proto` from Flint
-   - Create `proto/pillar_control.proto` (evolved from `pnfs_control.proto`)
-
-**Critical Files:**
-- `/Users/ddalton/github/pillar/pillar-csi-driver/src/main.rs`
-- `/Users/ddalton/github/pillar/pillar-csi-driver/src/controller.rs`
-- `/Users/ddalton/github/pillar/pillar-csi-driver/src/node.rs`
-- `/Users/ddalton/github/pillar/proto/pillar_control.proto`
-
-### Phase 5: Helm Chart & Deployment (3-4 days)
+### Phase 4: Helm Chart & Deployment (3-4 days)
 
 1. Create Helm chart structure:
    ```
@@ -722,29 +683,35 @@ This is the most complex phase as it implements the full HDFS NameNode protocol.
    ├── Chart.yaml
    ├── values.yaml
    └── templates/
-       ├── namenode-deployment.yaml
+       ├── namenode-statefulset.yaml
        ├── namenode-service.yaml
-       ├── datanode-daemonset.yaml
-       ├── csidriver.yaml
-       ├── controller.yaml (CSI controller)
-       └── node.yaml (CSI node DaemonSet)
+       ├── datanode-statefulset.yaml
+       ├── datanode-service.yaml
+       ├── etcd-statefulset.yaml
+       ├── etcd-service.yaml
+       ├── configmap-common.yaml
+       ├── configmap-namenode.yaml
+       └── configmap-datanode.yaml
    ```
 
-2. NameNode deployment:
+2. NameNode StatefulSet:
    ```yaml
-   # Stateful deployment with PVC for metadata
+   # StatefulSet with HA support (1 active, N standby)
    apiVersion: apps/v1
    kind: StatefulSet
    metadata:
      name: pillar-namenode
    spec:
-     replicas: 1
+     replicas: 3  # 1 active, 2 standby
+     serviceName: pillar-namenode
      template:
        spec:
          containers:
          - name: namenode
            image: pillar/namenode:v0.1.0
-           volumeMounts:
+           env:
+           - name: ETCD_ENDPOINTS
+             value: "etcd-0.etcd:2379,etcd-1.etcd:2379,etcd-2.etcd:2379"
            - name: metadata
              mountPath: /var/lib/pillar/metadata
      volumeClaimTemplates:

@@ -4,17 +4,21 @@ metadata:
   name: {{ include "pillar.fullname" . }}-namenode
   labels:
     app: {{ include "pillar.name" . }}-namenode
+    component: namenode
     {{- include "pillar.labels" . | nindent 4 }}
 spec:
   serviceName: {{ include "pillar.fullname" . }}-namenode
   replicas: {{ .Values.namenode.replicas }}
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: {{ include "pillar.name" . }}-namenode
+      component: namenode
   template:
     metadata:
       labels:
         app: {{ include "pillar.name" . }}-namenode
+        component: namenode
     spec:
       containers:
       - name: namenode
@@ -30,6 +34,13 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        # NameNode HA configuration
+        # The first pod (index 0) will be the active NameNode
+        # All other pods will be standby NameNodes
+        - name: NAMENODE_HA_ENABLED
+          value: "{{ gt (int .Values.namenode.replicas) 1 }}"
+        - name: NAMENODE_SERVICE_NAME
+          value: "{{ include "pillar.fullname" . }}-namenode"
         # Etcd endpoints for HA metadata storage
         - name: ETCD_ENDPOINTS
           value: {{ include "pillar.etcdEndpoints" . | quote }}
@@ -44,6 +55,9 @@ spec:
         - --etcd-endpoints={{ include "pillar.etcdEndpoints" . }}
         - --replication={{ .Values.hdfs.replication }}
         - --block-size-mb={{ .Values.hdfs.blockSize }}
+        {{- if gt (int .Values.namenode.replicas) 1 }}
+        - --ha-enabled=true
+        {{- end }}
         ports:
         - name: rpc
           containerPort: {{ .Values.namenode.rpcPort }}

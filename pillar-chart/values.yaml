@@ -69,7 +69,10 @@ namenode:
     tag: v0.1.0
     pullPolicy: IfNotPresent
 
-  replicas: 1  # Single replica for MVP, can add HA later
+  # Number of NameNode replicas
+  # For HA: Set to 3 or more (first pod is active, others are standby)
+  # For development: Set to 1
+  replicas: 1
 
   resources:
     requests:
@@ -124,8 +127,9 @@ datanode:
     tag: v0.1.0
     pullPolicy: IfNotPresent
 
-  # DaemonSet - runs on every node
-  # Each DataNode gets its own Flint RWO volume
+  # Number of DataNode replicas in the StatefulSet
+  # Recommended: 3 or more for production
+  replicas: 3
 
   resources:
     requests:
@@ -144,11 +148,19 @@ datanode:
   # HTTP UI port
   httpPort: 50075
 
+  # RDMA configuration for high-performance data transfer
+  rdma:
+    enabled: false
+    port: 50011
+    queueDepth: 128
+    maxInlineData: 256
+    bufferPoolSize: 1024
+
   # Storage configuration (per DataNode)
   storage:
-    # Underlying storage class (Flint RWO volumes)
-    storageClass: flint
-    # Size per DataNode (adjust based on node capacity)
+    # Underlying storage class for persistent volumes
+    storageClass: ""  # Use default storage class
+    # Size per DataNode
     size: 100Gi
 
   # DataNode-specific configuration
@@ -193,41 +205,6 @@ datanode:
     # Then create a separate DaemonSet with nodeSelector:
     #   kubernetes.io/hostname: worker-node-1
 
-## CSI Driver Configuration
-csiDriver:
-  enabled: true
-
-  image:
-    repository: pillar/csi-driver
-    tag: v0.1.0
-    pullPolicy: IfNotPresent
-
-  controller:
-    replicas: 1
-
-    resources:
-      requests:
-        cpu: 100m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-
-  node:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        cpu: 200m
-        memory: 256Mi
-
-  # CSI driver name
-  driverName: pillar.csi.hdfs.io
-
-  # Socket paths
-  socketDir: /var/lib/kubelet/plugins/pillar.csi.hdfs.io
-
 ## Service Configuration
 service:
   # NameNode service type (ClusterIP for direct client access)
@@ -253,18 +230,3 @@ security:
     # kdcServer: "kdc.example.com"
     # principal: "hdfs/_HOST@EXAMPLE.COM"
     # keytabPath: "/etc/security/keytabs/hdfs.keytab"
-
-## Storage Classes
-storageClass:
-  # Create a StorageClass for Pillar volumes
-  create: true
-  name: pillar
-  # Reclaim policy
-  reclaimPolicy: Delete
-  # Volume binding mode
-  volumeBindingMode: Immediate
-  # Allow volume expansion
-  allowVolumeExpansion: true
-  # Parameters passed to CSI driver
-  parameters:
-    replicationFactor: "3"

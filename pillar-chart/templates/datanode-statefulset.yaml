@@ -1,30 +1,31 @@
 apiVersion: apps/v1
-kind: DaemonSet
+kind: StatefulSet
 metadata:
   name: {{ include "pillar.fullname" . }}-datanode
   labels:
     app: {{ include "pillar.name" . }}-datanode
+    component: datanode
     {{- include "pillar.labels" . | nindent 4 }}
 spec:
+  serviceName: {{ include "pillar.fullname" . }}-datanode
+  replicas: {{ .Values.datanode.replicas }}
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: {{ include "pillar.name" . }}-datanode
+      component: datanode
   template:
     metadata:
       labels:
         app: {{ include "pillar.name" . }}-datanode
+        component: datanode
     spec:
-      hostNetwork: true  # For direct DataNode access
       containers:
       - name: datanode
         image: "{{ .Values.datanode.image.repository }}:{{ .Values.datanode.image.tag }}"
         imagePullPolicy: {{ .Values.datanode.image.pullPolicy }}
         env:
-        # Pod and node information
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
+        # Pod information
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -51,6 +52,10 @@ spec:
         - --http-addr=0.0.0.0:{{ .Values.datanode.httpPort }}
         - --volume-mount-point=/mnt/pillar-data
         - --block-pool-id={{ .Values.hdfs.blockPoolId }}
+        {{- if .Values.datanode.rdma.enabled }}
+        - --transport=auto
+        - --rdma-port={{ .Values.datanode.rdma.port }}
+        {{- end }}
         ports:
         - name: rpc
           containerPort: {{ .Values.datanode.rpcPort }}
@@ -61,6 +66,11 @@ spec:
         - name: http
           containerPort: {{ .Values.datanode.httpPort }}
           protocol: TCP
+        {{- if .Values.datanode.rdma.enabled }}
+        - name: rdma
+          containerPort: {{ .Values.datanode.rdma.port }}
+          protocol: TCP
+        {{- end }}
         volumeMounts:
         - name: storage
           mountPath: /mnt/pillar-data
@@ -76,9 +86,14 @@ spec:
             port: rpc
           initialDelaySeconds: 10
           periodSeconds: 5
-      volumes:
-      - name: storage
-        persistentVolumeClaim:
-          # Pre-create PVCs per node: pillar-datanode-storage-<nodename>
-          # Or use a provisioner that auto-creates per-node volumes
-          claimName: {{ include "pillar.fullname" . }}-datanode-storage-{{ "{{" }} .NodeName {{ "}}" }}
+  volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      {{- if .Values.datanode.storage.storageClass }}
+      storageClassName: {{ .Values.datanode.storage.storageClass }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.datanode.storage.size }}
