@@ -19,6 +19,7 @@ use pillar_proto::hdfs::{
 };
 
 use crate::storage::{VolumeManager, BlockStorage};
+use crate::replication::{ReplicationCoordinator, ReplicationRequest, ReplicationTarget};
 
 #[derive(Error, Debug)]
 pub enum NamenodeClientError {
@@ -62,6 +63,7 @@ pub struct NamenodeClient {
     block_storage: Arc<BlockStorage>,
     heartbeat_interval: Duration,
     block_pool_id: String,
+    replication_coordinator: Option<Arc<ReplicationCoordinator>>,
 }
 
 impl NamenodeClient {
@@ -79,7 +81,13 @@ impl NamenodeClient {
             block_storage,
             heartbeat_interval: Duration::from_secs(3),
             block_pool_id,
+            replication_coordinator: None,
         }
+    }
+
+    /// Set the replication coordinator (called after initialization)
+    pub fn set_replication_coordinator(&mut self, coordinator: Arc<ReplicationCoordinator>) {
+        self.replication_coordinator = Some(coordinator);
     }
 
     /// Create a gRPC client connection to the NameNode
@@ -318,17 +326,83 @@ impl NamenodeClient {
     /// Handle a command from the NameNode
     async fn handle_command(&self, command: DatanodeCommand) -> Result<()> {
         match command {
-            DatanodeCommand::ReplicateBlocks { blocks, target } => {
-                info!("Received command to replicate {} blocks to {}", blocks.len(), target);
-                // TODO: Implement block replication
+            DatanodeCommand::ReplicateBlocks { blocks, targets } => {
+                info!(
+                    "Received command to replicate {} blocks to {} target(s)",
+                    blocks.len(),
+                    targets.len()
+                );
+
+                // Check if replication coordinator is available
+                let coordinator = match &self.replication_coordinator {
+                    Some(c) => c.clone(),
+                    None => {
+                        error!("Replication coordinator not initialized");
+                        return Err(NamenodeClientError::HeartbeatFailed(
+                            "Replication coordinator not available".to_string()
+                        ));
+                    }
+                };
+
+                // Replicate each block
+                for (block_id, gen_stamp, block_size) in blocks {
+                    debug!(
+                        "Replicating block {} (gen_stamp={}, size={}) to {} targets",
+                        block_id, gen_stamp, block_size, targets.len()
+                    );
+
+                    // Create replication request
+                    let request = ReplicationRequest {
+                        block_id,
+                        gen_stamp,
+                        targets: targets.clone(),
+                        block_size,
+                        priority: 1,
+                    };
+
+                    // Execute replication
+                    match coordinator.replicate(request).await {
+                        Ok(result) => {
+                            if result.is_success() {
+                                info!(
+                                    "Successfully replicated block {} to {}/{} targets ({:.2} MB/s)",
+                                    block_id,
+                                    result.successful_replicas,
+                                    result.total_replicas,
+                                    result.throughput_mbps()
+                                );
+                            } else if result.is_partial() {
+                                warn!(
+                                    "Partial replication for block {}: {}/{} targets succeeded",
+                                    block_id,
+                                    result.successful_replicas,
+                                    result.total_replicas
+                                );
+                                for error in &result.errors {
+                                    warn!("  - {}", error);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to replicate block {}: {}", block_id, e);
+                        }
+                    }
+                }
+
+                info!("Block replication command completed");
             }
             DatanodeCommand::InvalidateBlocks { blocks } => {
                 info!("Received command to invalidate {} blocks", blocks.len());
                 // TODO: Implement block deletion
+                for block_id in blocks {
+                    debug!("Invalidating block {}", block_id);
+                    // Future implementation: self.block_storage.delete_block(block_id)?;
+                }
             }
             DatanodeCommand::Shutdown => {
                 warn!("Received shutdown command from NameNode");
                 // TODO: Implement graceful shutdown
+                // Future implementation: signal shutdown and cleanup resources
             }
         }
 
@@ -339,13 +413,17 @@ impl NamenodeClient {
 /// Commands that can be received from NameNode
 #[derive(Debug, Clone)]
 pub enum DatanodeCommand {
+    /// Replicate blocks to target DataNodes
+    /// Each tuple contains: (block_id, gen_stamp, block_size)
     ReplicateBlocks {
-        blocks: Vec<u64>,
-        target: String,
+        blocks: Vec<(u64, u64, u64)>,
+        targets: Vec<ReplicationTarget>,
     },
+    /// Invalidate (delete) blocks
     InvalidateBlocks {
         blocks: Vec<u64>,
     },
+    /// Shutdown the DataNode gracefully
     Shutdown,
 }
 

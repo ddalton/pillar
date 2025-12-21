@@ -2,6 +2,7 @@ mod storage;
 mod grpc;
 mod server;
 mod transport;
+mod replication;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
