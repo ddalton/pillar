@@ -848,16 +848,37 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn concat(
         &self,
-        _request: Request<ConcatRequestProto>,
+        request: Request<ConcatRequestProto>,
     ) -> Result<Response<ConcatResponseProto>, Status> {
-        Err(Status::unimplemented("concat not supported"))
+        let req = request.into_inner();
+
+        info!(
+            "concat: target={} sources={:?}",
+            req.trg, req.srcs
+        );
+
+        self.service.handle_concat(&req.trg, &req.srcs).await?;
+
+        Ok(Response::new(ConcatResponseProto {}))
     }
 
     async fn truncate(
         &self,
-        _request: Request<TruncateRequestProto>,
+        request: Request<TruncateRequestProto>,
     ) -> Result<Response<TruncateResponseProto>, Status> {
-        Err(Status::unimplemented("truncate not supported"))
+        let req = request.into_inner();
+
+        info!(
+            "truncate: src={} new_length={} client={}",
+            req.src, req.new_length, req.client_name
+        );
+
+        let result = self.service.handle_truncate(
+            &req.src,
+            req.new_length,
+        ).await?;
+
+        Ok(Response::new(TruncateResponseProto { result }))
     }
 
     async fn rename2(

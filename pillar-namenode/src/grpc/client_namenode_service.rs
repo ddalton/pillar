@@ -506,6 +506,166 @@ impl ClientNamenodeService {
         Ok(true)
     }
 
+    /// Truncate a file to a new length
+    pub async fn handle_truncate(
+        &self,
+        path: &str,
+        new_length: u64,
+    ) -> Result<bool, Status> {
+        info!("Truncating file {} to {} bytes", path, new_length);
+
+        let inode = self.namespace
+            .lookup(path)
+            .await
+            .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
+
+        let mut inode_guard = inode.write().await;
+
+        if inode_guard.is_dir {
+            return Err(Status::invalid_argument("Cannot truncate directory"));
+        }
+
+        // Calculate current file length
+        let current_length = inode_guard.blocks.as_ref()
+            .map(|blocks| blocks.iter().map(|b| b.num_bytes).sum())
+            .unwrap_or(0);
+
+        // Validate new length
+        if new_length > current_length {
+            return Err(Status::invalid_argument(format!(
+                "Cannot truncate to length {} greater than current length {}",
+                new_length, current_length
+            )));
+        }
+
+        // If new length is same as current, it's a no-op
+        if new_length == current_length {
+            info!("Truncate is no-op: new length equals current length");
+            return Ok(true);
+        }
+
+        // Determine which blocks to keep and modify
+        let block_size = inode_guard.block_size;
+        let num_blocks_to_keep = ((new_length + block_size - 1) / block_size) as usize;
+
+        if let Some(blocks) = &mut inode_guard.blocks {
+            // If truncating to zero, remove all blocks
+            if new_length == 0 {
+                blocks.clear();
+                info!("Truncated {} to zero length, removed all blocks", path);
+                return Ok(true);
+            }
+
+            // Calculate the size of the last block after truncation
+            let last_block_size = if new_length % block_size == 0 {
+                block_size
+            } else {
+                new_length % block_size
+            };
+
+            // Keep only the blocks we need and update the last block's size
+            blocks.truncate(num_blocks_to_keep);
+
+            if let Some(last_block) = blocks.last_mut() {
+                last_block.num_bytes = last_block_size;
+                info!(
+                    "Updated last block {} size to {} bytes",
+                    last_block.block_id,
+                    last_block_size
+                );
+            }
+
+            info!(
+                "Truncated {} from {} to {} bytes ({} blocks remaining)",
+                path, current_length, new_length, blocks.len()
+            );
+        }
+
+        Ok(true)
+    }
+
+    /// Concatenate source files into target file
+    pub async fn handle_concat(
+        &self,
+        target: &str,
+        sources: &[String],
+    ) -> Result<(), Status> {
+        info!("Concatenating {} files into {}", sources.len(), target);
+
+        // Validate sources array is not empty
+        if sources.is_empty() {
+            return Err(Status::invalid_argument("Sources array cannot be empty"));
+        }
+
+        // Look up target file
+        let target_inode = self.namespace
+            .lookup(target)
+            .await
+            .map_err(|e| Status::not_found(format!("Target file not found: {}", e)))?;
+
+        let mut target_guard = target_inode.write().await;
+
+        if target_guard.is_dir {
+            return Err(Status::invalid_argument("Target cannot be a directory"));
+        }
+
+        // Validate and collect all source files
+        let mut source_blocks = Vec::new();
+        for source_path in sources {
+            let source_inode = self.namespace
+                .lookup(source_path)
+                .await
+                .map_err(|e| Status::not_found(format!("Source file not found: {}", e)))?;
+
+            let source_guard = source_inode.read().await;
+
+            if source_guard.is_dir {
+                return Err(Status::invalid_argument(format!(
+                    "Source {} is a directory",
+                    source_path
+                )));
+            }
+
+            // Check block size compatibility
+            if source_guard.block_size != target_guard.block_size {
+                return Err(Status::invalid_argument(format!(
+                    "Source {} has different block size ({} vs {})",
+                    source_path, source_guard.block_size, target_guard.block_size
+                )));
+            }
+
+            // Collect blocks from this source
+            if let Some(blocks) = &source_guard.blocks {
+                source_blocks.extend(blocks.clone());
+            }
+        }
+
+        // Append source blocks to target
+        if let Some(target_blocks) = &mut target_guard.blocks {
+            target_blocks.extend(source_blocks);
+        } else {
+            target_guard.blocks = Some(source_blocks);
+        }
+
+        // Release target lock before deleting sources
+        drop(target_guard);
+
+        // Delete all source files
+        for source_path in sources {
+            self.namespace
+                .delete(source_path, false)
+                .await
+                .map_err(|e| Status::internal(format!(
+                    "Failed to delete source file {}: {}",
+                    source_path, e
+                )))?;
+        }
+
+        info!("Successfully concatenated {} files into {}", sources.len(), target);
+
+        Ok(())
+    }
+
     /// Score a datanode for use as a replacement (higher is better)
     fn score_datanode_for_replacement(&self, node: &crate::datanode::manager::DatanodeDescriptor) -> f64 {
         let mut score = 0.0;
@@ -2003,5 +2163,940 @@ mod tests {
 
         assert!(has_new_datanode || new_locations.len() > existing.len(),
                 "Should have added a new datanode for pipeline recovery");
+    }
+
+    // ========================================================================
+    // Truncate Operation Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_truncate_to_shorter_length() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file with a block
+        let block_size = 128 * 1024 * 1024; // 128MB
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            block_size,
+        ).await.unwrap();
+
+        service.handle_add_block("/test.txt").await.unwrap();
+
+        // Simulate a full block
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        {
+            let mut inode_guard = inode.write().await;
+            if let Some(blocks) = &mut inode_guard.blocks {
+                if let Some(block) = blocks.last_mut() {
+                    block.num_bytes = block_size; // Full block
+                }
+            }
+        }
+
+        // Truncate to half the block size
+        let new_length = block_size / 2;
+        let result = service.handle_truncate("/test.txt", new_length).await.unwrap();
+        assert!(result);
+
+        // Verify the file length
+        let file_info = service.handle_get_file_info("/test.txt").await.unwrap();
+        assert_eq!(file_info.length, new_length);
+
+        // Verify block was updated
+        let inode_guard = inode.read().await;
+        assert_eq!(inode_guard.blocks.as_ref().unwrap().len(), 1);
+        assert_eq!(inode_guard.blocks.as_ref().unwrap()[0].num_bytes, new_length);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_to_same_length() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        service.handle_add_block("/test.txt").await.unwrap();
+
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        let current_length = 64 * 1024 * 1024;
+        {
+            let mut inode_guard = inode.write().await;
+            if let Some(blocks) = &mut inode_guard.blocks {
+                if let Some(block) = blocks.last_mut() {
+                    block.num_bytes = current_length;
+                }
+            }
+        }
+
+        // Truncate to same length (no-op)
+        let result = service.handle_truncate("/test.txt", current_length).await.unwrap();
+        assert!(result);
+
+        // Verify nothing changed
+        let file_info = service.handle_get_file_info("/test.txt").await.unwrap();
+        assert_eq!(file_info.length, current_length);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_beyond_length_fails() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        service.handle_add_block("/test.txt").await.unwrap();
+
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        let current_length = 64 * 1024 * 1024;
+        {
+            let mut inode_guard = inode.write().await;
+            if let Some(blocks) = &mut inode_guard.blocks {
+                if let Some(block) = blocks.last_mut() {
+                    block.num_bytes = current_length;
+                }
+            }
+        }
+
+        // Try to truncate beyond current length - should fail
+        let result = service.handle_truncate("/test.txt", current_length + 1000).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_removes_complete_blocks() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file with multiple blocks
+        let block_size = 128 * 1024 * 1024;
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            block_size,
+        ).await.unwrap();
+
+        // Add 3 blocks
+        service.handle_add_block("/test.txt").await.unwrap();
+        service.handle_add_block("/test.txt").await.unwrap();
+        service.handle_add_block("/test.txt").await.unwrap();
+
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        {
+            let mut inode_guard = inode.write().await;
+            if let Some(blocks) = &mut inode_guard.blocks {
+                // Make all blocks full
+                for block in blocks.iter_mut() {
+                    block.num_bytes = block_size;
+                }
+            }
+        }
+
+        // Verify we have 3 blocks
+        {
+            let inode_guard = inode.read().await;
+            assert_eq!(inode_guard.blocks.as_ref().unwrap().len(), 3);
+        }
+
+        // Truncate to 1.5 blocks
+        let new_length = block_size + (block_size / 2);
+        let result = service.handle_truncate("/test.txt", new_length).await.unwrap();
+        assert!(result);
+
+        // Verify we now have 2 blocks
+        let inode_guard = inode.read().await;
+        assert_eq!(inode_guard.blocks.as_ref().unwrap().len(), 2);
+
+        // First block should be full, second should be half
+        assert_eq!(inode_guard.blocks.as_ref().unwrap()[0].num_bytes, block_size);
+        assert_eq!(inode_guard.blocks.as_ref().unwrap()[1].num_bytes, block_size / 2);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_to_zero() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file with blocks
+        let block_size = 128 * 1024 * 1024;
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            block_size,
+        ).await.unwrap();
+
+        service.handle_add_block("/test.txt").await.unwrap();
+        service.handle_add_block("/test.txt").await.unwrap();
+
+        // Set block sizes
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        {
+            let mut inode_guard = inode.write().await;
+            if let Some(blocks) = &mut inode_guard.blocks {
+                for block in blocks.iter_mut() {
+                    block.num_bytes = block_size / 2; // Half full blocks
+                }
+            }
+        }
+
+        // Truncate to zero
+        let result = service.handle_truncate("/test.txt", 0).await.unwrap();
+        assert!(result);
+
+        // Verify all blocks were removed
+        let inode_guard = inode.read().await;
+        assert!(inode_guard.blocks.as_ref().unwrap().is_empty());
+
+        // Verify file length is zero
+        let file_info = service.handle_get_file_info("/test.txt").await.unwrap();
+        assert_eq!(file_info.length, 0);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_nonexistent_file() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Try to truncate non-existent file
+        let result = service.handle_truncate("/nonexistent.txt", 100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_directory_fails() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create a directory
+        service.handle_mkdir("/dir", "user".to_string(), "group".to_string(), 0o755).await.unwrap();
+
+        // Try to truncate directory - should fail
+        let result = service.handle_truncate("/dir", 0).await;
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Concat Operation Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_concat_multiple_files() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        let block_size = 128 * 1024 * 1024;
+
+        // Create target file
+        service.handle_create(
+            "/target.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            block_size,
+        ).await.unwrap();
+        service.handle_add_block("/target.txt").await.unwrap();
+
+        // Create source files
+        for i in 1..=3 {
+            let path = format!("/source{}.txt", i);
+            service.handle_create(
+                &path,
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                1,
+                block_size,
+            ).await.unwrap();
+            service.handle_add_block(&path).await.unwrap();
+        }
+
+        // Concat source files into target
+        let sources = vec![
+            "/source1.txt".to_string(),
+            "/source2.txt".to_string(),
+            "/source3.txt".to_string(),
+        ];
+
+        let result = service.handle_concat("/target.txt", &sources).await;
+        assert!(result.is_ok());
+
+        // Verify target file has all blocks (1 original + 3 from sources = 4 total)
+        let target_inode = namespace.lookup("/target.txt").await.unwrap();
+        let target_guard = target_inode.read().await;
+        assert_eq!(target_guard.blocks.as_ref().unwrap().len(), 4);
+
+        // Verify source files were deleted
+        for i in 1..=3 {
+            let path = format!("/source{}.txt", i);
+            assert!(namespace.lookup(&path).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concat_empty_sources_fails() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create target file
+        service.handle_create(
+            "/target.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Try to concat with empty sources - should fail
+        let result = service.handle_concat("/target.txt", &[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concat_nonexistent_source_fails() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create target file
+        service.handle_create(
+            "/target.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Try to concat with non-existent source
+        let sources = vec!["/nonexistent.txt".to_string()];
+        let result = service.handle_concat("/target.txt", &sources).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concat_different_block_sizes_fails() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create target file with 128MB blocks
+        service.handle_create(
+            "/target.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Create source file with 64MB blocks
+        service.handle_create(
+            "/source.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            64 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Try to concat - should fail due to different block sizes
+        let sources = vec!["/source.txt".to_string()];
+        let result = service.handle_concat("/target.txt", &sources).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concat_directory_fails() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a directory and a file
+        service.handle_mkdir("/dir", "user".to_string(), "group".to_string(), 0o755).await.unwrap();
+        service.handle_create(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Try to concat directory as target - should fail
+        let sources = vec!["/file.txt".to_string()];
+        let result = service.handle_concat("/dir", &sources).await;
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Idempotency Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create a file
+        let result1 = service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await;
+        assert!(result1.is_ok());
+
+        // Retry create - should fail with already exists
+        let result2 = service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await;
+        assert!(result2.is_err());
+
+        // File should still exist and be intact
+        let info = service.handle_get_file_info("/test.txt").await.unwrap();
+        assert_eq!(info.path, "/test.txt");
+    }
+
+    #[tokio::test]
+    async fn test_delete_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Delete the file
+        let result1 = service.handle_delete("/test.txt", false).await;
+        assert!(result1.is_ok());
+
+        // Retry delete - should fail (file doesn't exist)
+        let result2 = service.handle_delete("/test.txt", false).await;
+        assert!(result2.is_err());
+
+        // File should not exist
+        assert!(service.handle_get_file_info("/test.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rename_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Rename the file
+        let result1 = service.handle_rename("/test.txt", "/renamed.txt").await;
+        assert!(result1.is_ok());
+
+        // Retry rename - should fail (source doesn't exist)
+        let result2 = service.handle_rename("/test.txt", "/renamed.txt").await;
+        assert!(result2.is_err());
+
+        // Renamed file should exist
+        assert!(service.handle_get_file_info("/renamed.txt").await.is_ok());
+        // Original should not exist
+        assert!(service.handle_get_file_info("/test.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file with data
+        let block_size = 128 * 1024 * 1024;
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            block_size,
+        ).await.unwrap();
+
+        service.handle_add_block("/test.txt").await.unwrap();
+
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        {
+            let mut inode_guard = inode.write().await;
+            if let Some(blocks) = &mut inode_guard.blocks {
+                if let Some(block) = blocks.last_mut() {
+                    block.num_bytes = block_size;
+                }
+            }
+        }
+
+        // Truncate the file
+        let new_length = block_size / 2;
+        let result1 = service.handle_truncate("/test.txt", new_length).await;
+        assert!(result1.is_ok());
+
+        // Retry truncate to same length - should succeed (idempotent)
+        let result2 = service.handle_truncate("/test.txt", new_length).await;
+        assert!(result2.is_ok());
+
+        // File length should be the same
+        let info = service.handle_get_file_info("/test.txt").await.unwrap();
+        assert_eq!(info.length, new_length);
+    }
+
+    #[tokio::test]
+    async fn test_mkdir_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        );
+
+        // Create a directory
+        let result1 = service.handle_mkdir("/dir", "user".to_string(), "group".to_string(), 0o755).await;
+        assert!(result1.is_ok());
+
+        // Retry mkdir - should fail (already exists)
+        let result2 = service.handle_mkdir("/dir", "user".to_string(), "group".to_string(), 0o755).await;
+        assert!(result2.is_err());
+
+        // Directory should still exist
+        let info = service.handle_get_file_info("/dir").await.unwrap();
+        assert!(info.is_dir);
+    }
+
+    #[tokio::test]
+    async fn test_append_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // First append
+        let result1 = service.handle_append("/test.txt").await;
+        assert!(result1.is_ok());
+        let block_id1 = result1.unwrap().block_id;
+
+        // Retry append - should succeed and return same block (if not full)
+        let result2 = service.handle_append("/test.txt").await;
+        assert!(result2.is_ok());
+        let block_id2 = result2.unwrap().block_id;
+
+        // Should get the same block back since it's not full
+        assert_eq!(block_id1, block_id2);
+    }
+
+    #[tokio::test]
+    async fn test_complete_idempotency() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager,
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register a datanode
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            1,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Complete the file
+        let result1 = service.handle_complete("/test.txt").await;
+        assert!(result1.is_ok());
+
+        // Retry complete - should succeed (idempotent)
+        let result2 = service.handle_complete("/test.txt").await;
+        assert!(result2.is_ok());
+
+        // File should still exist
+        assert!(service.handle_get_file_info("/test.txt").await.is_ok());
     }
 }
