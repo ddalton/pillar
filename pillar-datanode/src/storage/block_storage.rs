@@ -711,4 +711,167 @@ mod tests {
         let read_data = storage.read_block(&block_id, 0, 4).unwrap();
         assert_eq!(&read_data[..], b"Data");
     }
+
+    // ========================================================================
+    // Block Corruption Detection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_corrupted_block() {
+        use pillar_common::hdfs::checksums::{compute_checksum, verify_checksum};
+
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(3001, 1);
+
+        // Write original data
+        let original_data = b"Important data that must not be corrupted";
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, original_data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Compute checksum of original data
+        let original_checksum = compute_checksum(original_data);
+
+        // Read data and verify it matches
+        let read_data = storage.read_block(&block_id, 0, original_data.len() as u64).unwrap();
+        assert!(verify_checksum(&read_data, &original_checksum));
+
+        // Simulate corruption by tampering with the block file
+        let block_path = storage.get_block_path(&block_id, true);
+        let mut corrupted_data = original_data.to_vec();
+        corrupted_data[10] = b'X'; // Flip a byte
+        fs::write(&block_path, &corrupted_data).unwrap();
+
+        // Read corrupted data
+        let read_corrupted = storage.read_block(&block_id, 0, original_data.len() as u64).unwrap();
+
+        // Checksum validation should fail
+        assert!(!verify_checksum(&read_corrupted, &original_checksum),
+                "Corrupted block should fail checksum validation");
+    }
+
+    #[test]
+    fn test_checksum_validation_on_read() {
+        use pillar_common::hdfs::checksums::{compute_checksum, verify_checksum};
+
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(3002, 1);
+
+        // Write data and compute checksum
+        let data = b"Data that should maintain integrity";
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        let expected_checksum = compute_checksum(data);
+
+        // Read data multiple times
+        for _ in 0..5 {
+            let read_data = storage.read_block(&block_id, 0, data.len() as u64).unwrap();
+
+            // Validate checksum on each read
+            assert!(verify_checksum(&read_data, &expected_checksum),
+                    "Block data should pass checksum validation");
+            assert_eq!(&read_data[..], data);
+        }
+    }
+
+    #[test]
+    fn test_partial_block_corruption() {
+        use pillar_common::hdfs::checksums::{compute_checksum, verify_checksum};
+
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(3003, 1);
+
+        // Write large block
+        let large_data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, &large_data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        let original_checksum = compute_checksum(&large_data);
+
+        // Corrupt middle of block
+        let block_path = storage.get_block_path(&block_id, true);
+        let mut corrupted_data = large_data.clone();
+        corrupted_data[512] = 0xFF; // Flip byte in middle
+        fs::write(&block_path, &corrupted_data).unwrap();
+
+        // Read full block
+        let read_data = storage.read_block(&block_id, 0, 1024).unwrap();
+
+        // Should detect corruption even in middle of large block
+        assert!(!verify_checksum(&read_data, &original_checksum),
+                "Partial corruption should be detected");
+    }
+
+    #[test]
+    fn test_multiple_blocks_corruption_isolation() {
+        use pillar_common::hdfs::checksums::{compute_checksum, verify_checksum};
+
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+
+        // Create multiple blocks
+        let block1 = BlockId::new(3004, 1);
+        let block2 = BlockId::new(3005, 1);
+        let block3 = BlockId::new(3006, 1);
+
+        let data1 = b"Block 1 data";
+        let data2 = b"Block 2 data";
+        let data3 = b"Block 3 data";
+
+        for (block_id, data) in [(block1, data1), (block2, data2), (block3, data3)] {
+            storage.create_block(block_id).unwrap();
+            storage.write_block(&block_id, 0, data).unwrap();
+            storage.finalize_block(&block_id).unwrap();
+        }
+
+        let checksum1 = compute_checksum(data1);
+        let checksum2 = compute_checksum(data2);
+        let checksum3 = compute_checksum(data3);
+
+        // Corrupt only block 2
+        let block2_path = storage.get_block_path(&block2, true);
+        fs::write(&block2_path, b"Corrupted!!!").unwrap();
+
+        // Verify block 1 is still good
+        let read1 = storage.read_block(&block1, 0, data1.len() as u64).unwrap();
+        assert!(verify_checksum(&read1, &checksum1), "Block 1 should be intact");
+
+        // Verify block 2 is corrupted
+        let read2 = storage.read_block(&block2, 0, data2.len() as u64).unwrap();
+        assert!(!verify_checksum(&read2, &checksum2), "Block 2 should be corrupted");
+
+        // Verify block 3 is still good
+        let read3 = storage.read_block(&block3, 0, data3.len() as u64).unwrap();
+        assert!(verify_checksum(&read3, &checksum3), "Block 3 should be intact");
+    }
 }
