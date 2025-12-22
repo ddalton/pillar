@@ -1805,4 +1805,203 @@ mod tests {
         let success_count = [delete_result.is_ok(), create_result.is_ok()].iter().filter(|&&x| x).count();
         assert_eq!(success_count, 1, "Exactly one operation should succeed");
     }
+
+    // ========================================================================
+    // DataNode Failure Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_insufficient_datanodes() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register only 2 datanodes, but replication factor is 3
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn1".to_string(),
+                hostname: "host1".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        datanode_manager.register(
+            crate::metadata::block_manager::DatanodeId {
+                uuid: "dn2".to_string(),
+                hostname: "host2".to_string(),
+                rpc_port: 9867,
+                data_port: 50010,
+                http_port: 50075,
+                supported_transports: vec!["tcp".to_string()],
+                rdma_port: 0,
+            },
+            1_000_000_000,
+        ).unwrap();
+
+        // Create a file - should fail because we need 3 datanodes but only have 2
+        let result = service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3, // Replication factor 3
+            128 * 1024 * 1024,
+        ).await;
+
+        // Creation should succeed (metadata operation)
+        assert!(result.is_ok());
+
+        // But adding a block should fail due to insufficient datanodes
+        let add_block_result = service.handle_add_block("/test.txt").await;
+        assert!(add_block_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_with_datanode_failure() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace,
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register 3 datanodes
+        for i in 1..=3 {
+            datanode_manager.register(
+                crate::metadata::block_manager::DatanodeId {
+                    uuid: format!("dn{}", i),
+                    hostname: format!("host{}", i),
+                    rpc_port: 9867,
+                    data_port: 50010,
+                    http_port: 50075,
+                    supported_transports: vec!["tcp".to_string()],
+                    rdma_port: 0,
+                },
+                1_000_000_000,
+            ).unwrap();
+        }
+
+        // All 3 datanodes should be alive initially
+        assert_eq!(datanode_manager.get_live_datanodes().len(), 3);
+        assert_eq!(datanode_manager.get_dead_datanodes().len(), 0);
+
+        // Mark dn1 as dead
+        datanode_manager.mark_datanode_dead_for_test("dn1");
+
+        // Verify failure detection
+        let live_datanodes = datanode_manager.get_live_datanodes();
+        let dead_datanodes = datanode_manager.get_dead_datanodes();
+        assert_eq!(live_datanodes.len(), 2);
+        assert_eq!(dead_datanodes.len(), 1);
+        assert_eq!(dead_datanodes[0].id.uuid, "dn1");
+
+        // Live datanodes should only be dn2 and dn3
+        let live_uuids: Vec<String> = live_datanodes.iter().map(|dn| dn.id.uuid.clone()).collect();
+        assert!(live_uuids.contains(&"dn2".to_string()));
+        assert!(live_uuids.contains(&"dn3".to_string()));
+        assert!(!live_uuids.contains(&"dn1".to_string()));
+
+        // Client would select datanodes for read, should only get live ones
+        let selected = datanode_manager.select_datanodes(2).unwrap();
+        assert_eq!(selected.len(), 2);
+
+        // Selected should not include dead dn1
+        for node in &selected {
+            assert_ne!(node.uuid, "dn1", "Dead datanode should not be selected");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_with_datanode_failure_recovery() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = ClientNamenodeService::new(
+            namespace,
+            block_manager.clone(),
+            datanode_manager.clone(),
+            placement_policy,
+        );
+
+        // Register 4 datanodes (one extra for replacement)
+        for i in 1..=4 {
+            datanode_manager.register(
+                crate::metadata::block_manager::DatanodeId {
+                    uuid: format!("dn{}", i),
+                    hostname: format!("host{}", i),
+                    rpc_port: 9867,
+                    data_port: 50010,
+                    http_port: 50075,
+                    supported_transports: vec!["tcp".to_string()],
+                    rdma_port: 0,
+                },
+                1_000_000_000,
+            ).unwrap();
+        }
+
+        // Create a file
+        service.handle_create(
+            "/test.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Add a block
+        let block = service.handle_add_block("/test.txt").await.unwrap();
+        let original_locations = block.locations.clone();
+
+        // Simulate one datanode failing during write
+        let failed_datanode = &original_locations[0];
+
+        // Client calls get_additional_datanode to get replacement
+        let existing: Vec<crate::metadata::block_manager::DatanodeId> = original_locations.clone();
+        let excluded: Vec<crate::metadata::block_manager::DatanodeId> = vec![failed_datanode.clone()];
+
+        let replacement_block = service.handle_get_additional_datanode(
+            block.block_id,
+            block.generation_stamp,
+            &existing,
+            &excluded,
+            1,
+        ).await.unwrap();
+
+        // Replacement block should have original + new datanodes
+        assert!(replacement_block.locations.len() >= 3);
+
+        // New datanode should not be the failed one
+        let new_locations: Vec<String> = replacement_block.locations
+            .iter()
+            .map(|loc| loc.uuid.clone())
+            .collect();
+
+        // Should have at least one datanode that wasn't in the original list
+        let has_new_datanode = new_locations.iter()
+            .any(|uuid| !existing.iter().any(|orig| &orig.uuid == uuid));
+
+        assert!(has_new_datanode || new_locations.len() > existing.len(),
+                "Should have added a new datanode for pipeline recovery");
+    }
 }
