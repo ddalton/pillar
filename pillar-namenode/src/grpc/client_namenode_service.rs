@@ -1211,4 +1211,598 @@ mod tests {
         let result = service.handle_recover_lease("/nonexistent.txt", "client1").await;
         assert!(result.is_err());
     }
+
+    // ========================================================================
+    // Atomicity Tests - Concurrent Operations
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_concurrent_rename_different_files() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create two files
+        service.handle_create(
+            "/file1.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+        service.handle_create(
+            "/file2.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently rename different files
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_rename("/file1.txt", "/renamed1.txt").await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_rename("/file2.txt", "/renamed2.txt").await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Both renames should succeed
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert!(result1.unwrap());
+        assert!(result2.unwrap());
+
+        // Verify both files were renamed
+        assert!(service.handle_get_file_info("/renamed1.txt").await.is_ok());
+        assert!(service.handle_get_file_info("/renamed2.txt").await.is_ok());
+        assert!(service.handle_get_file_info("/file1.txt").await.is_err());
+        assert!(service.handle_get_file_info("/file2.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_rename_same_file() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create a file
+        service.handle_create(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently rename same file to different destinations
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_rename("/file.txt", "/renamed1.txt").await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_rename("/file.txt", "/renamed2.txt").await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed, one should fail
+        let success_count = [result1.is_ok(), result2.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(success_count, 1, "Exactly one rename should succeed");
+
+        // Original file should not exist
+        assert!(service.handle_get_file_info("/file.txt").await.is_err());
+
+        // Exactly one of the renamed files should exist
+        let renamed1_exists = service.handle_get_file_info("/renamed1.txt").await.is_ok();
+        let renamed2_exists = service.handle_get_file_info("/renamed2.txt").await.is_ok();
+        assert!(renamed1_exists ^ renamed2_exists, "Exactly one renamed file should exist");
+    }
+
+    #[tokio::test]
+    async fn test_rename_read_race() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create a file
+        service.handle_create(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently rename and read
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_rename("/file.txt", "/renamed.txt").await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_get_file_info("/file.txt").await
+        });
+
+        let rename_result = handle1.await.unwrap();
+        let read_result = handle2.await.unwrap();
+
+        // Rename should succeed
+        assert!(rename_result.is_ok());
+
+        // Read might succeed or fail depending on timing, but shouldn't corrupt state
+        // After rename, new name should exist
+        assert!(service.handle_get_file_info("/renamed.txt").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rename_delete_race() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create a file
+        service.handle_create(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently rename and delete
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_rename("/file.txt", "/renamed.txt").await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_delete("/file.txt", false).await
+        });
+
+        let rename_result = handle1.await.unwrap();
+        let delete_result = handle2.await.unwrap();
+
+        // One should succeed, one should fail
+        let success_count = [rename_result.is_ok(), delete_result.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(success_count, 1, "Exactly one operation should succeed");
+
+        // Original file should not exist
+        assert!(service.handle_get_file_info("/file.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory_concurrent() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create two directories
+        service.handle_mkdir("/dir1", "user".to_string(), "group".to_string(), 0o755).await.unwrap();
+        service.handle_mkdir("/dir2", "user".to_string(), "group".to_string(), 0o755).await.unwrap();
+
+        // Concurrently rename different directories
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_rename("/dir1", "/renamed_dir1").await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_rename("/dir2", "/renamed_dir2").await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Both renames should succeed
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        // Verify both directories were renamed
+        assert!(service.handle_get_file_info("/renamed_dir1").await.is_ok());
+        assert!(service.handle_get_file_info("/renamed_dir2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_create_same_file() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Concurrently create same file
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_create(
+                "/file.txt",
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                3,
+                128 * 1024 * 1024,
+            ).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_create(
+                "/file.txt",
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                3,
+                128 * 1024 * 1024,
+            ).await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed, one should fail (file already exists)
+        let success_count = [result1.is_ok(), result2.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(success_count, 1, "Exactly one create should succeed");
+
+        // File should exist
+        assert!(service.handle_get_file_info("/file.txt").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_create_different_files() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Concurrently create different files
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_create(
+                "/file1.txt",
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                3,
+                128 * 1024 * 1024,
+            ).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_create(
+                "/file2.txt",
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                3,
+                128 * 1024 * 1024,
+            ).await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Both creates should succeed
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        // Both files should exist
+        assert!(service.handle_get_file_info("/file1.txt").await.is_ok());
+        assert!(service.handle_get_file_info("/file2.txt").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_read_race() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Concurrently create and read
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_create(
+                "/file.txt",
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                3,
+                128 * 1024 * 1024,
+            ).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            service2.handle_get_file_info("/file.txt").await
+        });
+
+        let create_result = handle1.await.unwrap();
+        let read_result = handle2.await.unwrap();
+
+        // Create should succeed
+        assert!(create_result.is_ok());
+
+        // Read might succeed or fail depending on timing
+        // After create completes, file should exist
+        assert!(service.handle_get_file_info("/file.txt").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_delete_same_file() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create a file
+        service.handle_create(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently delete same file
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_delete("/file.txt", false).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_delete("/file.txt", false).await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed, one should fail gracefully
+        let success_count = [result1.is_ok(), result2.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(success_count, 1, "Exactly one delete should succeed");
+
+        // File should not exist
+        assert!(service.handle_get_file_info("/file.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_delete_different_files() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create two files
+        service.handle_create(
+            "/file1.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+        service.handle_create(
+            "/file2.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently delete different files
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_delete("/file1.txt", false).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_delete("/file2.txt", false).await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Both deletes should succeed
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        // Both files should not exist
+        assert!(service.handle_get_file_info("/file1.txt").await.is_err());
+        assert!(service.handle_get_file_info("/file2.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_while_reading() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create a file
+        service.handle_create(
+            "/file.txt",
+            "user".to_string(),
+            "group".to_string(),
+            0o644,
+            3,
+            128 * 1024 * 1024,
+        ).await.unwrap();
+
+        // Concurrently delete and read
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_delete("/file.txt", false).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_get_file_info("/file.txt").await
+        });
+
+        let delete_result = handle1.await.unwrap();
+        let _read_result = handle2.await.unwrap();
+
+        // Delete should succeed
+        assert!(delete_result.is_ok());
+
+        // Read might succeed or fail depending on timing
+        // After delete, file should not exist
+        assert!(service.handle_get_file_info("/file.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory_while_creating_files() {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 3));
+
+        let service = Arc::new(ClientNamenodeService::new(
+            namespace,
+            block_manager,
+            datanode_manager,
+            placement_policy,
+        ));
+
+        // Create a directory
+        service.handle_mkdir("/dir", "user".to_string(), "group".to_string(), 0o755).await.unwrap();
+
+        // Concurrently delete directory and create file in it
+        let service1 = service.clone();
+        let service2 = service.clone();
+
+        let handle1 = tokio::spawn(async move {
+            service1.handle_delete("/dir", true).await
+        });
+
+        let handle2 = tokio::spawn(async move {
+            service2.handle_create(
+                "/dir/file.txt",
+                "user".to_string(),
+                "group".to_string(),
+                0o644,
+                3,
+                128 * 1024 * 1024,
+            ).await
+        });
+
+        let delete_result = handle1.await.unwrap();
+        let create_result = handle2.await.unwrap();
+
+        // One should succeed, one should fail
+        let success_count = [delete_result.is_ok(), create_result.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(success_count, 1, "Exactly one operation should succeed");
+    }
 }
