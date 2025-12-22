@@ -181,6 +181,37 @@ impl BlockStorage {
         Ok(data.len() as u64)
     }
 
+    /// Append data to an existing block
+    pub fn append_block(&self, block_id: &BlockId, data: &[u8]) -> Result<u64> {
+        // Check if block exists in finalized or tmp directory
+        let tmp_path = self.get_block_path(block_id, false);
+        let finalized_path = self.get_block_path(block_id, true);
+
+        let file_path = if tmp_path.exists() {
+            tmp_path
+        } else if finalized_path.exists() {
+            finalized_path
+        } else {
+            return Err(BlockStorageError::BlockNotFound(block_id.block_id));
+        };
+
+        // Open file in append mode
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&file_path)?;
+
+        // Write data at the end
+        file.write_all(data)?;
+        file.flush()?;
+
+        // Get new file size
+        let new_size = file.metadata()?.len();
+
+        debug!("Appended {} bytes to block {} (new size: {})", data.len(), block_id.block_id, new_size);
+
+        Ok(new_size)
+    }
+
     /// Read data from a block
     pub fn read_block(&self, block_id: &BlockId, offset: u64, length: u64) -> Result<Bytes> {
         let metadata = self.blocks.get(&block_id.block_id)
@@ -315,5 +346,369 @@ mod tests {
         // Delete block
         storage.delete_block(&block_id).unwrap();
         assert_eq!(storage.get_block_count(), 0);
+    }
+
+    #[test]
+    fn test_seek_to_beginning() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1001, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"0123456789ABCDEF";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Seek to offset 0 (beginning)
+        let read_data = storage.read_block(&block_id, 0, 5).unwrap();
+        assert_eq!(&read_data[..], b"01234");
+    }
+
+    #[test]
+    fn test_seek_to_middle() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1002, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"0123456789ABCDEF";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Seek to middle (offset 5)
+        let read_data = storage.read_block(&block_id, 5, 5).unwrap();
+        assert_eq!(&read_data[..], b"56789");
+    }
+
+    #[test]
+    fn test_seek_to_end() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1003, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"0123456789ABCDEF";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Seek to near end
+        let read_data = storage.read_block(&block_id, 12, 4).unwrap();
+        assert_eq!(&read_data[..], b"CDEF");
+    }
+
+    #[test]
+    fn test_seek_beyond_end() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1004, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"0123456789ABCDEF";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Seek beyond file end - should return less data than requested
+        let read_data = storage.read_block(&block_id, 14, 10).unwrap();
+        assert_eq!(&read_data[..], b"EF"); // Only 2 bytes available
+    }
+
+    #[test]
+    fn test_seek_backwards() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1005, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"0123456789ABCDEF";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // First seek to offset 10
+        let read_data1 = storage.read_block(&block_id, 10, 3).unwrap();
+        assert_eq!(&read_data1[..], b"ABC");
+
+        // Then seek backwards to offset 2
+        let read_data2 = storage.read_block(&block_id, 2, 4).unwrap();
+        assert_eq!(&read_data2[..], b"2345");
+    }
+
+    #[test]
+    fn test_seek_and_read_specific_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1006, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"The quick brown fox jumps over the lazy dog";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Read "quick" at offset 4
+        let read_data = storage.read_block(&block_id, 4, 5).unwrap();
+        assert_eq!(&read_data[..], b"quick");
+
+        // Read "fox" at offset 16
+        let read_data = storage.read_block(&block_id, 16, 3).unwrap();
+        assert_eq!(&read_data[..], b"fox");
+
+        // Read "lazy" at offset 35
+        let read_data = storage.read_block(&block_id, 35, 4).unwrap();
+        assert_eq!(&read_data[..], b"lazy");
+    }
+
+    #[test]
+    fn test_multiple_seeks() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(1007, 1);
+
+        storage.create_block(block_id).unwrap();
+        let data = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        storage.write_block(&block_id, 0, data).unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Multiple sequential seeks
+        let positions: Vec<(u64, u64, &[u8])> = vec![
+            (0, 3, b"ABC"),
+            (5, 3, b"FGH"),
+            (10, 3, b"KLM"),
+            (20, 3, b"UVW"),
+            (25, 1, b"Z"),
+        ];
+
+        for (offset, length, expected) in positions {
+            let read_data = storage.read_block(&block_id, offset, length).unwrap();
+            assert_eq!(&read_data[..], expected);
+        }
+    }
+
+    #[test]
+    fn test_append_to_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(2001, 1);
+
+        // Create and write initial data
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, b"Hello, ").unwrap();
+
+        // Append more data
+        let new_size = storage.append_block(&block_id, b"World!").unwrap();
+        assert_eq!(new_size, 13); // "Hello, World!" is 13 bytes
+
+        // Finalize and read to verify
+        storage.finalize_block(&block_id).unwrap();
+        let read_data = storage.read_block(&block_id, 0, 13).unwrap();
+        assert_eq!(&read_data[..], b"Hello, World!");
+    }
+
+    #[test]
+    fn test_append_to_finalized_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(2002, 1);
+
+        // Create, write, and finalize
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, b"Initial").unwrap();
+        storage.finalize_block(&block_id).unwrap();
+
+        // Append to finalized block
+        let new_size = storage.append_block(&block_id, b" Data").unwrap();
+        assert_eq!(new_size, 12); // "Initial Data" is 12 bytes
+
+        // Read to verify
+        let read_data = storage.read_block(&block_id, 0, 12).unwrap();
+        assert_eq!(&read_data[..], b"Initial Data");
+    }
+
+    #[test]
+    fn test_multiple_appends() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(2003, 1);
+
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, b"A").unwrap();
+
+        // Multiple appends
+        storage.append_block(&block_id, b"B").unwrap();
+        storage.append_block(&block_id, b"C").unwrap();
+        storage.append_block(&block_id, b"D").unwrap();
+        let final_size = storage.append_block(&block_id, b"E").unwrap();
+
+        assert_eq!(final_size, 5); // "ABCDE"
+
+        // Finalize and verify
+        storage.finalize_block(&block_id).unwrap();
+        let read_data = storage.read_block(&block_id, 0, 5).unwrap();
+        assert_eq!(&read_data[..], b"ABCDE");
+    }
+
+    #[test]
+    fn test_append_large_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(2004, 1);
+
+        storage.create_block(block_id).unwrap();
+
+        // Write initial 1KB
+        let initial_data = vec![0xAA; 1024];
+        storage.write_block(&block_id, 0, &initial_data).unwrap();
+
+        // Append 2KB
+        let append_data = vec![0xBB; 2048];
+        let new_size = storage.append_block(&block_id, &append_data).unwrap();
+
+        assert_eq!(new_size, 3072); // 1KB + 2KB
+
+        // Verify first KB is 0xAA
+        storage.finalize_block(&block_id).unwrap();
+        let read_first = storage.read_block(&block_id, 0, 1024).unwrap();
+        assert!(read_first.iter().all(|&b| b == 0xAA));
+
+        // Verify last 2KB is 0xBB
+        let read_last = storage.read_block(&block_id, 1024, 2048).unwrap();
+        assert!(read_last.iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn test_append_and_read() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(2005, 1);
+
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, b"Line 1\n").unwrap();
+        storage.append_block(&block_id, b"Line 2\n").unwrap();
+        storage.append_block(&block_id, b"Line 3\n").unwrap();
+
+        storage.finalize_block(&block_id).unwrap();
+
+        // Read entire content
+        let read_data = storage.read_block(&block_id, 0, 100).unwrap();
+        assert_eq!(&read_data[..], b"Line 1\nLine 2\nLine 3\n");
+
+        // Read specific line
+        let read_line2 = storage.read_block(&block_id, 7, 7).unwrap();
+        assert_eq!(&read_line2[..], b"Line 2\n");
+    }
+
+    #[test]
+    fn test_append_to_nonexistent_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(9999, 1);
+
+        // Try to append to non-existent block
+        let result = storage.append_block(&block_id, b"data");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlockStorageError::BlockNotFound(id) => assert_eq!(id, 9999),
+            _ => panic!("Expected BlockNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_append_empty_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        let block_id = BlockId::new(2006, 1);
+
+        storage.create_block(block_id).unwrap();
+        storage.write_block(&block_id, 0, b"Data").unwrap();
+
+        // Append empty data (should succeed but not change size)
+        let new_size = storage.append_block(&block_id, b"").unwrap();
+        assert_eq!(new_size, 4);
+
+        storage.finalize_block(&block_id).unwrap();
+        let read_data = storage.read_block(&block_id, 0, 4).unwrap();
+        assert_eq!(&read_data[..], b"Data");
     }
 }
