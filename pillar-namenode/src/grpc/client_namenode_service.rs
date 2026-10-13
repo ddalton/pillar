@@ -134,12 +134,22 @@ impl ClientNamenodeService {
 
     /// Delete a file or directory
     pub async fn handle_delete(&self, path: &str, recursive: bool) -> Result<bool, Status> {
-        self.namespace
-            .delete(path, recursive)
+        let removed = self.namespace
+            .delete_and_collect(path, recursive)
             .await
             .map_err(|e| Status::internal(format!("Failed to delete: {}", e)))?;
 
-        info!("Deleted: {}", path);
+        // Release block-manager state for every removed file (including
+        // descendants of a recursively deleted directory).
+        for inode in removed.iter().filter(|inode| !inode.is_dir) {
+            for block in &inode.blocks {
+                self.block_manager
+                    .remove_block(&BlockId::new(block.block_id, block.generation_stamp));
+            }
+            self.block_manager.delete_file_blocks(inode.id);
+        }
+
+        info!("Deleted: {} ({} inodes)", path, removed.len());
 
         Ok(true)
     }
@@ -606,13 +616,29 @@ impl ClientNamenodeService {
 
         // Validate and collect all source files
         let mut source_blocks = Vec::new();
+        let mut source_ids: Vec<u64> = Vec::new();
         for source_path in sources {
             let source_inode = self.namespace
                 .lookup(source_path)
                 .await
                 .map_err(|e| Status::not_found(format!("Source file not found: {}", e)))?;
 
+            // The target is write-locked: locking it again would deadlock,
+            // and deleting it afterwards would lose the result.
+            if Arc::ptr_eq(&source_inode, &target_inode) {
+                return Err(Status::invalid_argument(format!(
+                    "Source {} is the concat target", source_path
+                )));
+            }
+
             let source_guard = source_inode.read().await;
+
+            if source_ids.contains(&source_guard.id) {
+                return Err(Status::invalid_argument(format!(
+                    "Source {} is listed more than once", source_path
+                )));
+            }
+            source_ids.push(source_guard.id);
 
             if source_guard.is_dir {
                 return Err(Status::invalid_argument(format!(
@@ -640,6 +666,12 @@ impl ClientNamenodeService {
             target_blocks.extend(source_blocks);
         } else {
             target_guard.blocks = Some(source_blocks);
+        }
+
+        // The moved blocks now belong to the target in the block manager too.
+        let target_id = target_guard.id;
+        for source_id in &source_ids {
+            self.block_manager.move_file_blocks(*source_id, target_id);
         }
 
         // Release target lock before deleting sources
@@ -3071,5 +3103,99 @@ mod tests {
 
         // File should still exist
         assert!(service.handle_get_file_info("/test.txt").await.is_ok());
+    }
+
+    // ========================================================================
+    // Namespace / block-manager consistency
+    // ========================================================================
+
+    /// Service with `num_datanodes` registered datanodes and replication 1.
+    fn service_with_datanodes(
+        num_datanodes: usize,
+    ) -> (ClientNamenodeService, Arc<Namespace>, Arc<BlockManager>) {
+        let namespace = Arc::new(Namespace::new());
+        let block_manager = Arc::new(BlockManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::new());
+        for i in 0..num_datanodes {
+            datanode_manager
+                .register(DatanodeId::new(format!("dn{}", i), format!("host{}", i), 9867), 1 << 40)
+                .unwrap();
+        }
+        let placement_policy = Arc::new(BlockPlacementPolicy::new(datanode_manager.clone(), 1));
+        let service = ClientNamenodeService::new(
+            namespace.clone(),
+            block_manager.clone(),
+            datanode_manager,
+            placement_policy,
+        );
+        (service, namespace, block_manager)
+    }
+
+    async fn create(service: &ClientNamenodeService, path: &str, block_size: u64) {
+        service
+            .handle_create(path, "u".to_string(), "g".to_string(), 0o644, 1, block_size)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_recursive_delete_releases_descendant_blocks() {
+        let (service, namespace, block_manager) = service_with_datanodes(1);
+        let inodes_before = namespace.inode_count();
+
+        service.handle_mkdir("/d", "u".to_string(), "g".to_string(), 0o755).await.unwrap();
+        service.handle_mkdir("/d/sub", "u".to_string(), "g".to_string(), 0o755).await.unwrap();
+        for path in ["/d/a", "/d/sub/b"] {
+            create(&service, path, 1024).await;
+            service.handle_add_block(path).await.unwrap();
+            service.handle_add_block(path).await.unwrap();
+        }
+        create(&service, "/keep", 1024).await;
+        service.handle_add_block("/keep").await.unwrap();
+        assert_eq!(block_manager.get_total_blocks(), 5);
+
+        assert!(service.handle_delete("/d", false).await.is_err());
+        service.handle_delete("/d", true).await.unwrap();
+
+        assert_eq!(block_manager.get_total_blocks(), 1);
+        assert_eq!(namespace.inode_count(), inodes_before + 1);
+
+        // Recreating the same paths yields fresh, empty files.
+        service.handle_mkdir("/d", "u".to_string(), "g".to_string(), 0o755).await.unwrap();
+        service.handle_mkdir("/d/sub", "u".to_string(), "g".to_string(), 0o755).await.unwrap();
+        create(&service, "/d/sub/b", 1024).await;
+        assert_eq!(service.handle_get_file_info("/d/sub/b").await.unwrap().length, 0);
+        assert!(service.handle_get_block_locations("/d/sub/b", 0, 1 << 20).await.unwrap().is_empty());
+        assert_eq!(service.handle_get_listing("/d").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concat_moves_block_ownership_and_rejects_self() {
+        let (service, namespace, block_manager) = service_with_datanodes(1);
+        create(&service, "/t", 1024).await;
+        create(&service, "/s", 1024).await;
+        service.handle_add_block("/t").await.unwrap();
+        service.handle_add_block("/s").await.unwrap();
+
+        // Concatenating a file onto itself must fail, not deadlock or delete it.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.handle_concat("/t", &["/t".to_string()]),
+        )
+        .await
+        .expect("concat onto itself must not deadlock");
+        assert!(res.is_err());
+        assert!(namespace.lookup("/t").await.is_ok());
+
+        let dup = ["/s".to_string(), "/s".to_string()];
+        assert!(service.handle_concat("/t", &dup).await.is_err());
+
+        service.handle_concat("/t", &["/s".to_string()]).await.unwrap();
+        let t_id = namespace.lookup("/t").await.unwrap().read().await.id;
+        assert_eq!(block_manager.get_file_blocks(t_id).unwrap().len(), 2);
+
+        // Deleting the target releases the moved block as well.
+        service.handle_delete("/t", false).await.unwrap();
+        assert_eq!(block_manager.get_total_blocks(), 0);
     }
 }
