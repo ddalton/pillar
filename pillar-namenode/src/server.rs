@@ -205,11 +205,14 @@ impl NameNode {
         let client_service_arc = Arc::new(client_service);
         let datanode_service_arc = Arc::new(datanode_service);
 
-        // Create protocol servers
+        // Create protocol servers. Hadoop IPC clients get their own front end
+        // over the same ClientNamenodeService.
+        let ipc_server = Arc::new(ClientNamenodeProtocolServer::new(client_service_arc.clone()));
         let client_proto_server = ClientNamenodeProtocolServer::new(client_service_arc);
         let datanode_proto_server = DatanodeProtocolServer::new(datanode_service_arc);
 
-        info!("Starting high-performance gRPC server on {}", self.config.rpc_addr);
+        info!("Starting RPC server (Hadoop IPC + gRPC) on {}", self.config.rpc_addr);
+        let incoming = crate::ipc::bind_shared(self.config.rpc_addr, ipc_server).await?;
 
         // Build server with performance optimizations
         let server = tonic::transport::Server::builder()
@@ -227,7 +230,7 @@ impl NameNode {
             // Add services
             .add_service(ClientNamenodeProtoServer::new(client_proto_server))
             .add_service(DatanodeProtoServer::new(datanode_proto_server))
-            .serve_with_shutdown(self.config.rpc_addr, async {
+            .serve_with_incoming_shutdown(incoming, async {
                 tokio::signal::ctrl_c().await.ok();
                 info!("Shutdown signal received");
             });

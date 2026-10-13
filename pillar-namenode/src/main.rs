@@ -1,6 +1,7 @@
 mod metadata;
 mod datanode;
 mod grpc;
+mod ipc;
 mod server;
 
 use std::net::SocketAddr;

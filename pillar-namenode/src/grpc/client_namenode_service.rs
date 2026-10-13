@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::metadata::{Namespace, BlockManager};
 use crate::metadata::namespace::{FsPermission, INode};
@@ -98,11 +98,60 @@ impl ClientNamenodeService {
         self.namespace
             .mkdir(path, owner, group, FsPermission::new(permissions))
             .await
-            .map_err(|e| Status::already_exists(format!("Failed to create directory: {}", e)))?;
+            .map_err(namespace_status)?;
 
         info!("Created directory: {}", path);
 
         Ok(())
+    }
+
+    /// HDFS `mkdirs`: succeeds if `path` already is a directory; with
+    /// `create_parent`, creates missing ancestors first (`mkdir -p`).
+    pub async fn handle_mkdirs(
+        &self,
+        path: &str,
+        owner: String,
+        group: String,
+        permissions: u16,
+        create_parent: bool,
+    ) -> Result<(), Status> {
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut acc = String::new();
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            acc.push('/');
+            acc.push_str(part);
+            prefixes.push(acc.clone());
+        }
+        let (ancestors, target) = match prefixes.split_last() {
+            Some((t, a)) => (a, t.as_str()),
+            None => return Ok(()), // "/"
+        };
+        if create_parent {
+            for dir in ancestors {
+                self.ensure_dir(dir, &owner, &group, permissions).await?;
+            }
+        }
+        self.ensure_dir(target, &owner, &group, permissions).await
+    }
+
+    async fn ensure_dir(&self, path: &str, owner: &str, group: &str, permissions: u16) -> Result<(), Status> {
+        match self.namespace.lookup(path).await {
+            Ok(inode) => {
+                if inode.read().await.is_dir {
+                    Ok(())
+                } else {
+                    Err(Status::already_exists(format!("Path is not a directory: {}", path)))
+                }
+            }
+            Err(_) => match self.handle_mkdir(path, owner.to_string(), group.to_string(), permissions).await {
+                // Lost a race with a concurrent mkdirs: fine if it made a directory.
+                Err(e) if e.code() == tonic::Code::AlreadyExists => match self.namespace.lookup(path).await {
+                    Ok(inode) if inode.read().await.is_dir => Ok(()),
+                    _ => Err(e),
+                },
+                r => r,
+            },
+        }
     }
 
     /// Create a file
@@ -159,7 +208,7 @@ impl ClientNamenodeService {
         self.namespace
             .rename(src, dst)
             .await
-            .map_err(|e| Status::internal(format!("Failed to rename: {}", e)))?;
+            .map_err(namespace_status)?;
 
         info!("Renamed: {} -> {}", src, dst);
 
@@ -330,6 +379,40 @@ impl ClientNamenodeService {
         })
     }
 
+    /// HDFS `rename2`: like rename, but an existing destination is an error
+    /// unless `overwrite` is set, in which case a destination file (or empty
+    /// directory) is replaced.
+    pub async fn handle_rename2(&self, src: &str, dst: &str, overwrite: bool) -> Result<(), Status> {
+        if let Ok(existing) = self.namespace.lookup(dst).await {
+            if !overwrite {
+                return Err(Status::already_exists(format!("rename destination {} already exists", dst)));
+            }
+            // Non-recursive: a non-empty destination directory is refused,
+            // as in HDFS.
+            let _ = existing;
+            self.handle_delete(dst, false).await?;
+        }
+        self.handle_rename(src, dst).await.map(|_| ())
+    }
+
+    /// Record the final length of a block the client finished writing
+    /// (`addBlock`'s `previous`, `complete`'s `last`). The file's length is
+    /// the sum of its blocks.
+    pub async fn handle_commit_block(&self, path: &str, block_id: u64, num_bytes: u64) -> Result<(), Status> {
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let mut guard = inode.write().await;
+        let block = guard
+            .blocks
+            .as_mut()
+            .and_then(|bs| bs.iter_mut().find(|b| b.block_id == block_id))
+            .ok_or_else(|| Status::invalid_argument(format!("block {} is not part of {}", block_id, path)))?;
+        block.num_bytes = num_bytes;
+        let id = crate::metadata::block_manager::BlockId::new(block.block_id, block.generation_stamp);
+        drop(guard);
+        let _ = self.block_manager.update_block_size(&id, num_bytes);
+        Ok(())
+    }
+
     /// Complete a file (finalize writes)
     pub async fn handle_complete(&self, path: &str) -> Result<bool, Status> {
         let inode = self.namespace
@@ -341,6 +424,23 @@ impl ClientNamenodeService {
 
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot complete directory"));
+        }
+
+        // HDFS dfs.namenode.replication.min (1): the file is complete only
+        // once every block has a replica a DataNode has reported. Until then
+        // answer false; clients retry complete() with backoff.
+        let unreported = inode_guard
+            .blocks
+            .iter()
+            .flatten()
+            .find(|b| {
+                let id = crate::metadata::block_manager::BlockId::new(b.block_id, b.generation_stamp);
+                self.block_manager.get_block_locations(&id).map_or(true, |l| l.is_empty())
+            })
+            .map(|b| b.block_id);
+        if let Some(block_id) = unreported {
+            debug!("complete({}): block {} has no reported replica yet", path, block_id);
+            return Ok(false);
         }
 
         info!("Completed file: {}", path);
@@ -849,6 +949,19 @@ pub struct LocatedBlock {
     pub num_bytes: u64,
     pub offset: u64,
     pub locations: Vec<DatanodeId>,
+}
+
+/// Map a namespace error onto the status (and so the Hadoop exception)
+/// clients expect: a missing parent is FileNotFound, not AlreadyExists.
+fn namespace_status(e: crate::metadata::namespace::NamespaceError) -> Status {
+    use crate::metadata::namespace::NamespaceError as E;
+    match e {
+        E::PathNotFound(_) => Status::not_found(e.to_string()),
+        E::PathAlreadyExists(_) => Status::already_exists(e.to_string()),
+        E::NotADirectory(_) | E::DirectoryNotEmpty(_) => Status::failed_precondition(e.to_string()),
+        E::InvalidPath(_) => Status::invalid_argument(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
 }
 
 #[cfg(test)]

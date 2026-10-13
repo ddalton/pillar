@@ -132,11 +132,12 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         info!("mkdirs: {}", path);
 
         match self.service
-            .handle_mkdir(
+            .handle_mkdirs(
                 &path,
                 "hdfs".to_string(), // Default owner, should come from auth context
                 "supergroup".to_string(),
                 masked.perm as u16,
+                req.create_parent,
             )
             .await
         {
@@ -274,10 +275,14 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         info!("add_block: {}", path);
 
+        if let Some(prev) = &req.previous {
+            self.service.handle_commit_block(&path, prev.block_id, prev.num_bytes.unwrap_or(0)).await?;
+        }
+
         match self.service.handle_add_block(&path).await {
             Ok(block) => {
                 let response = AddBlockResponseProto {
-                    block: LocatedBlockProto {
+                    block: fill_storages(LocatedBlockProto {
                         b: ExtendedBlockProto {
                             pool_id: "BP-pillar-001".to_string(),
                             block_id: block.block_id,
@@ -325,7 +330,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                         storage_i_ds: vec![],
                         block_indices: None,
                         block_tokens: vec![],
-                    },
+                    }),
                 };
                 Ok(Response::new(response))
             }
@@ -342,6 +347,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let path = req.src;
 
         info!("complete: {}", path);
+
+        if let Some(last) = &req.last {
+            self.service.handle_commit_block(&path, last.block_id, last.num_bytes.unwrap_or(0)).await?;
+        }
 
         match self.service.handle_complete(&path).await {
             Ok(result) => Ok(Response::new(CompleteResponseProto { result })),
@@ -498,7 +507,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         match self.service.handle_append(&path).await {
             Ok(block) => {
                 let response = AppendResponseProto {
-                    block: Some(LocatedBlockProto {
+                    block: Some(fill_storages(LocatedBlockProto {
                         b: ExtendedBlockProto {
                             pool_id: "BP-pillar-001".to_string(),
                             block_id: block.block_id,
@@ -546,7 +555,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                         storage_i_ds: vec![],
                         block_indices: None,
                         block_tokens: vec![],
-                    }),
+                    })),
                     stat: None,
                 };
                 Ok(Response::new(response))
@@ -640,7 +649,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
             .collect();
 
         let response = GetAdditionalDatanodeResponseProto {
-            block: LocatedBlockProto {
+            block: fill_storages(LocatedBlockProto {
                 b: ExtendedBlockProto {
                     pool_id: "BP-pillar-001".to_string(),
                     block_id: located_block.block_id,
@@ -656,7 +665,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 storage_i_ds: vec![],
                 block_indices: None,
                 block_tokens: vec![],
-            },
+            }),
         };
 
         Ok(Response::new(response))
@@ -716,7 +725,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
             .collect();
 
         let response = UpdateBlockForPipelineResponseProto {
-            block: LocatedBlockProto {
+            block: fill_storages(LocatedBlockProto {
                 b: ExtendedBlockProto {
                     pool_id: "BP-pillar-001".to_string(),
                     block_id: located_block.block_id,
@@ -732,7 +741,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 storage_i_ds: vec![],
                 block_indices: None,
                 block_tokens: vec![],
-            },
+            }),
         };
 
         Ok(Response::new(response))
@@ -828,9 +837,12 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn rename2(
         &self,
-        _request: Request<Rename2RequestProto>,
+        request: Request<Rename2RequestProto>,
     ) -> Result<Response<Rename2ResponseProto>, Status> {
-        Err(Status::unimplemented("rename2 not yet implemented"))
+        let req = request.into_inner();
+        info!("rename2: {} -> {} (overwrite={})", req.src, req.dst, req.overwrite_dest);
+        self.service.handle_rename2(&req.src, &req.dst, req.overwrite_dest).await?;
+        Ok(Response::new(Rename2ResponseProto {}))
     }
 
     async fn get_batched_listing(
@@ -1509,7 +1521,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
 /// Convert a service-level LocatedBlock into the wire LocatedBlockProto.
 fn located_block_to_proto(b: crate::grpc::client_namenode_service::LocatedBlock) -> LocatedBlockProto {
-    LocatedBlockProto {
+    fill_storages(LocatedBlockProto {
         b: ExtendedBlockProto {
             pool_id: "BP-pillar-001".to_string(),
             block_id: b.block_id,
@@ -1557,5 +1569,22 @@ fn located_block_to_proto(b: crate::grpc::client_namenode_service::LocatedBlock)
         storage_i_ds: vec![],
         block_indices: None,
         block_tokens: vec![],
+    })
+}
+
+/// Hadoop clients expect one storage id, storage type and cached flag per
+/// location (they index them alongside `locs` to build the write pipeline).
+/// Pillar DataNodes report a single DISK storage whose id is their uuid.
+fn fill_storages(mut b: LocatedBlockProto) -> LocatedBlockProto {
+    let n = b.locs.len();
+    if b.storage_i_ds.len() != n {
+        b.storage_i_ds = b.locs.iter().map(|l| l.id.datanode_uuid.clone()).collect();
     }
+    if b.storage_types.len() != n {
+        b.storage_types = vec![pillar_proto::hadoop::hdfs::StorageTypeProto::Disk as i32; n];
+    }
+    if b.is_cached.len() != n {
+        b.is_cached = vec![false; n];
+    }
+    b
 }
