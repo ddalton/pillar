@@ -1,24 +1,27 @@
 //! TCP-based data transport implementation
+//!
+//! The wire format and the server/client logic live in [`super::wire`];
+//! this type binds them to a TCP listener and a pool of peer connections.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
-use crate::storage::block_storage::{BlockStorage, BlockId};
-use super::{DataTransport, DataTransferOp, Result, TransportError, TransportType};
+use crate::storage::block_storage::BlockStorage;
+use super::wire::{self, ConnPool};
+use super::{BlockChunks, DataTransport, Result, TransportType};
 
 /// TCP-based data transport
 ///
-/// This implements the HDFS data transfer protocol over TCP sockets.
-/// It provides both server-side (listening for connections) and client-side
-/// (connecting to peers) functionality.
+/// Serves block reads and writes from local storage, and reads from or
+/// streams blocks to peer DataNodes over pooled connections.
 pub struct TcpTransport {
     block_storage: Arc<BlockStorage>,
     listen_addr: SocketAddr,
+    pool: ConnPool,
 }
 
 impl TcpTransport {
@@ -26,168 +29,13 @@ impl TcpTransport {
         Self {
             block_storage,
             listen_addr,
+            pool: ConnPool::default(),
         }
-    }
-
-    /// Handle a single TCP connection
-    async fn handle_connection(&self, mut socket: TcpStream, peer_addr: SocketAddr) -> Result<()> {
-        debug!("Handling TCP connection from {}", peer_addr);
-
-        // Read operation code (1 byte)
-        let mut op_code_buf = [0u8; 1];
-        socket.read_exact(&mut op_code_buf).await?;
-
-        let op = DataTransferOp::from_u8(op_code_buf[0])
-            .ok_or_else(|| TransportError::ProtocolError(
-                format!("Unknown operation code: {}", op_code_buf[0])
-            ))?;
-
-        debug!("TCP operation: {:?}", op);
-
-        match op {
-            DataTransferOp::ReadBlock => {
-                self.handle_read_block(&mut socket).await?;
-            }
-            DataTransferOp::WriteBlock => {
-                self.handle_write_block(&mut socket).await?;
-            }
-            DataTransferOp::ReplaceBlock => {
-                warn!("ReplaceBlock operation not yet implemented");
-            }
-            DataTransferOp::CopyBlock => {
-                warn!("CopyBlock operation not yet implemented");
-            }
-            DataTransferOp::BlockChecksum => {
-                warn!("BlockChecksum operation not yet implemented");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle read block operation over TCP
-    async fn handle_read_block(&self, socket: &mut TcpStream) -> Result<()> {
-        // Simplified protocol for MVP:
-        // 1. Read block ID (8 bytes)
-        // 2. Read generation stamp (8 bytes)
-        // 3. Read offset (8 bytes)
-        // 4. Read length (8 bytes)
-
-        let mut buf = [0u8; 32];
-        socket.read_exact(&mut buf).await?;
-
-        let block_id = u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let gen_stamp = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let offset = u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-        let length = u64::from_be_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
-
-        debug!("TCP read request: block={}, offset={}, length={}", block_id, offset, length);
-
-        // Use the trait method to read block
-        let data = self.serve_read_request(block_id, gen_stamp, offset, length).await?;
-
-        // Send success response (1 byte = 0)
-        socket.write_u8(0).await?;
-
-        // Send data length (8 bytes)
-        socket.write_u64(data.len() as u64).await?;
-
-        // Send data
-        socket.write_all(&data).await?;
-        socket.flush().await?;
-
-        info!("Sent {} bytes for block {} via TCP", data.len(), block_id);
-
-        Ok(())
-    }
-
-    /// Handle write block operation over TCP
-    async fn handle_write_block(&self, socket: &mut TcpStream) -> Result<()> {
-        // Simplified protocol for MVP:
-        // 1. Read block ID (8 bytes)
-        // 2. Read generation stamp (8 bytes)
-        // 3. Read offset (8 bytes)
-        // 4. Read length (8 bytes)
-        // 5. Read data
-
-        let mut buf = [0u8; 32];
-        socket.read_exact(&mut buf).await?;
-
-        let block_id = u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let gen_stamp = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let offset = u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-        let length = u64::from_be_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
-
-        debug!("TCP write request: block={}, offset={}, length={}", block_id, offset, length);
-
-        // Read data
-        let mut data = vec![0u8; length as usize];
-        socket.read_exact(&mut data).await?;
-
-        // Use the trait method to write block
-        self.serve_write_request(block_id, gen_stamp, offset, &data).await?;
-
-        // Send success response (1 byte = 0)
-        socket.write_u8(0).await?;
-        socket.flush().await?;
-
-        info!("Received {} bytes for block {} via TCP", data.len(), block_id);
-
-        Ok(())
-    }
-
-    /// Connect to a peer DataNode via TCP and perform an operation
-    async fn connect_to_peer(&self, peer_addr: &str) -> Result<TcpStream> {
-        let socket = TcpStream::connect(peer_addr).await
-            .map_err(|e| TransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", peer_addr, e)
-            ))?;
-
-        debug!("Connected to peer {} via TCP", peer_addr);
-        Ok(socket)
     }
 }
 
 #[async_trait]
 impl DataTransport for TcpTransport {
-    async fn serve_read_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        length: u64,
-    ) -> Result<Bytes> {
-        let block = BlockId::new(block_id, gen_stamp);
-
-        // Read block data from storage
-        let data = self.block_storage.read_block(&block, offset, length)
-            .map_err(|_| TransportError::BlockNotFound(block_id))?;
-
-        Ok(data)
-    }
-
-    async fn serve_write_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        let block = BlockId::new(block_id, gen_stamp);
-
-        // Create block if it doesn't exist
-        if self.block_storage.get_block_metadata(block_id).is_none() {
-            self.block_storage.create_block(block)
-                .map_err(|e| TransportError::ProtocolError(format!("Failed to create block: {}", e)))?;
-        }
-
-        // Write block data to storage
-        self.block_storage.write_block(&block, offset, data)
-            .map_err(|e| TransportError::ProtocolError(format!("Failed to write block: {}", e)))?;
-
-        Ok(())
-    }
-
     async fn read_from_peer(
         &self,
         peer_addr: &str,
@@ -196,76 +44,21 @@ impl DataTransport for TcpTransport {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        let mut socket = self.connect_to_peer(peer_addr).await?;
-
-        // Send read block operation
-        socket.write_u8(DataTransferOp::ReadBlock.to_u8()).await?;
-
-        // Send block request (32 bytes: block_id + gen_stamp + offset + length)
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&block_id.to_be_bytes());
-        buf[8..16].copy_from_slice(&gen_stamp.to_be_bytes());
-        buf[16..24].copy_from_slice(&offset.to_be_bytes());
-        buf[24..32].copy_from_slice(&length.to_be_bytes());
-        socket.write_all(&buf).await?;
-        socket.flush().await?;
-
-        // Read response status (1 byte)
-        let status = socket.read_u8().await?;
-        if status != 0 {
-            return Err(TransportError::ProtocolError(
-                format!("Read failed with status: {}", status)
-            ));
-        }
-
-        // Read data length (8 bytes)
-        let data_len = socket.read_u64().await?;
-
-        // Read data
-        let mut data = vec![0u8; data_len as usize];
-        socket.read_exact(&mut data).await?;
-
-        debug!("Read {} bytes from peer {} via TCP", data.len(), peer_addr);
-
-        Ok(Bytes::from(data))
+        let data = self.pool.read_block(peer_addr, block_id, gen_stamp, offset, length).await?;
+        debug!("Read {} bytes of block {} from {} via TCP", data.len(), block_id, peer_addr);
+        Ok(data)
     }
 
-    async fn write_to_peer(
+    async fn send_block_to_peer(
         &self,
         peer_addr: &str,
         block_id: u64,
         gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        let mut socket = self.connect_to_peer(peer_addr).await?;
-
-        // Send write block operation
-        socket.write_u8(DataTransferOp::WriteBlock.to_u8()).await?;
-
-        // Send block request (32 bytes: block_id + gen_stamp + offset + length)
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&block_id.to_be_bytes());
-        buf[8..16].copy_from_slice(&gen_stamp.to_be_bytes());
-        buf[16..24].copy_from_slice(&offset.to_be_bytes());
-        buf[24..32].copy_from_slice(&(data.len() as u64).to_be_bytes());
-        socket.write_all(&buf).await?;
-
-        // Send data
-        socket.write_all(data).await?;
-        socket.flush().await?;
-
-        // Read response status (1 byte)
-        let status = socket.read_u8().await?;
-        if status != 0 {
-            return Err(TransportError::ProtocolError(
-                format!("Write failed with status: {}", status)
-            ));
-        }
-
-        debug!("Wrote {} bytes to peer {} via TCP", data.len(), peer_addr);
-
-        Ok(())
+        chunks: BlockChunks,
+    ) -> Result<u64> {
+        let stored = self.pool.send_block(peer_addr, block_id, gen_stamp, chunks).await?;
+        debug!("Sent block {} ({} bytes) to {} via TCP", block_id, stored, peer_addr);
+        Ok(stored)
     }
 
     fn transport_type(&self) -> TransportType {
@@ -291,10 +84,10 @@ impl DataTransport for TcpTransport {
             match listener.accept().await {
                 Ok((socket, peer_addr)) => {
                     debug!("Accepted TCP connection from {}", peer_addr);
-
-                    let server = self.clone();
+                    wire::tune(&socket);
+                    let storage = self.block_storage.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = server.handle_connection(socket, peer_addr).await {
+                        if let Err(e) = wire::serve_connection(socket, storage, peer_addr).await {
                             warn!("Error handling TCP connection from {}: {}", peer_addr, e);
                         }
                     });

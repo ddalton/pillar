@@ -212,22 +212,58 @@ impl BlockStorage {
         Ok(new_size)
     }
 
-    /// Read data from a block
+    /// Read data from a finalized block.
+    ///
+    /// `length` is clamped to what the block holds past `offset`, so a
+    /// caller asking for more than exists gets the remainder (and the
+    /// allocation is bounded by the block, not by the request).
     pub fn read_block(&self, block_id: &BlockId, offset: u64, length: u64) -> Result<Bytes> {
-        let metadata = self.blocks.get(&block_id.block_id)
-            .ok_or(BlockStorageError::BlockNotFound(block_id.block_id))?;
+        let (mut file, available) = self.open_for_read(block_id, offset, length)?;
+        let mut buffer = vec![0u8; available as usize];
+        file.read_exact(&mut buffer)?;
 
-        let mut file = File::open(&metadata.file_path)?;
-
-        file.seek(SeekFrom::Start(offset))?;
-
-        let mut buffer = vec![0u8; length as usize];
-        let bytes_read = file.read(&mut buffer)?;
-        buffer.truncate(bytes_read);
-
-        debug!("Read {} bytes from block {} at offset {}", bytes_read, block_id.block_id, offset);
+        debug!("Read {} bytes from block {} at offset {}", available, block_id.block_id, offset);
 
         Ok(Bytes::from(buffer))
+    }
+
+    /// Open a finalized block positioned at `offset`, returning the file and
+    /// how many bytes may be read from there: `min(length, size - offset)`.
+    pub fn open_for_read(&self, block_id: &BlockId, offset: u64, length: u64) -> Result<(File, u64)> {
+        let path = self.blocks.get(&block_id.block_id)
+            .map(|m| m.file_path.clone())
+            .ok_or(BlockStorageError::BlockNotFound(block_id.block_id))?;
+
+        let mut file = File::open(&path)?;
+        let size = file.metadata()?.len();
+        let available = length.min(size.saturating_sub(offset));
+        file.seek(SeekFrom::Start(offset.min(size)))?;
+        Ok((file, available))
+    }
+
+    /// Start receiving a complete block: create (or truncate a stale) temp
+    /// file once and return it for sequential writing. Finish with
+    /// [`Self::finalize_block`]; on failure call [`Self::abort_write`].
+    ///
+    /// Refuses a block that is already finalized here, so a duplicate
+    /// transfer cannot clobber a good replica.
+    pub fn begin_write(&self, block_id: &BlockId) -> Result<File> {
+        if self.blocks.contains_key(&block_id.block_id) {
+            return Err(BlockStorageError::BlockAlreadyExists(block_id.block_id));
+        }
+        File::create(self.get_meta_path(block_id, false))?;
+        Ok(File::create(self.get_block_path(block_id, false))?)
+    }
+
+    /// Discard a partially received block.
+    pub fn abort_write(&self, block_id: &BlockId) {
+        for path in [self.get_block_path(block_id, false), self.get_meta_path(block_id, false)] {
+            if let Err(e) = fs::remove_file(&path) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    warn!("Failed to remove partial block file {}: {}", path.display(), e);
+                }
+            }
+        }
     }
 
     /// Finalize a block (move from tmp to finalized directory)
@@ -312,6 +348,50 @@ impl BlockStorage {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn new_storage() -> (TempDir, BlockStorage) {
+        let temp_dir = TempDir::new().unwrap();
+        let finalized_dir = temp_dir.path().join("finalized");
+        let tmp_dir = temp_dir.path().join("tmp");
+        fs::create_dir_all(&finalized_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
+        (temp_dir, storage)
+    }
+
+    #[test]
+    fn a_write_session_writes_sequentially_and_finalizes() {
+        let (_d, storage) = new_storage();
+        let b = BlockId::new(1, 1);
+        let mut f = storage.begin_write(&b).unwrap();
+        f.write_all(b"hello ").unwrap();
+        f.write_all(b"world").unwrap();
+        drop(f);
+        assert_eq!(storage.finalize_block(&b).unwrap(), 11);
+        assert_eq!(&storage.read_block(&b, 0, 11).unwrap()[..], b"hello world");
+        assert!(matches!(storage.begin_write(&b), Err(BlockStorageError::BlockAlreadyExists(1))));
+    }
+
+    #[test]
+    fn an_aborted_write_leaves_nothing() {
+        let (d, storage) = new_storage();
+        let b = BlockId::new(2, 1);
+        storage.begin_write(&b).unwrap().write_all(b"partial").unwrap();
+        storage.abort_write(&b);
+        assert_eq!(fs::read_dir(d.path().join("tmp")).unwrap().count(), 0);
+        assert!(storage.finalize_block(&b).is_err());
+    }
+
+    #[test]
+    fn reads_are_clamped_to_the_block() {
+        let (_d, storage) = new_storage();
+        let b = BlockId::new(3, 1);
+        storage.begin_write(&b).unwrap().write_all(b"0123456789").unwrap();
+        storage.finalize_block(&b).unwrap();
+        assert_eq!(&storage.read_block(&b, 4, 100).unwrap()[..], b"456789");
+        assert_eq!(&storage.read_block(&b, 0, u64::MAX).unwrap()[..], b"0123456789");
+        assert!(storage.read_block(&b, 50, 10).unwrap().is_empty());
+    }
 
     #[test]
     fn test_block_storage() {

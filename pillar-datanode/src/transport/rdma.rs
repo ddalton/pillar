@@ -30,8 +30,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
-use crate::storage::block_storage::{BlockStorage, BlockId};
-use super::{DataTransport, DataTransferOp, Result, TransportError, TransportType};
+use crate::storage::block_storage::BlockStorage;
+use super::wire::{self, ConnPool};
+use super::{BlockChunks, DataTransport, Result, TransportError, TransportType};
 
 // Import ibverbs types when RDMA feature is enabled
 #[cfg(feature = "rdma")]
@@ -521,6 +522,8 @@ pub struct RdmaTransport {
     context: Arc<RdmaContext>,
     memory_pool: Arc<RdmaMemoryPool>,
     connection_pool: Arc<RdmaConnectionPool>,
+    /// Pooled TCP connections for the interim TCP data path.
+    tcp_pool: ConnPool,
 }
 
 impl RdmaTransport {
@@ -571,153 +574,15 @@ impl RdmaTransport {
             context,
             memory_pool,
             connection_pool,
+            tcp_pool: ConnPool::default(),
         })
-    }
-
-    /// Handle a single RDMA connection (server side)
-    ///
-    /// Note: In a full RDMA implementation, this would use RDMA CM (Connection Manager)
-    /// to accept incoming connections. For now, we use TCP for connection setup and
-    /// then switch to RDMA for data transfer.
-    async fn handle_connection(&self, mut socket: TcpStream, peer_addr: SocketAddr) -> Result<()> {
-        debug!("Handling RDMA connection from {}", peer_addr);
-
-        // Read operation code (1 byte)
-        let mut op_code_buf = [0u8; 1];
-        socket.read_exact(&mut op_code_buf).await?;
-
-        let op = DataTransferOp::from_u8(op_code_buf[0])
-            .ok_or_else(|| TransportError::ProtocolError(
-                format!("Unknown operation code: {}", op_code_buf[0])
-            ))?;
-
-        debug!("RDMA operation: {:?}", op);
-
-        match op {
-            DataTransferOp::ReadBlock => {
-                self.handle_rdma_read(&mut socket).await?;
-            }
-            DataTransferOp::WriteBlock => {
-                self.handle_rdma_write(&mut socket).await?;
-            }
-            _ => {
-                warn!("Operation {:?} not yet implemented over RDMA", op);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle RDMA read request (server side)
-    async fn handle_rdma_read(&self, socket: &mut TcpStream) -> Result<()> {
-        // Read request header
-        let mut buf = [0u8; 32];
-        socket.read_exact(&mut buf).await?;
-
-        let block_id = u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let gen_stamp = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let offset = u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-        let length = u64::from_be_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
-
-        debug!("RDMA read request: block={}, offset={}, length={}", block_id, offset, length);
-
-        // Read block from storage
-        let data = self.serve_read_request(block_id, gen_stamp, offset, length).await?;
-
-        // Send data via RDMA or TCP fallback
-        #[cfg(feature = "rdma")]
-        {
-            // TODO: Use RDMA SEND for production
-            // For now, use TCP as fallback during development
-            socket.write_u8(0).await?;
-            socket.write_u64(data.len() as u64).await?;
-            socket.write_all(&data).await?;
-            socket.flush().await?;
-        }
-
-        #[cfg(not(feature = "rdma"))]
-        {
-            socket.write_u8(0).await?;
-            socket.write_u64(data.len() as u64).await?;
-            socket.write_all(&data).await?;
-            socket.flush().await?;
-        }
-
-        info!("Sent {} bytes for block {} via RDMA", data.len(), block_id);
-
-        Ok(())
-    }
-
-    /// Handle RDMA write request (server side)
-    async fn handle_rdma_write(&self, socket: &mut TcpStream) -> Result<()> {
-        // Read request header
-        let mut buf = [0u8; 32];
-        socket.read_exact(&mut buf).await?;
-
-        let block_id = u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let gen_stamp = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let offset = u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-        let length = u64::from_be_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
-
-        debug!("RDMA write request: block={}, offset={}, length={}", block_id, offset, length);
-
-        // Read data via RDMA or TCP fallback
-        let mut data = vec![0u8; length as usize];
-        socket.read_exact(&mut data).await?;
-
-        // Write to storage
-        self.serve_write_request(block_id, gen_stamp, offset, &data).await?;
-
-        // Send success response
-        socket.write_u8(0).await?;
-        socket.flush().await?;
-
-        info!("Received {} bytes for block {} via RDMA", data.len(), block_id);
-
-        Ok(())
     }
 }
 
 #[async_trait]
 impl DataTransport for RdmaTransport {
-    async fn serve_read_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        length: u64,
-    ) -> Result<Bytes> {
-        let block = BlockId::new(block_id, gen_stamp);
-
-        // Read block data from storage
-        let data = self.block_storage.read_block(&block, offset, length)
-            .map_err(|_| TransportError::BlockNotFound(block_id))?;
-
-        Ok(data)
-    }
-
-    async fn serve_write_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        let block = BlockId::new(block_id, gen_stamp);
-
-        // Create block if it doesn't exist
-        if self.block_storage.get_block_metadata(block_id).is_none() {
-            self.block_storage.create_block(block)
-                .map_err(|e| TransportError::ProtocolError(format!("Failed to create block: {}", e)))?;
-        }
-
-        // Write block data to storage
-        self.block_storage.write_block(&block, offset, data)
-            .map_err(|e| TransportError::ProtocolError(format!("Failed to write block: {}", e)))?;
-
-        Ok(())
-    }
-
+    // Data moves over TCP with the shared wire protocol until RDMA
+    // READ/WRITE is implemented (RDMA_IMPLEMENTATION_PLAN.md).
     async fn read_from_peer(
         &self,
         peer_addr: &str,
@@ -726,93 +591,19 @@ impl DataTransport for RdmaTransport {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        debug!("Reading block {} from peer {} via RDMA", block_id, peer_addr);
-
-        // Get or create connection to peer
-        let _conn = self.connection_pool.get_or_create(peer_addr).await?;
-
-        // Use TCP fallback for now
-        // TODO: Implement RDMA READ for production
-        let mut socket = TcpStream::connect(peer_addr).await
-            .map_err(|e| TransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", peer_addr, e)
-            ))?;
-
-        // Send read block operation
-        socket.write_u8(DataTransferOp::ReadBlock.to_u8()).await?;
-
-        // Send block request
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&block_id.to_be_bytes());
-        buf[8..16].copy_from_slice(&gen_stamp.to_be_bytes());
-        buf[16..24].copy_from_slice(&offset.to_be_bytes());
-        buf[24..32].copy_from_slice(&length.to_be_bytes());
-        socket.write_all(&buf).await?;
-        socket.flush().await?;
-
-        // Read response
-        let status = socket.read_u8().await?;
-        if status != 0 {
-            return Err(TransportError::ProtocolError(
-                format!("Read failed with status: {}", status)
-            ));
-        }
-
-        let data_len = socket.read_u64().await?;
-        let mut data = vec![0u8; data_len as usize];
-        socket.read_exact(&mut data).await?;
-
-        debug!("Read {} bytes from peer {} via RDMA", data.len(), peer_addr);
-
-        Ok(Bytes::from(data))
+        debug!("Reading block {} from peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
+        self.tcp_pool.read_block(peer_addr, block_id, gen_stamp, offset, length).await
     }
 
-    async fn write_to_peer(
+    async fn send_block_to_peer(
         &self,
         peer_addr: &str,
         block_id: u64,
         gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        debug!("Writing block {} to peer {} via RDMA", block_id, peer_addr);
-
-        // Get or create connection to peer
-        let _conn = self.connection_pool.get_or_create(peer_addr).await?;
-
-        // Use TCP fallback for now
-        // TODO: Implement RDMA WRITE for production
-        let mut socket = TcpStream::connect(peer_addr).await
-            .map_err(|e| TransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", peer_addr, e)
-            ))?;
-
-        // Send write block operation
-        socket.write_u8(DataTransferOp::WriteBlock.to_u8()).await?;
-
-        // Send block request
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&block_id.to_be_bytes());
-        buf[8..16].copy_from_slice(&gen_stamp.to_be_bytes());
-        buf[16..24].copy_from_slice(&offset.to_be_bytes());
-        buf[24..32].copy_from_slice(&(data.len() as u64).to_be_bytes());
-        socket.write_all(&buf).await?;
-
-        // Send data
-        socket.write_all(data).await?;
-        socket.flush().await?;
-
-        // Read response
-        let status = socket.read_u8().await?;
-        if status != 0 {
-            return Err(TransportError::ProtocolError(
-                format!("Write failed with status: {}", status)
-            ));
-        }
-
-        debug!("Wrote {} bytes to peer {} via RDMA", data.len(), peer_addr);
-
-        Ok(())
+        chunks: BlockChunks,
+    ) -> Result<u64> {
+        debug!("Sending block {} to peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
+        self.tcp_pool.send_block(peer_addr, block_id, gen_stamp, chunks).await
     }
 
     fn transport_type(&self) -> TransportType {
@@ -847,9 +638,10 @@ impl DataTransport for RdmaTransport {
                 Ok((socket, peer_addr)) => {
                     debug!("Accepted RDMA connection from {}", peer_addr);
 
-                    let server = self.clone();
+                    wire::tune(&socket);
+                    let storage = self.block_storage.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = server.handle_connection(socket, peer_addr).await {
+                        if let Err(e) = wire::serve_connection(socket, storage, peer_addr).await {
                             warn!("Error handling RDMA connection from {}: {}", peer_addr, e);
                         }
                     });
