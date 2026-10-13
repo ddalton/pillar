@@ -104,7 +104,27 @@ impl VolumeManager {
         })
     }
 
-    /// Get volume statistics
+    /// Volume statistics with block-pool usage supplied by the caller
+    /// (`BlockStorage::total_bytes`): one `statvfs`, no directory walk.
+    /// This is what heartbeats should use.
+    pub fn get_volume_stats(&self, block_pool_used_bytes: u64) -> Result<VolumeInfo> {
+        let stats = statvfs(&self.mount_point)
+            .map_err(|e| VolumeError::SystemError(format!("statvfs failed: {}", e)))?;
+
+        let block_size = stats.block_size();
+        let capacity_bytes = stats.blocks() as u64 * block_size;
+        let available_bytes = stats.blocks_available() as u64 * block_size;
+
+        Ok(VolumeInfo {
+            capacity_bytes,
+            used_bytes: capacity_bytes.saturating_sub(available_bytes),
+            remaining_bytes: available_bytes,
+            block_pool_used_bytes,
+        })
+    }
+
+    /// Get volume statistics, walking the block pool directory to size it.
+    /// Prefer [`Self::get_volume_stats`] on hot paths.
     pub fn get_volume_info(&self) -> Result<VolumeInfo> {
         let stats = statvfs(&self.mount_point)
             .map_err(|e| VolumeError::SystemError(format!("statvfs failed: {}", e)))?;

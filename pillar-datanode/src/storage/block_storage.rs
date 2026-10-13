@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use dashmap::DashMap;
 use bytes::Bytes;
 use thiserror::Error;
@@ -58,6 +60,21 @@ pub struct BlockStorage {
 
     /// Block metadata cache: block_id -> BlockMetadata
     blocks: DashMap<u64, BlockMetadata>,
+
+    /// Sum of `num_bytes` over finalized blocks, so usage reports need no
+    /// directory walk.
+    total_bytes: AtomicU64,
+
+    /// Finalize/delete events awaiting an incremental block report; `None`
+    /// until a NameNode client asks for them.
+    events: Mutex<Option<Vec<BlockEvent>>>,
+}
+
+/// A change to the set of finalized replicas, for incremental block reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockEvent {
+    Received { block: BlockId, num_bytes: u64 },
+    Deleted { block: BlockId },
 }
 
 impl BlockStorage {
@@ -69,6 +86,8 @@ impl BlockStorage {
             finalized_dir,
             tmp_dir,
             blocks: DashMap::new(),
+            total_bytes: AtomicU64::new(0),
+            events: Mutex::new(None),
         };
 
         // Scan and load existing blocks
@@ -105,6 +124,7 @@ impl BlockStorage {
                             };
 
                             self.blocks.insert(block_id.block_id, metadata);
+                            self.total_bytes.fetch_add(num_bytes, Ordering::Relaxed);
                             count += 1;
                         }
                     }
@@ -296,7 +316,11 @@ impl BlockStorage {
             meta_path: finalized_meta,
         };
 
-        self.blocks.insert(block_id.block_id, metadata);
+        if let Some(old) = self.blocks.insert(block_id.block_id, metadata) {
+            self.total_bytes.fetch_sub(old.num_bytes, Ordering::Relaxed);
+        }
+        self.total_bytes.fetch_add(num_bytes, Ordering::Relaxed);
+        self.record(BlockEvent::Received { block: *block_id, num_bytes });
 
         info!("Finalized block {} ({} bytes) at {}", block_id.block_id, num_bytes, finalized_path.display());
 
@@ -306,6 +330,8 @@ impl BlockStorage {
     /// Delete a block
     pub fn delete_block(&self, block_id: &BlockId) -> Result<()> {
         if let Some((_, metadata)) = self.blocks.remove(&block_id.block_id) {
+            self.total_bytes.fetch_sub(metadata.num_bytes, Ordering::Relaxed);
+            self.record(BlockEvent::Deleted { block: metadata.block_id });
             // Delete block file
             if metadata.file_path.exists() {
                 fs::remove_file(&metadata.file_path)?;
@@ -336,6 +362,38 @@ impl BlockStorage {
     /// Get block metadata
     pub fn get_block_metadata(&self, block_id: u64) -> Option<BlockMetadata> {
         self.blocks.get(&block_id).map(|entry| entry.value().clone())
+    }
+
+    /// Bytes held in finalized blocks.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Start recording finalize/delete events for incremental block reports.
+    pub fn enable_events(&self) {
+        let mut ev = self.events.lock().unwrap();
+        if ev.is_none() {
+            *ev = Some(Vec::new());
+        }
+    }
+
+    /// Take the events recorded since the last call.
+    pub fn take_events(&self) -> Vec<BlockEvent> {
+        self.events.lock().unwrap().as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Put back events that could not be reported, ahead of newer ones.
+    pub fn requeue_events(&self, mut older: Vec<BlockEvent>) {
+        if let Some(ev) = self.events.lock().unwrap().as_mut() {
+            older.append(ev);
+            *ev = older;
+        }
+    }
+
+    fn record(&self, event: BlockEvent) {
+        if let Some(ev) = self.events.lock().unwrap().as_mut() {
+            ev.push(event);
+        }
     }
 
     /// Get total number of blocks
@@ -380,6 +438,26 @@ mod tests {
         storage.abort_write(&b);
         assert_eq!(fs::read_dir(d.path().join("tmp")).unwrap().count(), 0);
         assert!(storage.finalize_block(&b).is_err());
+    }
+
+    #[test]
+    fn usage_and_events_track_finalize_and_delete() {
+        let (_d, storage) = new_storage();
+        let (a, b) = (BlockId::new(10, 1), BlockId::new(11, 1));
+        storage.begin_write(&a).unwrap().write_all(&[0; 100]).unwrap();
+        storage.finalize_block(&a).unwrap();
+        assert!(storage.take_events().is_empty(), "events are off until enabled");
+
+        storage.enable_events();
+        storage.begin_write(&b).unwrap().write_all(&[0; 50]).unwrap();
+        storage.finalize_block(&b).unwrap();
+        storage.delete_block(&a).unwrap();
+        assert_eq!(storage.total_bytes(), 50);
+        assert_eq!(
+            storage.take_events(),
+            vec![BlockEvent::Received { block: b, num_bytes: 50 }, BlockEvent::Deleted { block: a }]
+        );
+        assert!(storage.take_events().is_empty());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::storage::{VolumeManager, BlockStorage};
 use crate::transport::tcp::TcpTransport;
 use crate::transport::selector::TransportSelector;
+use crate::replication::ReplicationCoordinator;
 use crate::grpc::{NamenodeClient, ClientDatanodeService};
 use crate::grpc::namenode_client::DatanodeInfo;
 
@@ -357,13 +358,31 @@ impl DataNode {
             rdma_port,
         };
 
+        // Replication coordinator: runs the NameNode's TRANSFER commands over
+        // whichever transports this DataNode has.
+        #[allow(unused_mut)]
+        let mut transports = vec![transport_selector.tcp_transport()];
+        #[cfg(feature = "rdma")]
+        if let Some(rdma) = transport_selector.rdma_transport() {
+            transports.push(rdma);
+        }
+        let replication_coordinator = Arc::new(ReplicationCoordinator::new(block_storage.clone(), transports));
+
         // Create NameNode client
-        let namenode_client = Arc::new(NamenodeClient::new(
+        let mut namenode_client = NamenodeClient::new(
             config.namenode_addr.clone(),
             datanode_info.clone(),
             volume_manager.clone(),
             block_storage.clone(),
-        ));
+        );
+        namenode_client.set_replication_coordinator(replication_coordinator);
+        if let Some(secs) = config.heartbeat_interval {
+            namenode_client.set_heartbeat_interval(std::time::Duration::from_secs(secs.max(1)));
+        }
+        if let Some(ms) = config.block_report_interval {
+            namenode_client.set_block_report_interval(std::time::Duration::from_millis(ms));
+        }
+        let namenode_client = Arc::new(namenode_client);
 
         // Log transport configuration
         if supported_transports.contains(&"rdma".to_string()) {
