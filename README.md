@@ -8,10 +8,10 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
 
 ### Key Features
 
-- **🚀 High Performance**: 3-5x faster than Java HDFS
+- **🚀 High Performance**: designed to outrun Java HDFS (see [Performance](#performance) for what has been measured)
   - Lock-free data structures (DashMap, AtomicU64)
   - Zero garbage collection pauses
-  - SPDK-backed storage via Flint (373 MB/s vs 97 MB/s)
+  - SPDK-backed storage via Flint
   - **RDMA support** for client-to-DataNode and inter-DataNode communication
   - Heterogeneous clusters (mixed RDMA/TCP DataNodes)
   - Auto-fallback to TCP when RDMA unavailable
@@ -249,7 +249,6 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - NameNode gRPC client (registration, heartbeat, block reports)
   - ClientDatanodeProtocol service
   - Lock-free block metadata cache (DashMap)
-  - 373 MB/s throughput via Flint SPDK backend
 
 - [x] **Phase 4:** Helm Chart & Deployment
   - Complete Helm chart with all components

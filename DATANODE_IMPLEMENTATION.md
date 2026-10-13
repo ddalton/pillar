@@ -47,7 +47,6 @@ The Pillar DataNode provides complete HDFS block storage functionality with nati
            │ Flint CSI Volume   │
            │ /mnt/pillar-data   │
            │ SPDK backend       │
-           │ 373 MB/s reads     │
            └────────────────────┘
 ```
 
@@ -334,31 +333,11 @@ spec:
 
 ## Performance
 
-### Block I/O Performance
-
-| Operation | Throughput | Latency (p50) | Latency (p99) |
-|-----------|------------|---------------|---------------|
-| Sequential Read | 373 MB/s | 2ms | 5ms |
-| Sequential Write | 350 MB/s | 3ms | 8ms |
-| Random Read | 180 MB/s | 5ms | 15ms |
-| Random Write | 150 MB/s | 8ms | 20ms |
-
-### Metadata Operations
-
-| Operation | Latency (p50) | Throughput |
-|-----------|---------------|------------|
-| Create Block | ~1ms | 1,000 ops/sec |
-| Finalize Block | ~2ms | 500 ops/sec |
-| Get Block Metadata | ~0.1ms | 10,000 ops/sec |
-
-### Resource Usage
-
-| Resource | Typical | Peak |
-|----------|---------|------|
-| CPU | 10-20% | 60% |
-| Memory | 100 MB | 500 MB |
-| Disk I/O | Variable | 373 MB/s |
-| Network | Variable | 1 Gbps+ |
+No end-to-end disk or network benchmarks have been run yet. The only
+measurements are the loopback data-path numbers in the README's
+Performance section (`tests/data_path.rs`), which measure protocol and
+copy overhead, not storage or network bandwidth. The targets in
+`NEXT_STEPS.md` (e.g. ~350 MB/s sequential I/O) remain targets.
 
 ## Data Flow Examples
 
