@@ -245,78 +245,23 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         info!("get_block_locations: {} (offset={}, length={})", path, offset, length);
 
-        match self.service
-            .handle_get_block_locations(&path, offset, length)
-            .await
-        {
-            Ok(blocks) => {
-                let located_blocks = LocatedBlocksProto {
-                    file_length: blocks.iter().map(|b| b.num_bytes).sum(),
-                    blocks: blocks
-                        .into_iter()
-                        .map(|b| LocatedBlockProto {
-                            b: ExtendedBlockProto {
-                                pool_id: "BP-pillar-001".to_string(),
-                                block_id: b.block_id,
-                                generation_stamp: b.generation_stamp,
-                                num_bytes: Some(b.num_bytes),
-                            },
-                            offset: b.offset,
-                            locs: b.locations
-                                .into_iter()
-                                .map(|loc| DatanodeInfoProto {
-                                    id: DatanodeIdProto {
-                                        ip_addr: loc.hostname.clone(),
-                                        host_name: loc.hostname,
-                                        datanode_uuid: loc.uuid,
-                                        xfer_port: loc.data_port as u32,
-                                        info_port: loc.http_port as u32,
-                                        ipc_port: loc.rpc_port as u32,
-                                        info_secure_port: Some(0),
-                                        supported_transports: loc.supported_transports,
-                                        rdma_port: Some(loc.rdma_port as u32),
-                                    },
-                                    capacity: Some(0),
-                                    dfs_used: Some(0),
-                                    remaining: Some(0),
-                                    block_pool_used: Some(0),
-                                    cache_capacity: Some(0),
-                                    cache_used: Some(0),
-                                    last_update: Some(0),
-                                    last_update_monotonic: Some(0),
-                                    xceiver_count: Some(0),
-                                    location: None,
-                                    non_dfs_used: Some(0),
-                                    admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
-                                    upgrade_domain: None,
-                                    last_block_report_time: Some(0),
-                                    last_block_report_monotonic: Some(0),
-                                    num_blocks: Some(0),
-                                    software_version: None,
-                                })
-                                .collect(),
-                            corrupt: false,
-                            block_token: Default::default(),
-                            is_cached: vec![],
-                            storage_types: vec![],
-                            storage_i_ds: vec![],
-                            block_indices: None,
-                            block_tokens: vec![],
-                        })
-                        .collect(),
-                    under_construction: false,
-                    last_block: None,
-                    is_last_block_complete: true,
-                    file_encryption_info: None,
-                    ec_policy: None,
-                };
+        let located = self.service
+            .handle_get_located_blocks(&path, offset, length)
+            .await?;
 
-                Ok(Response::new(GetBlockLocationsResponseProto {
-                    locations: Some(located_blocks),
-                }))
-            }
-            Err(e) => Err(e),
-        }
+        let located_blocks = LocatedBlocksProto {
+            file_length: located.file_length,
+            blocks: located.blocks.into_iter().map(located_block_to_proto).collect(),
+            under_construction: located.under_construction,
+            last_block: located.last_block.map(located_block_to_proto),
+            is_last_block_complete: located.is_last_block_complete,
+            file_encryption_info: None,
+            ec_policy: None,
+        };
+
+        Ok(Response::new(GetBlockLocationsResponseProto {
+            locations: Some(located_blocks),
+        }))
     }
 
     /// Add a new block when writing a file
@@ -1559,5 +1504,58 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         _request: Request<GetEditsFromTxidRequestProto>,
     ) -> Result<Response<GetEditsFromTxidResponseProto>, Status> {
         Err(Status::unimplemented("Edit log access not supported"))
+    }
+}
+
+/// Convert a service-level LocatedBlock into the wire LocatedBlockProto.
+fn located_block_to_proto(b: crate::grpc::client_namenode_service::LocatedBlock) -> LocatedBlockProto {
+    LocatedBlockProto {
+        b: ExtendedBlockProto {
+            pool_id: "BP-pillar-001".to_string(),
+            block_id: b.block_id,
+            generation_stamp: b.generation_stamp,
+            num_bytes: Some(b.num_bytes),
+        },
+        offset: b.offset,
+        locs: b.locations
+            .into_iter()
+            .map(|loc| DatanodeInfoProto {
+                id: DatanodeIdProto {
+                    ip_addr: loc.hostname.clone(),
+                    host_name: loc.hostname,
+                    datanode_uuid: loc.uuid,
+                    xfer_port: loc.data_port as u32,
+                    info_port: loc.http_port as u32,
+                    ipc_port: loc.rpc_port as u32,
+                    info_secure_port: Some(0),
+                    supported_transports: loc.supported_transports,
+                    rdma_port: Some(loc.rdma_port as u32),
+                },
+                capacity: Some(0),
+                dfs_used: Some(0),
+                remaining: Some(0),
+                block_pool_used: Some(0),
+                cache_capacity: Some(0),
+                cache_used: Some(0),
+                last_update: Some(0),
+                last_update_monotonic: Some(0),
+                xceiver_count: Some(0),
+                location: None,
+                non_dfs_used: Some(0),
+                admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
+                upgrade_domain: None,
+                last_block_report_time: Some(0),
+                last_block_report_monotonic: Some(0),
+                num_blocks: Some(0),
+                software_version: None,
+            })
+            .collect(),
+        corrupt: false,
+        block_token: Default::default(),
+        is_cached: vec![],
+        storage_types: vec![],
+        storage_i_ds: vec![],
+        block_indices: None,
+        block_tokens: vec![],
     }
 }

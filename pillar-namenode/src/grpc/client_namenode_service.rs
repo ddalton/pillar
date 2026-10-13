@@ -166,46 +166,114 @@ impl ClientNamenodeService {
         Ok(true)
     }
 
-    /// Get block locations for a file
+    /// Get the blocks of a file overlapping `[offset, offset + length)`.
+    ///
+    /// Convenience wrapper around [`Self::handle_get_located_blocks`] that
+    /// returns only the block list.
     pub async fn handle_get_block_locations(
         &self,
         path: &str,
         offset: u64,
         length: u64,
     ) -> Result<Vec<LocatedBlock>, Status> {
+        Ok(self.handle_get_located_blocks(path, offset, length).await?.blocks)
+    }
+
+    /// getBlockLocations with HDFS semantics.
+    ///
+    /// Block offsets are the cumulative sizes of the preceding blocks (blocks
+    /// can have unequal sizes after append, concat or truncate). Only blocks
+    /// overlapping `[offset, offset + length)` are returned; as in HDFS, the
+    /// block containing `offset` is returned even when `length` is 0, and an
+    /// offset at or past EOF yields no blocks. `file_length`, `last_block`
+    /// and `is_last_block_complete` always describe the whole file.
+    pub async fn handle_get_located_blocks(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<LocatedBlocks, Status> {
         let inode = self.namespace
             .lookup(path)
             .await
             .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
 
-        let inode_guard = inode.read().await;
+        // Copy out what we need and release the inode lock before resolving
+        // locations.
+        let (selected, file_length, last) = {
+            let inode_guard = inode.read().await;
 
-        if inode_guard.is_dir {
-            return Err(Status::invalid_argument("Cannot get blocks for directory"));
+            if inode_guard.is_dir {
+                return Err(Status::invalid_argument("Cannot get blocks for directory"));
+            }
+
+            let blocks: &[crate::metadata::namespace::BlockInfo] =
+                inode_guard.blocks.as_deref().unwrap_or(&[]);
+            let file_length: u64 = blocks.iter().map(|b| b.num_bytes).sum();
+            let last = blocks.last().map(|b| (b.clone(), file_length - b.num_bytes));
+            (Self::blocks_in_range(blocks, offset, length), file_length, last)
+        };
+
+        let blocks = selected
+            .into_iter()
+            .map(|(block, block_offset)| self.locate(&block, block_offset))
+            .collect();
+
+        let is_last_block_complete = last.is_some();
+        let last_block = last.map(|(block, block_offset)| self.locate(&block, block_offset));
+
+        Ok(LocatedBlocks {
+            file_length,
+            blocks,
+            last_block,
+            is_last_block_complete,
+            under_construction: false,
+        })
+    }
+
+    /// Select the blocks overlapping `[offset, offset + length)`, paired with
+    /// their starting offsets in the file (HDFS `createLocatedBlockList`).
+    fn blocks_in_range(
+        blocks: &[crate::metadata::namespace::BlockInfo],
+        offset: u64,
+        length: u64,
+    ) -> Vec<(crate::metadata::namespace::BlockInfo, u64)> {
+        // Find the block containing `offset`.
+        let mut cur_pos = 0u64;
+        let mut cur_blk = 0usize;
+        while cur_blk < blocks.len() {
+            if cur_pos + blocks[cur_blk].num_bytes > offset {
+                break;
+            }
+            cur_pos += blocks[cur_blk].num_bytes;
+            cur_blk += 1;
         }
 
-        let blocks = inode_guard.blocks.as_ref()
-            .ok_or_else(|| Status::internal("File has no blocks"))?;
-
+        let end = offset.saturating_add(length);
         let mut result = Vec::new();
-
-        for (idx, block) in blocks.iter().enumerate() {
-            let block_id = BlockId::new(block.block_id, block.generation_stamp);
-
-            let locations = self.block_manager
-                .get_block_locations(&block_id)
-                .unwrap_or_default();
-
-            result.push(LocatedBlock {
-                block_id: block.block_id,
-                generation_stamp: block.generation_stamp,
-                num_bytes: block.num_bytes,
-                offset: idx as u64 * inode_guard.block_size,
-                locations,
-            });
+        while cur_blk < blocks.len() {
+            result.push((blocks[cur_blk].clone(), cur_pos));
+            cur_pos += blocks[cur_blk].num_bytes;
+            cur_blk += 1;
+            if cur_pos >= end {
+                break;
+            }
         }
+        result
+    }
 
-        Ok(result)
+    /// Build a LocatedBlock for a block at a given file offset.
+    fn locate(&self, block: &crate::metadata::namespace::BlockInfo, offset: u64) -> LocatedBlock {
+        let block_id = BlockId::new(block.block_id, block.generation_stamp);
+        LocatedBlock {
+            block_id: block.block_id,
+            generation_stamp: block.generation_stamp,
+            num_bytes: block.num_bytes,
+            offset,
+            locations: self.block_manager
+                .get_block_locations(&block_id)
+                .unwrap_or_default(),
+        }
     }
 
     /// Add a new block to a file (called by client when writing)
@@ -309,7 +377,9 @@ impl ClientNamenodeService {
                         block_id: last_block.block_id,
                         generation_stamp: last_block.generation_stamp,
                         num_bytes: last_block.num_bytes,
-                        offset: (blocks.len() - 1) as u64 * inode_guard.block_size,
+                        // Real offset: blocks before the last can be partial
+                        // (after append/concat/truncate).
+                        offset: blocks[..blocks.len() - 1].iter().map(|b| b.num_bytes).sum(),
                         locations,
                     });
                 }
@@ -331,7 +401,18 @@ impl ClientNamenodeService {
         let mut inode_guard = inode.write().await;
 
         if let Some(blocks) = &mut inode_guard.blocks {
-            blocks.retain(|b| b.block_id != block_id);
+            let mut abandoned = Vec::new();
+            blocks.retain(|b| {
+                if b.block_id == block_id {
+                    abandoned.push(BlockId::new(b.block_id, b.generation_stamp));
+                    false
+                } else {
+                    true
+                }
+            });
+            for block in &abandoned {
+                self.block_manager.remove_block(block);
+            }
             info!("Abandoned block {} for file: {}", block_id, path);
         }
 
@@ -549,30 +630,32 @@ impl ClientNamenodeService {
             return Ok(true);
         }
 
-        // Determine which blocks to keep and modify
-        let block_size = inode_guard.block_size;
-        let num_blocks_to_keep = ((new_length + block_size - 1) / block_size) as usize;
-
         if let Some(blocks) = &mut inode_guard.blocks {
-            // If truncating to zero, remove all blocks
-            if new_length == 0 {
-                blocks.clear();
-                info!("Truncated {} to zero length, removed all blocks", path);
-                return Ok(true);
+            // Walk real block sizes (blocks can be partial after
+            // append/concat): keep every block that starts before
+            // new_length, and cut the last kept one at new_length.
+            let mut num_blocks_to_keep = 0usize;
+            let mut kept_bytes = 0u64;
+            while num_blocks_to_keep < blocks.len() && kept_bytes < new_length {
+                kept_bytes += blocks[num_blocks_to_keep].num_bytes;
+                num_blocks_to_keep += 1;
             }
 
-            // Calculate the size of the last block after truncation
-            let last_block_size = if new_length % block_size == 0 {
-                block_size
-            } else {
-                new_length % block_size
-            };
-
-            // Keep only the blocks we need and update the last block's size
-            blocks.truncate(num_blocks_to_keep);
+            let dropped: Vec<BlockId> = blocks
+                .drain(num_blocks_to_keep..)
+                .map(|b| BlockId::new(b.block_id, b.generation_stamp))
+                .collect();
+            for block in &dropped {
+                self.block_manager.remove_block(block);
+            }
 
             if let Some(last_block) = blocks.last_mut() {
+                let last_block_size = last_block.num_bytes - (kept_bytes - new_length);
                 last_block.num_bytes = last_block_size;
+                let _ = self.block_manager.update_block_size(
+                    &BlockId::new(last_block.block_id, last_block.generation_stamp),
+                    last_block_size,
+                );
                 info!(
                     "Updated last block {} size to {} bytes",
                     last_block.block_id,
@@ -581,8 +664,8 @@ impl ClientNamenodeService {
             }
 
             info!(
-                "Truncated {} from {} to {} bytes ({} blocks remaining)",
-                path, current_length, new_length, blocks.len()
+                "Truncated {} from {} to {} bytes ({} blocks remaining, {} removed)",
+                path, current_length, new_length, blocks.len(), dropped.len()
             );
         }
 
@@ -743,6 +826,19 @@ pub struct FileInfo {
     pub owner: String,
     pub group: String,
     pub permissions: u16,
+}
+
+/// Result of getBlockLocations (mirrors HDFS LocatedBlocks)
+#[derive(Debug, Clone)]
+pub struct LocatedBlocks {
+    /// Length of the whole file
+    pub file_length: u64,
+    /// Blocks overlapping the requested range
+    pub blocks: Vec<LocatedBlock>,
+    /// Last block of the file (None for an empty file)
+    pub last_block: Option<LocatedBlock>,
+    pub is_last_block_complete: bool,
+    pub under_construction: bool,
 }
 
 /// Block location information
@@ -3197,5 +3293,124 @@ mod tests {
         // Deleting the target releases the moved block as well.
         service.handle_delete("/t", false).await.unwrap();
         assert_eq!(block_manager.get_total_blocks(), 0);
+    }
+
+    // ========================================================================
+    // getBlockLocations: real offsets and range filtering
+    // ========================================================================
+
+    /// Create `path` with blocks of the given sizes (block_size 128).
+    async fn file_with_block_sizes(
+        service: &ClientNamenodeService,
+        namespace: &Namespace,
+        path: &str,
+        sizes: &[u64],
+    ) {
+        create(service, path, 128).await;
+        for _ in sizes {
+            service.handle_add_block(path).await.unwrap();
+        }
+        let inode = namespace.lookup(path).await.unwrap();
+        let mut guard = inode.write().await;
+        for (block, size) in guard.blocks.as_mut().unwrap().iter_mut().zip(sizes) {
+            block.num_bytes = *size;
+        }
+    }
+
+    fn offsets(blocks: &[LocatedBlock]) -> Vec<u64> {
+        blocks.iter().map(|b| b.offset).collect()
+    }
+
+    #[tokio::test]
+    async fn test_get_block_locations_unequal_block_sizes() {
+        let (service, namespace, block_manager) = service_with_datanodes(1);
+        file_with_block_sizes(&service, &namespace, "/f", &[100, 50, 100, 30]).await;
+
+        let all = service.handle_get_located_blocks("/f", 0, u64::MAX).await.unwrap();
+        assert_eq!(offsets(&all.blocks), vec![0, 100, 150, 250]);
+        assert_eq!(all.file_length, 280);
+
+        // Replica locations come from the block manager.
+        let second = BlockId::new(all.blocks[1].block_id, all.blocks[1].generation_stamp);
+        block_manager.add_block_location(second, DatanodeId::new("dn0".to_string(), "host0".to_string(), 9867));
+        let span = service.handle_get_located_blocks("/f", 100, 1).await.unwrap();
+        assert_eq!(span.blocks[0].locations.len(), 1);
+        assert_eq!(span.blocks[0].locations[0].uuid, "dn0");
+
+        // Only blocks overlapping [offset, offset+length) are returned.
+        let mid = service.handle_get_located_blocks("/f", 120, 10).await.unwrap();
+        assert_eq!(offsets(&mid.blocks), vec![100]);
+        let span = service.handle_get_located_blocks("/f", 149, 2).await.unwrap();
+        assert_eq!(offsets(&span.blocks), vec![100, 150]);
+        let edge = service.handle_get_located_blocks("/f", 100, 50).await.unwrap();
+        assert_eq!(offsets(&edge.blocks), vec![100]);
+        let tail = service.handle_get_located_blocks("/f", 200, 1000).await.unwrap();
+        assert_eq!(offsets(&tail.blocks), vec![150, 250]);
+        // HDFS returns the block containing offset even for length 0.
+        let zero = service.handle_get_located_blocks("/f", 150, 0).await.unwrap();
+        assert_eq!(offsets(&zero.blocks), vec![150]);
+        // At or beyond EOF: no blocks.
+        assert!(service.handle_get_located_blocks("/f", 280, 10).await.unwrap().blocks.is_empty());
+        assert!(service.handle_get_located_blocks("/f", 10_000, 10).await.unwrap().blocks.is_empty());
+
+        // File-level fields describe the whole file regardless of range.
+        assert_eq!(mid.file_length, 280);
+        let last = mid.last_block.as_ref().unwrap();
+        assert_eq!((last.offset, last.num_bytes), (250, 30));
+        assert_eq!(last.block_id, all.blocks[3].block_id);
+        assert!(mid.is_last_block_complete);
+        assert!(!mid.under_construction);
+
+        // The Vec-returning wrapper applies the same filtering.
+        let v = service.handle_get_block_locations("/f", 120, 10).await.unwrap();
+        assert_eq!(offsets(&v), vec![100]);
+    }
+
+    #[tokio::test]
+    async fn test_get_block_locations_empty_file() {
+        let (service, _, _) = service_with_datanodes(1);
+        create(&service, "/empty", 128).await;
+        let located = service.handle_get_located_blocks("/empty", 0, u64::MAX).await.unwrap();
+        assert!(located.blocks.is_empty());
+        assert_eq!(located.file_length, 0);
+        assert!(located.last_block.is_none());
+        assert!(!located.is_last_block_complete);
+    }
+
+    #[tokio::test]
+    async fn test_block_offsets_after_truncate_concat_and_append() {
+        let (service, namespace, block_manager) = service_with_datanodes(1);
+        file_with_block_sizes(&service, &namespace, "/t", &[100, 50, 100]).await;
+
+        // Truncate inside the second block: [100, 50, 100] -> [100, 20].
+        service.handle_truncate("/t", 120).await.unwrap();
+        let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
+        assert_eq!(offsets(&located.blocks), vec![0, 100]);
+        assert_eq!(located.blocks[1].num_bytes, 20);
+        assert_eq!(located.file_length, 120);
+        // The dropped block is released from the block manager.
+        assert_eq!(block_manager.get_total_blocks(), 2);
+
+        // Concat a source with a partial block: offsets keep accumulating.
+        file_with_block_sizes(&service, &namespace, "/s", &[70]).await;
+        service.handle_concat("/t", &["/s".to_string()]).await.unwrap();
+        let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
+        assert_eq!(offsets(&located.blocks), vec![0, 100, 120]);
+        assert_eq!(located.file_length, 190);
+        let last = located.last_block.unwrap();
+        assert_eq!((last.offset, last.num_bytes), (120, 70));
+        let hit = service.handle_get_located_blocks("/t", 125, 1).await.unwrap();
+        assert_eq!(offsets(&hit.blocks), vec![120]);
+
+        // Append returns the partial last block at its real offset.
+        let appended = service.handle_append("/t").await.unwrap();
+        assert_eq!(appended.offset, 120);
+        assert_eq!(appended.num_bytes, 70);
+
+        // Truncate across unequal blocks to the exact boundary.
+        service.handle_truncate("/t", 100).await.unwrap();
+        let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
+        assert_eq!(offsets(&located.blocks), vec![0]);
+        assert_eq!(located.file_length, 100);
     }
 }
