@@ -1,6 +1,5 @@
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -95,6 +94,37 @@ impl DatanodeDescriptor {
     pub fn remove_block(&mut self, block_id: &BlockId) {
         self.blocks.remove(block_id);
     }
+
+    /// Cheap snapshot of this descriptor without the (potentially huge) block set.
+    pub fn to_info(&self) -> DatanodeInfo {
+        DatanodeInfo {
+            id: self.id.clone(),
+            storage: self.storage.clone(),
+            last_update: self.last_update,
+            last_block_report: self.last_block_report,
+            xceiver_count: self.xceiver_count,
+            failed_volumes: self.failed_volumes,
+            num_blocks: self.blocks.len(),
+        }
+    }
+}
+
+/// Lightweight point-in-time view of a datanode.
+///
+/// This is what hot paths (block placement, datanode lookups on every
+/// block-received / block-report RPC) get back from [`DatanodeManager`].
+/// Unlike [`DatanodeDescriptor`] it does not carry the datanode's block set,
+/// so producing it is O(1) in the number of replicas the node stores.
+#[derive(Debug, Clone)]
+pub struct DatanodeInfo {
+    pub id: DatanodeId,
+    pub storage: StorageInfo,
+    pub last_update: Instant,
+    pub last_block_report: Option<Instant>,
+    pub xceiver_count: u32,
+    pub failed_volumes: u32,
+    /// Number of blocks the namenode believes this datanode stores.
+    pub num_blocks: usize,
 }
 
 /// Manages all registered datanodes
@@ -152,21 +182,55 @@ impl DatanodeManager {
         }
     }
 
-    /// Get a datanode by UUID
-    pub fn get_datanode(&self, uuid: &str) -> Option<DatanodeDescriptor> {
+    /// Get a lightweight snapshot of a datanode by UUID (no block set).
+    ///
+    /// Use [`DatanodeManager::get_datanode_blocks`] or
+    /// [`DatanodeManager::datanode_has_block`] for block membership, or
+    /// [`DatanodeManager::get_datanode_descriptor`] for a full (expensive) copy.
+    pub fn get_datanode(&self, uuid: &str) -> Option<DatanodeInfo> {
+        self.datanodes.get(uuid).map(|entry| entry.value().to_info())
+    }
+
+    /// Get just the identity (addresses/ports) of a datanode.
+    pub fn get_datanode_id(&self, uuid: &str) -> Option<DatanodeId> {
+        self.datanodes.get(uuid).map(|entry| entry.value().id.clone())
+    }
+
+    /// Get a full copy of a datanode descriptor, including its block set.
+    ///
+    /// This is O(number of replicas on the node); avoid it on hot paths.
+    pub fn get_datanode_descriptor(&self, uuid: &str) -> Option<DatanodeDescriptor> {
         self.datanodes.get(uuid).map(|entry| entry.value().clone())
     }
 
-    /// Get all live datanodes
-    pub fn get_live_datanodes(&self) -> Vec<DatanodeDescriptor> {
+    /// Blocks the namenode believes are stored on a datanode.
+    pub fn get_datanode_blocks(&self, uuid: &str) -> Option<Vec<BlockId>> {
+        self.datanodes
+            .get(uuid)
+            .map(|entry| entry.value().blocks.iter().copied().collect())
+    }
+
+    /// Whether a datanode is known to store a block.
+    pub fn datanode_has_block(&self, uuid: &str, block_id: &BlockId) -> bool {
+        self.datanodes
+            .get(uuid)
+            .map(|entry| entry.value().blocks.contains(block_id))
+            .unwrap_or(false)
+    }
+
+    /// Get lightweight snapshots of all live datanodes (no block sets).
+    pub fn get_live_datanodes(&self) -> Vec<DatanodeInfo> {
         self.datanodes
             .iter()
             .filter(|entry| entry.value().is_alive(self.stale_interval))
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().to_info())
             .collect()
     }
 
-    /// Get all dead datanodes
+    /// Get all dead datanodes.
+    ///
+    /// Returns full descriptors (including block sets) because callers use
+    /// them to find blocks needing re-replication. This is a rare, slow path.
     pub fn get_dead_datanodes(&self) -> Vec<DatanodeDescriptor> {
         self.datanodes
             .iter()
@@ -177,21 +241,18 @@ impl DatanodeManager {
 
     /// Select datanodes for block placement (simple round-robin for now)
     pub fn select_datanodes(&self, num_replicas: usize) -> Result<Vec<DatanodeId>> {
-        let live_nodes = self.get_live_datanodes();
+        let mut nodes = self.get_live_datanodes();
 
-        if live_nodes.len() < num_replicas {
+        if nodes.len() < num_replicas {
             return Err(DatanodeManagerError::InsufficientDatanodes);
         }
 
         // Simple selection: pick nodes with most remaining capacity
-        let mut nodes = live_nodes;
-        nodes.sort_by(|a, b| {
-            b.storage.remaining.cmp(&a.storage.remaining)
-        });
+        nodes.sort_by(|a, b| b.storage.remaining.cmp(&a.storage.remaining));
 
         Ok(nodes.into_iter()
             .take(num_replicas)
-            .map(|desc| desc.id)
+            .map(|info| info.id)
             .collect())
     }
 
@@ -241,18 +302,25 @@ impl DatanodeManager {
 
     /// Get number of live datanodes
     pub fn get_num_live_datanodes(&self) -> usize {
-        self.get_live_datanodes().len()
+        self.datanodes
+            .iter()
+            .filter(|entry| entry.value().is_alive(self.stale_interval))
+            .count()
     }
 
-    /// Remove dead datanodes
+    /// Remove dead datanodes, returning their UUIDs
     pub fn remove_dead_datanodes(&self) -> Vec<String> {
-        let dead_nodes = self.get_dead_datanodes();
         let mut removed = Vec::new();
+        let dead_interval = self.dead_interval;
 
-        for node in dead_nodes {
-            self.datanodes.remove(&node.id.uuid);
-            removed.push(node.id.uuid);
-        }
+        self.datanodes.retain(|uuid, descriptor| {
+            if descriptor.is_dead(dead_interval) {
+                removed.push(uuid.clone());
+                false
+            } else {
+                true
+            }
+        });
 
         removed
     }
@@ -435,9 +503,9 @@ mod tests {
         manager.add_block_to_datanode("dn3", block_id).unwrap();
 
         // Verify all datanodes have the block
-        assert!(manager.get_datanode("dn1").unwrap().blocks.contains(&block_id));
-        assert!(manager.get_datanode("dn2").unwrap().blocks.contains(&block_id));
-        assert!(manager.get_datanode("dn3").unwrap().blocks.contains(&block_id));
+        assert!(manager.datanode_has_block("dn1", &block_id));
+        assert!(manager.datanode_has_block("dn2", &block_id));
+        assert!(manager.datanode_has_block("dn3", &block_id));
 
         // Mark dn1 as dead
         {
@@ -540,5 +608,33 @@ mod tests {
         let live_nodes = manager.get_live_datanodes();
         assert_eq!(live_nodes.len(), 1);
         assert_eq!(live_nodes[0].id.uuid, "dn1");
+    }
+
+    #[test]
+    fn test_snapshots_do_not_copy_block_set() {
+        let manager = DatanodeManager::new();
+        let id = DatanodeId::new("dn1".to_string(), "host1".to_string(), 9000);
+        manager.register(id.clone(), 1_000_000_000).unwrap();
+
+        for i in 0..1000 {
+            manager.add_block_to_datanode("dn1", BlockId::new(i, 1)).unwrap();
+        }
+
+        // Snapshots carry only a count, not the block set.
+        let info = manager.get_datanode("dn1").unwrap();
+        assert_eq!(info.id, id);
+        assert_eq!(info.num_blocks, 1000);
+        assert_eq!(manager.get_live_datanodes()[0].num_blocks, 1000);
+        assert_eq!(manager.get_num_live_datanodes(), 1);
+        assert_eq!(manager.get_datanode_id("dn1").unwrap(), id);
+
+        // The full descriptor is still available explicitly.
+        assert_eq!(manager.get_datanode_descriptor("dn1").unwrap().blocks.len(), 1000);
+        assert_eq!(manager.get_datanode_blocks("dn1").unwrap().len(), 1000);
+
+        manager.remove_block_from_datanode("dn1", &BlockId::new(0, 1)).unwrap();
+        assert!(!manager.datanode_has_block("dn1", &BlockId::new(0, 1)));
+        assert!(manager.datanode_has_block("dn1", &BlockId::new(1, 1)));
+        assert!(manager.get_datanode("missing").is_none());
     }
 }

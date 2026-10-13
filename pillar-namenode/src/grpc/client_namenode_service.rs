@@ -205,6 +205,23 @@ impl ClientNamenodeService {
             .await
             .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
 
+        // Read what placement needs, then release the inode lock: choosing
+        // targets scans all datanodes and must not serialize other operations
+        // on this file.
+        let replication = {
+            let inode_guard = inode.read().await;
+            if inode_guard.is_dir {
+                return Err(Status::invalid_argument("Cannot add block to directory"));
+            }
+            inode_guard.replication
+        };
+
+        // Select datanodes for replica placement (before allocating, so a
+        // placement failure doesn't leak an allocated block)
+        let targets = self.placement_policy
+            .choose_targets(Some(replication))
+            .map_err(|e| Status::resource_exhausted(format!("Failed to choose targets: {}", e)))?;
+
         let mut inode_guard = inode.write().await;
 
         if inode_guard.is_dir {
@@ -216,11 +233,6 @@ impl ClientNamenodeService {
             .allocate_block(inode_guard.id)
             .await
             .map_err(|e| Status::internal(format!("Failed to allocate block: {}", e)))?;
-
-        // Select datanodes for replica placement
-        let targets = self.placement_policy
-            .choose_targets(Some(inode_guard.replication))
-            .map_err(|e| Status::resource_exhausted(format!("Failed to choose targets: {}", e)))?;
 
         // Add block to inode
         inode_guard.add_block(crate::metadata::namespace::BlockInfo {
@@ -328,7 +340,7 @@ impl ClientNamenodeService {
                 capacity: dn.storage.capacity,
                 used: dn.storage.used,
                 remaining: dn.storage.remaining,
-                num_blocks: dn.blocks.len() as u32,
+                num_blocks: dn.num_blocks as u32,
                 last_update: dn.last_update.elapsed().as_secs(),
                 supported_transports: dn.id.supported_transports.clone(),
                 rdma_port: dn.id.rdma_port,
@@ -371,36 +383,19 @@ impl ClientNamenodeService {
             existing_datanodes.len() + excluded_datanodes.len()
         );
 
-        // Get all live datanodes
-        let mut available_datanodes = self.datanode_manager.get_live_datanodes();
-
-        // Filter out existing and excluded datanodes
-        available_datanodes.retain(|dn| {
-            !existing_datanodes.iter().any(|existing| existing.uuid == dn.id.uuid)
-                && !excluded_datanodes.iter().any(|excluded| excluded.uuid == dn.id.uuid)
-        });
-
-        if available_datanodes.len() < num_additional_nodes as usize {
-            return Err(Status::resource_exhausted(format!(
-                "Not enough datanodes available: need {}, have {}",
-                num_additional_nodes,
-                available_datanodes.len()
-            )));
-        }
-
-        // Score and select the best datanodes using placement policy
-        available_datanodes.sort_by(|a, b| {
-            let score_a = self.score_datanode_for_replacement(a);
-            let score_b = self.score_datanode_for_replacement(b);
-            score_b.partial_cmp(&score_a).unwrap()
-        });
-
-        // Take the requested number of datanodes
-        let new_locations: Vec<DatanodeId> = available_datanodes
-            .into_iter()
-            .take(num_additional_nodes as usize)
-            .map(|dn| dn.id)
+        // Choose the best live datanodes, excluding existing and excluded ones
+        let exclude: Vec<&str> = existing_datanodes
+            .iter()
+            .chain(excluded_datanodes.iter())
+            .map(|dn| dn.uuid.as_str())
             .collect();
+
+        let new_locations = self.placement_policy
+            .choose_targets_excluding(num_additional_nodes as usize, &exclude)
+            .map_err(|e| Status::resource_exhausted(format!(
+                "Not enough datanodes available: need {}: {}",
+                num_additional_nodes, e
+            )))?;
 
         // Combine existing and new locations
         let mut all_locations = existing_datanodes.to_vec();
@@ -664,28 +659,6 @@ impl ClientNamenodeService {
         info!("Successfully concatenated {} files into {}", sources.len(), target);
 
         Ok(())
-    }
-
-    /// Score a datanode for use as a replacement (higher is better)
-    fn score_datanode_for_replacement(&self, node: &crate::datanode::manager::DatanodeDescriptor) -> f64 {
-        let mut score = 0.0;
-
-        // Factor 1: Available space (0-100 points)
-        let space_ratio = node.storage.remaining as f64 / node.storage.capacity.max(1) as f64;
-        score += space_ratio * 100.0;
-
-        // Factor 2: Low xceiver count (0-50 points)
-        let xceiver_penalty = (node.xceiver_count as f64 * 2.0).min(50.0);
-        score -= xceiver_penalty;
-
-        // Factor 3: No failed volumes (0-50 points bonus)
-        if node.failed_volumes == 0 {
-            score += 50.0;
-        } else {
-            score -= node.failed_volumes as f64 * 25.0;
-        }
-
-        score
     }
 
     /// Get file length
