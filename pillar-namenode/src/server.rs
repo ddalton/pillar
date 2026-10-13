@@ -134,17 +134,25 @@ impl NameNode {
     pub async fn new(config: NameNodeConfig) -> Result<Self> {
         info!("Initializing NameNode with config: {:?}", config);
 
-        // Initialize etcd metadata store for HA
-        let metadata_store = Arc::new(
-            EtcdMetadataStore::new(config.etcd_endpoints.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))?
-        );
+        // Initialize etcd metadata store for HA. It is not yet consulted for
+        // namespace state, so "none" (or no endpoints) skips it, e.g. for
+        // local testing without etcd.
+        let etcd_disabled = config.etcd_endpoints.is_empty()
+            || config.etcd_endpoints.iter().all(|e| e.is_empty() || e == "none");
+        if etcd_disabled {
+            info!("Metadata store: etcd disabled");
+        } else {
+            let metadata_store = Arc::new(
+                EtcdMetadataStore::new(config.etcd_endpoints.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))?
+            );
 
-        metadata_store.initialize().await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize metadata store: {}", e))?;
+            metadata_store.initialize().await
+                .map_err(|e| anyhow::anyhow!("Failed to initialize metadata store: {}", e))?;
 
-        info!("Metadata store initialized with etcd: {:?}", config.etcd_endpoints);
+            info!("Metadata store initialized with etcd: {:?}", config.etcd_endpoints);
+        }
 
         // Initialize core components
         let namespace = Arc::new(Namespace::new());
@@ -218,8 +226,10 @@ impl NameNode {
         let server = tonic::transport::Server::builder()
             // High concurrency settings
             .concurrency_limit_per_connection(1024)
-            // Large message sizes for block transfers
-            .max_frame_size(Some(256 * 1024 * 1024)) // 256MB max frame
+            // HTTP/2 caps a frame at 2^24-1 octets; h2 panics on anything
+            // larger (the old 256 MiB value broke every gRPC connection).
+            // Messages larger than a frame are split across frames anyway.
+            .max_frame_size(Some(4 * 1024 * 1024))
             // Connection keep-alive
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .tcp_nodelay(true)
