@@ -17,9 +17,11 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
   - Auto-fallback to TCP when RDMA unavailable
   - Pure Rust - no glibc or OpenSSL dependencies
 
-- **🔌 Drop-in Replacement**: 100% compatible with Hadoop ecosystem
-  - Works with `hadoop fs` CLI
-  - Compatible with Spark, Hive, Flink, Presto
+- **🔌 Hadoop wire compatible**: stock HDFS clients connect unchanged
+  - NameNode speaks Hadoop IPC (`hdfs://namenode:9000`); DataNodes speak
+    Hadoop DataTransferProtocol, including 3-node write pipelines
+  - Tested with the Apache Hadoop 3.5.0 Java client and hdfs-native
+    (see [Hadoop client compatibility](#hadoop-client-compatibility))
   - Implements official Apache Hadoop protobuf protocols
 
 - **☸️ Kubernetes Native**: Designed for cloud-native deployments
@@ -290,6 +292,28 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - Heterogeneous cluster support (mixed RDMA/TCP)
   - Auto-fallback to TCP when RDMA unavailable
   - See [RDMA_IMPLEMENTATION_PLAN.md](RDMA_IMPLEMENTATION_PLAN.md) for details
+
+## Hadoop client compatibility
+
+Verified end to end against an in-process / local cluster (NameNode + 3
+DataNodes):
+
+- `tests/interop/run-java-interop.sh` — the stock **Apache Hadoop 3.5.0**
+  Java client (`DFSClient`, the code behind `hadoop fs`): `mkdirs -p`,
+  multi-block write through a 3-DataNode pipeline, sequential and
+  positional reads, `copyFromLocalFile` (`-put`) and read back (`-cat`),
+  `listStatus`, rename, `FileAlreadyExistsException`, recursive delete.
+- `pillar-datanode/tests/hdfs_client.rs` — the independent
+  [hdfs-native](https://crates.io/crates/hdfs-native) client: the same
+  operations, plus a DataNode crash with re-replication and replica
+  cleanup after delete.
+
+Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
+append, hflush/hsync recovery, pipeline recovery after a DataNode fails
+mid-write, block checksum (`-checksum`), short-circuit reads, erasure
+coding, and namespace persistence (the NameNode keeps metadata in memory;
+etcd is not yet consulted). The KUTTL suites in `tests/system` have not
+been re-run against these changes.
 
 ## Performance
 

@@ -2,7 +2,12 @@
 
 ## Overview
 
-Pillar NameNode now has **full gRPC wire protocol implementation** that allows real HDFS clients to connect and use standard Hadoop tools (`hadoop fs`, Spark, Hive, etc.).
+> **Correction:** Hadoop clients (`hadoop fs`, Spark, Hive, ...) do not speak gRPC; they use Hadoop IPC.
+> The NameNode now serves Hadoop IPC (`pillar-namenode/src/ipc/`) and gRPC on the same port, and
+> DataNodes serve Hadoop DataTransferProtocol (`pillar-datanode/src/transport/hdfs_dtp.rs`). gRPC
+> remains the DataNode -> NameNode protocol. See the README's "Hadoop client compatibility".
+
+Pillar NameNode implements the Hadoop `ClientNamenodeProtocol` and `DatanodeProtocol` protobuf services over gRPC (tonic).
 
 ## What Was Implemented
 
