@@ -120,6 +120,12 @@ where
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        // Hadoop DataTransferProtocol: a 2-byte version whose first octet
+        // is 0, never a Pillar op code.
+        if op == 0 {
+            super::hdfs_dtp::serve(&mut socket, &storage, peer).await?;
+            continue;
+        }
         let mut rest = [0u8; HEADER_LEN - 1];
         socket.read_exact(&mut rest).await?;
         let h = Header::decode(op, &rest);

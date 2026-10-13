@@ -35,6 +35,8 @@ clap = { workspace = true }
 uuid = { workspace = true }
 nix = { workspace = true }
 hostname = "0.4"
+crc32c = "0.6.8"     # CRC32C (Castagnoli), hardware-accelerated: HDFS default checksum
+crc32fast = "1.5"    # CRC32 (zlib): the other HDFS checksum type
 
 # Optional RDMA support
 ibverbs = { workspace = true, optional = true }
@@ -46,6 +48,8 @@ rdma = ["dep:ibverbs"]
 [dev-dependencies]
 tempfile = "3.8"
 pillar-namenode = { path = "../pillar-namenode" }
+# Independent HDFS client (Hadoop IPC + DataTransferProtocol) for interop tests.
+hdfs-native = { version = "=0.14.6", default-features = false }
 
 [build-dependencies]
 tonic-build = "0.12"

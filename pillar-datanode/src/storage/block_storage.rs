@@ -275,6 +275,12 @@ impl BlockStorage {
         Ok(File::create(self.get_block_path(block_id, false))?)
     }
 
+    /// The temp `.meta` file of a block being written (created by
+    /// [`Self::begin_write`]), opened for writing and truncated.
+    pub fn open_tmp_meta(&self, block_id: &BlockId) -> Result<File> {
+        Ok(OpenOptions::new().write(true).truncate(true).create(true).open(self.get_meta_path(block_id, false))?)
+    }
+
     /// Discard a partially received block.
     pub fn abort_write(&self, block_id: &BlockId) {
         for path in [self.get_block_path(block_id, false), self.get_meta_path(block_id, false)] {

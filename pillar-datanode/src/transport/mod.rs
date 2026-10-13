@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 pub mod tcp;
 pub mod selector;
 pub mod wire;
+pub mod hdfs_dtp;
 
 #[cfg(feature = "rdma")]
 pub mod rdma;

@@ -1,0 +1,204 @@
+//! Interop with an independent HDFS client: `hdfs-native` (pure Rust,
+//! implements Hadoop IPC and DataTransferProtocol from the Hadoop protos)
+//! against an in-process Pillar cluster — a NameNode serving Hadoop IPC and
+//! gRPC on one port, and three DataNodes registered with it.
+//!
+//! This is the same path `hadoop fs -put / -cat` takes: IPC calls to the
+//! NameNode (create, addBlock, complete, getBlockLocations, ...) and block
+//! data over DataTransferProtocol with a three-node write pipeline.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use hdfs_native::{Client, ClientBuilder, WriteOptions};
+use pillar_datanode::grpc::namenode_client::{DatanodeInfo, NamenodeClient};
+use pillar_datanode::replication::ReplicationCoordinator;
+use pillar_datanode::storage::{BlockStorage, VolumeManager};
+use pillar_datanode::transport::tcp::TcpTransport;
+use pillar_datanode::transport::DataTransport;
+use pillar_namenode::datanode::{BlockPlacementPolicy, DatanodeManager};
+use pillar_namenode::grpc::{
+    ClientNamenodeProtocolServer, ClientNamenodeService, DatanodeProtocolServer, DatanodeProtocolService,
+};
+use pillar_namenode::metadata::{BlockManager, Namespace};
+use pillar_proto::hadoop::hdfs::client_namenode_protocol_server::ClientNamenodeProtocolServer as ClientProtoServer;
+use pillar_proto::hadoop::hdfs::datanode::datanode_protocol_service_server::DatanodeProtocolServiceServer;
+use tempfile::TempDir;
+
+const MB: usize = 1024 * 1024;
+
+fn free_addr() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+}
+
+struct Cluster {
+    nn_addr: SocketAddr,
+    blocks: Arc<BlockManager>,
+    datanodes: Arc<DatanodeManager>,
+    _dns: Vec<(TempDir, Arc<BlockStorage>)>,
+}
+
+async fn start_cluster(n_datanodes: usize) -> Cluster {
+    // NameNode: same wiring as NameNode::start, minus etcd.
+    let namespace = Arc::new(Namespace::new());
+    let blocks = Arc::new(BlockManager::new());
+    let datanodes = Arc::new(DatanodeManager::new());
+    let placement = Arc::new(BlockPlacementPolicy::new(datanodes.clone(), 3));
+    let client_service = Arc::new(ClientNamenodeService::new(namespace, blocks.clone(), datanodes.clone(), placement));
+    let dn_service = Arc::new(DatanodeProtocolService::new(datanodes.clone(), blocks.clone()));
+
+    let nn_addr = free_addr();
+    let ipc = Arc::new(ClientNamenodeProtocolServer::new(client_service.clone()));
+    let incoming = pillar_namenode::ipc::bind_shared(nn_addr, ipc).await.unwrap();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ClientProtoServer::new(ClientNamenodeProtocolServer::new(client_service)))
+            .add_service(DatanodeProtocolServiceServer::new(DatanodeProtocolServer::new(dn_service)))
+            .serve_with_incoming(incoming),
+    );
+
+    let mut dns = Vec::new();
+    for i in 0..n_datanodes {
+        let dir = TempDir::new().unwrap();
+        let volumes = Arc::new(VolumeManager::new(dir.path(), "BP-test".to_string()).unwrap());
+        let storage = Arc::new(BlockStorage::new(volumes.get_finalized_dir(), volumes.get_tmp_dir()).unwrap());
+        let data_addr = free_addr();
+        let tcp = Arc::new(TcpTransport::new(storage.clone(), data_addr));
+        tokio::spawn(tcp.clone().start_server());
+        let info = DatanodeInfo {
+            uuid: format!("dn{i}"),
+            hostname: "127.0.0.1".into(),
+            rpc_port: 0,
+            data_port: data_addr.port(),
+            http_port: 0,
+            supported_transports: vec!["tcp".into()],
+            rdma_port: 0,
+        };
+        let mut client = NamenodeClient::new(nn_addr.to_string(), info, volumes, storage.clone());
+        client.set_replication_coordinator(Arc::new(ReplicationCoordinator::new(
+            storage.clone(),
+            vec![tcp as Arc<dyn DataTransport>],
+        )));
+        client.set_heartbeat_interval(Duration::from_millis(100));
+        let client = Arc::new(client);
+        let mut registered = false;
+        for _ in 0..100 {
+            if client.register().await.is_ok() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registered, "dn{i} could not register");
+        tokio::spawn(client.start_heartbeat_loop());
+        dns.push((dir, storage));
+    }
+    // Live = has heartbeated with capacity.
+    for _ in 0..100 {
+        if datanodes.get_live_datanodes().len() == n_datanodes {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Cluster { nn_addr, blocks, datanodes, _dns: dns }
+}
+
+fn client(c: &Cluster) -> Client {
+    ClientBuilder::new().with_url(format!("hdfs://{}", c.nn_addr)).build().unwrap()
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| ((i as u64 * 2654435761) >> 7) as u8 ^ seed).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hadoop_client_writes_and_reads_a_multi_block_file_through_a_three_node_pipeline() {
+    let c = start_cluster(3).await;
+    assert_eq!(c.datanodes.get_live_datanodes().len(), 3);
+    let fs = client(&c);
+
+    fs.mkdirs("/test", 0o755, true).await.unwrap();
+
+    // 2.5 blocks of 1 MiB, replicated 3 ways.
+    let data = pattern(5 * MB / 2, 0x5A);
+    let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(3), ..Default::default() };
+    let mut w = fs.create("/test/file.bin", opts).await.unwrap();
+    w.write_bytes(Bytes::from(data.clone())).await.unwrap();
+    w.close().await.unwrap();
+
+    let status = fs.get_file_info("/test/file.bin").await.unwrap();
+    assert_eq!(status.length, data.len());
+    assert!(!status.isdir);
+
+    let r = fs.read("/test/file.bin").await.unwrap();
+    assert_eq!(r.file_length(), data.len());
+    let all = r.read_range(0, data.len()).await.unwrap();
+    assert!(all[..] == data[..], "file read back differs");
+    // A range crossing a block boundary, not chunk-aligned.
+    let mid = r.read_range(MB - 1000, 3000).await.unwrap();
+    assert_eq!(&mid[..], &data[MB - 1000..MB + 2000]);
+
+    // Every block landed on all three DataNodes (incremental reports).
+    let listing = fs.list_status("/test", false).await.unwrap();
+    assert_eq!(listing.len(), 1);
+    assert_eq!(c.blocks.get_total_blocks(), 3);
+    // The pipeline forwarded every packet: each DataNode holds all three
+    // blocks, byte for byte the file's length, with an HDFS .meta beside each.
+    for (i, (dir, storage)) in c._dns.iter().enumerate() {
+        assert_eq!(storage.get_block_count(), 3, "dn{i} block count");
+        assert_eq!(storage.total_bytes(), data.len() as u64, "dn{i} bytes");
+        let metas = walk(dir.path()).into_iter().filter(|p| p.extension().is_some_and(|e| e == "meta")).count();
+        assert_eq!(metas, 3, "dn{i} meta files");
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn namespace_operations_over_hadoop_ipc() {
+    let c = start_cluster(1).await;
+    let fs = client(&c);
+
+    fs.mkdirs("/a/b", 0o755, true).await.unwrap();
+    let opts = WriteOptions { replication: Some(1), ..Default::default() };
+    let mut w = fs.create("/a/b/small.txt", opts.clone()).await.unwrap();
+    w.write_bytes(Bytes::from_static(b"hello pillar")).await.unwrap();
+    w.close().await.unwrap();
+
+    // Creating it again without overwrite fails the way Hadoop does.
+    assert!(fs.create("/a/b/small.txt", opts).await.is_err());
+
+    fs.rename("/a/b/small.txt", "/a/moved.txt", false).await.unwrap();
+    assert!(fs.get_file_info("/a/b/small.txt").await.is_err());
+    let r = fs.read("/a/moved.txt").await.unwrap();
+    assert_eq!(&r.read_range(0, 12).await.unwrap()[..], b"hello pillar");
+
+    let names: Vec<String> = fs.list_status("/a", false).await.unwrap().into_iter().map(|s| s.path).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+
+    assert!(fs.delete("/a", true).await.unwrap());
+    assert!(fs.get_file_info("/a").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_and_hadoop_ipc_share_the_port() {
+    // The DataNodes above register over gRPC on the same port the Hadoop
+    // client uses; make that explicit.
+    let c = start_cluster(2).await;
+    assert_eq!(c.datanodes.get_live_datanodes().len(), 2);
+    let fs = client(&c);
+    assert!(fs.get_file_info("/").await.unwrap().isdir);
+}
