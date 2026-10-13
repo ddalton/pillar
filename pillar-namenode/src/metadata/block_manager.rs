@@ -169,6 +169,10 @@ pub struct BlockManager {
 
     /// Default block size (128 MB)
     default_block_size: u64,
+
+    /// Replicas of removed blocks still on DataNodes: uuid -> blocks to
+    /// delete, handed out with that DataNode's next heartbeat.
+    pending_invalidations: DashMap<String, Vec<BlockId>>,
 }
 
 impl BlockManager {
@@ -181,6 +185,7 @@ impl BlockManager {
             next_block_id: AtomicU64::new(1),
             next_generation_stamp: AtomicU64::new(1000),
             default_block_size: 128 * 1024 * 1024, // 128 MB
+            pending_invalidations: DashMap::new(),
         }
     }
 
@@ -292,10 +297,35 @@ impl BlockManager {
         self.add_location_index(block_id, self.datanode_table.intern(&datanode));
     }
 
+    /// Queue deletion of `block`'s known replicas, before its locations are
+    /// forgotten.
+    fn invalidate_replicas(&self, block_id: &BlockId) {
+        for dn in self.get_block_locations_shared(block_id).unwrap_or_default() {
+            self.pending_invalidations.entry(dn.uuid.clone()).or_default().push(*block_id);
+        }
+    }
+
+    /// Replicas a DataNode should delete (blocks removed from the namespace).
+    pub fn take_invalidations(&self, datanode_uuid: &str) -> Vec<BlockId> {
+        self.pending_invalidations.remove(datanode_uuid).map(|(_, v)| v).unwrap_or_default()
+    }
+
+    /// Every block with its owning inode, length and known replica holders
+    /// (for the replication monitor's scan).
+    pub fn blocks_snapshot(&self) -> Vec<(BlockId, u64, u64, Vec<Arc<DatanodeId>>)> {
+        let infos: Vec<(BlockId, u64, u64)> =
+            self.blocks.iter().map(|e| (e.block_id, e.inode_id, e.num_bytes)).collect();
+        infos
+            .into_iter()
+            .map(|(id, inode, len)| (id, inode, len, self.get_block_locations_shared(&id).unwrap_or_default()))
+            .collect()
+    }
+
     /// Delete all blocks for a file
     pub fn delete_file_blocks(&self, inode_id: u64) -> Vec<BlockId> {
         if let Some((_, blocks)) = self.file_blocks.remove(&inode_id) {
             for block_id in &blocks {
+                self.invalidate_replicas(block_id);
                 self.blocks.remove(block_id);
                 self.block_locations.remove(block_id);
             }
@@ -307,6 +337,7 @@ impl BlockManager {
 
     /// Forget a single block (e.g. abandoned, or dropped by truncate).
     pub fn remove_block(&self, block_id: &BlockId) -> Option<BlockInfo> {
+        self.invalidate_replicas(block_id);
         let info = self.blocks.remove(block_id).map(|(_, info)| info);
         self.block_locations.remove(block_id);
         if let Some(info) = &info {
@@ -486,5 +517,19 @@ mod tests {
         assert_eq!(bm.get_file_blocks(1).unwrap(), vec![a1, c1]);
         assert!(bm.get_file_blocks(2).is_none());
         assert_eq!(bm.get_block_info(&c1).unwrap().inode_id, 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_block_queues_its_replicas_for_deletion() {
+        let bm = BlockManager::new();
+        let b = bm.allocate_block(7).await.unwrap();
+        bm.report_block(DatanodeId::new("dn1".into(), "h1".into(), 1), b, 10);
+        bm.report_block(DatanodeId::new("dn2".into(), "h2".into(), 1), b, 10);
+        assert_eq!(bm.blocks_snapshot().len(), 1);
+        assert_eq!(bm.delete_file_blocks(7), vec![b]);
+        assert_eq!(bm.take_invalidations("dn1"), vec![b]);
+        assert_eq!(bm.take_invalidations("dn2"), vec![b]);
+        assert!(bm.take_invalidations("dn1").is_empty());
+        assert!(bm.blocks_snapshot().is_empty());
     }
 }

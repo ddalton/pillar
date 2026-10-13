@@ -152,6 +152,12 @@ impl DatanodeManager {
         }
     }
 
+    /// A manager with custom stale / dead intervals (HDFS defaults are
+    /// 30 s and 10.5 min).
+    pub fn with_intervals(stale_interval: Duration, dead_interval: Duration) -> Self {
+        Self { stale_interval, dead_interval, ..Self::new() }
+    }
+
     /// Register a new datanode
     pub fn register(&self, id: DatanodeId, capacity: u64) -> Result<()> {
         let uuid = id.uuid.clone();

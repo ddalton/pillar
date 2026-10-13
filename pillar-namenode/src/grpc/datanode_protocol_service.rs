@@ -90,8 +90,14 @@ impl DatanodeProtocolService {
             .heartbeat(uuid, storage, xceiver_count, failed_volumes)
             .map_err(|e| Status::internal(format!("Heartbeat failed: {}", e)))?;
 
-        // Hand over whatever the replication monitor queued for this node.
-        Ok(self.take_commands(uuid))
+        // Hand over whatever the replication monitor queued for this node,
+        // plus deletions of replicas whose blocks were removed.
+        let mut commands = self.take_commands(uuid);
+        let invalid = self.block_manager.take_invalidations(uuid);
+        if !invalid.is_empty() {
+            commands.push(DatanodeCommand::InvalidateBlocks { blocks: invalid });
+        }
+        Ok(commands)
     }
 
     /// Queue a command for `uuid`'s next heartbeat.

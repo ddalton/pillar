@@ -6,7 +6,7 @@ use tonic::transport::Server;
 use tracing::{info, error};
 
 use crate::metadata::{Namespace, BlockManager, EtcdMetadataStore};
-use crate::datanode::{DatanodeManager, HeartbeatMonitor, BlockPlacementPolicy};
+use crate::datanode::{DatanodeManager, BlockPlacementPolicy, ReplicationMonitor};
 use crate::grpc::{ClientNamenodeService, DatanodeProtocolService};
 
 /// Configuration for the NameNode
@@ -127,7 +127,6 @@ pub struct NameNode {
     block_manager: Arc<BlockManager>,
     datanode_manager: Arc<DatanodeManager>,
     placement_policy: Arc<BlockPlacementPolicy>,
-    heartbeat_monitor: Arc<HeartbeatMonitor>,
 }
 
 impl NameNode {
@@ -162,7 +161,6 @@ impl NameNode {
             datanode_manager.clone(),
             config.default_replication,
         ));
-        let heartbeat_monitor = Arc::new(HeartbeatMonitor::new(datanode_manager.clone()));
 
         info!("NameNode core components initialized");
 
@@ -172,7 +170,6 @@ impl NameNode {
             block_manager,
             datanode_manager,
             placement_policy,
-            heartbeat_monitor,
         })
     }
 
@@ -180,11 +177,6 @@ impl NameNode {
     pub async fn start(self: Arc<Self>) -> Result<()> {
         info!("Starting NameNode server on {}", self.config.rpc_addr);
 
-        // Start heartbeat monitor in background
-        let heartbeat_monitor = self.heartbeat_monitor.clone();
-        tokio::spawn(async move {
-            heartbeat_monitor.start().await;
-        });
 
         // Create gRPC services
         let client_service = ClientNamenodeService::new(
@@ -212,6 +204,18 @@ impl NameNode {
         // Wrap services in Arc for the gRPC implementation
         let client_service_arc = Arc::new(client_service);
         let datanode_service_arc = Arc::new(datanode_service);
+
+        // Replication monitor: dead DataNodes and under-replicated blocks
+        // (replaces the old heartbeat monitor, which dropped dead nodes but
+        // left their replicas in the location map).
+        let replication_monitor = Arc::new(ReplicationMonitor::new(
+            self.namespace.clone(),
+            self.block_manager.clone(),
+            self.datanode_manager.clone(),
+            self.placement_policy.clone(),
+            datanode_service_arc.clone(),
+        ));
+        tokio::spawn(replication_monitor.start());
 
         // Create protocol servers. Hadoop IPC clients get their own front end
         // over the same ClientNamenodeService.

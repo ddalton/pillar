@@ -18,7 +18,7 @@ use pillar_datanode::replication::ReplicationCoordinator;
 use pillar_datanode::storage::{BlockStorage, VolumeManager};
 use pillar_datanode::transport::tcp::TcpTransport;
 use pillar_datanode::transport::DataTransport;
-use pillar_namenode::datanode::{BlockPlacementPolicy, DatanodeManager};
+use pillar_namenode::datanode::{BlockPlacementPolicy, DatanodeManager, ReplicationMonitor};
 use pillar_namenode::grpc::{
     ClientNamenodeProtocolServer, ClientNamenodeService, DatanodeProtocolServer, DatanodeProtocolService,
 };
@@ -38,16 +38,45 @@ struct Cluster {
     blocks: Arc<BlockManager>,
     datanodes: Arc<DatanodeManager>,
     _dns: Vec<(TempDir, Arc<BlockStorage>)>,
+    /// Per DataNode: its heartbeat loop and data server, to simulate a crash.
+    tasks: Vec<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Cluster {
+    /// Stop DataNode `i` as if it had crashed: no heartbeats, no data port.
+    fn kill(&self, i: usize) {
+        for t in &self.tasks[i] {
+            t.abort();
+        }
+    }
 }
 
 async fn start_cluster(n_datanodes: usize) -> Cluster {
+    start_cluster_with(n_datanodes, false).await
+}
+
+/// `fast_failure`: DataNodes are declared dead after 1 s without a
+/// heartbeat and the replication monitor runs every 100 ms.
+async fn start_cluster_with(n_datanodes: usize, fast_failure: bool) -> Cluster {
     // NameNode: same wiring as NameNode::start, minus etcd.
     let namespace = Arc::new(Namespace::new());
     let blocks = Arc::new(BlockManager::new());
-    let datanodes = Arc::new(DatanodeManager::new());
+    let datanodes = Arc::new(if fast_failure {
+        DatanodeManager::with_intervals(Duration::from_millis(500), Duration::from_secs(1))
+    } else {
+        DatanodeManager::new()
+    });
     let placement = Arc::new(BlockPlacementPolicy::new(datanodes.clone(), 3));
-    let client_service = Arc::new(ClientNamenodeService::new(namespace, blocks.clone(), datanodes.clone(), placement));
+    let client_service =
+        Arc::new(ClientNamenodeService::new(namespace.clone(), blocks.clone(), datanodes.clone(), placement.clone()));
     let dn_service = Arc::new(DatanodeProtocolService::new(datanodes.clone(), blocks.clone()));
+    let monitor = ReplicationMonitor::new(namespace, blocks.clone(), datanodes.clone(), placement, dn_service.clone());
+    let monitor = if fast_failure {
+        monitor.with_timing(Duration::from_millis(100), Duration::from_millis(300), Duration::from_secs(10))
+    } else {
+        monitor
+    };
+    tokio::spawn(Arc::new(monitor).start());
 
     let nn_addr = free_addr();
     let ipc = Arc::new(ClientNamenodeProtocolServer::new(client_service.clone()));
@@ -60,13 +89,19 @@ async fn start_cluster(n_datanodes: usize) -> Cluster {
     );
 
     let mut dns = Vec::new();
+    let mut tasks = Vec::new();
     for i in 0..n_datanodes {
         let dir = TempDir::new().unwrap();
         let volumes = Arc::new(VolumeManager::new(dir.path(), "BP-test".to_string()).unwrap());
         let storage = Arc::new(BlockStorage::new(volumes.get_finalized_dir(), volumes.get_tmp_dir()).unwrap());
         let data_addr = free_addr();
         let tcp = Arc::new(TcpTransport::new(storage.clone(), data_addr));
-        tokio::spawn(tcp.clone().start_server());
+        let server = tokio::spawn({
+            let tcp = tcp.clone();
+            async move {
+                let _ = tcp.start_server().await;
+            }
+        });
         let info = DatanodeInfo {
             uuid: format!("dn{i}"),
             hostname: "127.0.0.1".into(),
@@ -92,7 +127,8 @@ async fn start_cluster(n_datanodes: usize) -> Cluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(registered, "dn{i} could not register");
-        tokio::spawn(client.start_heartbeat_loop());
+        let heartbeats = tokio::spawn(client.start_heartbeat_loop());
+        tasks.push(vec![server, heartbeats]);
         dns.push((dir, storage));
     }
     // Live = has heartbeated with capacity.
@@ -102,7 +138,7 @@ async fn start_cluster(n_datanodes: usize) -> Cluster {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Cluster { nn_addr, blocks, datanodes, _dns: dns }
+    Cluster { nn_addr, blocks, datanodes, _dns: dns, tasks }
 }
 
 fn client(c: &Cluster) -> Client {
@@ -201,4 +237,60 @@ async fn grpc_and_hadoop_ipc_share_the_port() {
     assert_eq!(c.datanodes.get_live_datanodes().len(), 2);
     let fs = client(&c);
     assert!(fs.get_file_info("/").await.unwrap().isdir);
+}
+
+async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..300 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_replica_is_re_replicated_and_deleted_files_are_cleaned_up() {
+    let c = start_cluster_with(3, true).await;
+    let fs = client(&c);
+
+    let data = pattern(300 * 1024, 0x33);
+    let opts = WriteOptions { replication: Some(2), ..Default::default() };
+    let mut w = fs.create("/r.bin", opts).await.unwrap();
+    w.write_bytes(Bytes::from(data.clone())).await.unwrap();
+    w.close().await.unwrap();
+
+    let snapshot = c.blocks.blocks_snapshot();
+    assert_eq!(snapshot.len(), 1);
+    let (block, _, _, holders) = &snapshot[0];
+    let mut holders: Vec<usize> = holders.iter().map(|h| h.uuid[2..].parse().unwrap()).collect();
+    holders.sort();
+    assert_eq!(holders.len(), 2);
+    let spare = (0..3).find(|i| !holders.contains(i)).unwrap();
+
+    // A holder crashes. The monitor declares it dead, drops its replica and
+    // copies the block from the survivor to the spare DataNode.
+    c.kill(holders[0]);
+    let spare_storage = c._dns[spare].1.clone();
+    eventually("the spare DataNode receives a replica", || spare_storage.get_block_count() == 1).await;
+    let mut want = vec![format!("dn{}", holders[1]), format!("dn{spare}")];
+    want.sort();
+    eventually("the NameNode counts two live replicas again", || {
+        let mut now: Vec<String> =
+            c.blocks.get_block_locations(block).unwrap_or_default().into_iter().map(|d| d.uuid).collect();
+        now.sort();
+        now == want
+    })
+    .await;
+    let copy = spare_storage.read_block(&pillar_datanode::storage::block_storage::BlockId::new(block.block_id, block.generation_stamp), 0, u64::MAX).unwrap();
+    assert!(copy[..] == data[..], "re-replicated copy differs");
+
+    // Readable with one of the original holders gone.
+    let r = fs.read("/r.bin").await.unwrap();
+    assert!(r.read_range(0, data.len()).await.unwrap()[..] == data[..]);
+
+    // Deleting the file deletes the replicas on the live DataNodes.
+    assert!(fs.delete("/r.bin", false).await.unwrap());
+    let (a, b) = (c._dns[holders[1]].1.clone(), spare_storage.clone());
+    eventually("live replicas are invalidated", || a.get_block_count() == 0 && b.get_block_count() == 0).await;
 }
