@@ -2,7 +2,8 @@
 # The stock Apache Hadoop Java client against a Kerberized Pillar: a
 # throwaway MIT KDC (tests/kerberos/kdc.sh, realm PILLAR.TEST), a NameNode
 # and three DataNodes with keytabs on 127.0.0.1. Users log in from keytabs;
-# SIMPLE clients and impersonation must be refused.
+# SIMPLE clients and impersonation must be refused, and only DataNodes with
+# a dn/ principal may join the NameNode.
 #
 #   tests/interop/run-java-kerberos.sh       # needs a JDK (11+), curl, MIT krb5
 set -euo pipefail
@@ -39,16 +40,26 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
     --kerberos-keytab "$KDC/nn.keytab" --kerberos-principal nn/localhost@PILLAR.TEST >"$WORK/nn.log" 2>&1 &
 echo $! >"$WORK/nn.pid"
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19100) 2>/dev/null && break; sleep 0.2; done
-for i in 0 1 2; do
+# DataNodes log in from their keytab (KDCs from krb5.conf) to call the NameNode.
+export KRB5_CONFIG=$KDC/krb5.conf
+datanode() { # index uuid [kerberos flags...]
+    local i=$1 uuid=$2; shift 2
     mkdir -p "$WORK/dn$i"
-    "$BIN/pillar-datanode" --namenode 127.0.0.1:19100 --uuid "kdn$i" --hostname 127.0.0.1 \
+    "$BIN/pillar-datanode" --namenode 127.0.0.1:19100 --uuid "$uuid" --hostname 127.0.0.1 \
         --rpc-addr "127.0.0.1:1996$i" --data-addr "127.0.0.1:5011$i" --http-addr "127.0.0.1:5017$i" \
-        --volume-mount-point "$WORK/dn$i" --transport tcp \
-        --kerberos-keytab "$KDC/dn.keytab" --kerberos-principal dn/localhost@PILLAR.TEST >"$WORK/dn$i.log" 2>&1 &
+        --volume-mount-point "$WORK/dn$i" --transport tcp "$@" >"$WORK/dn$i.log" 2>&1 &
     echo $! >"$WORK/dn$i.pid"
+}
+for i in 0 1 2; do
+    datanode $i "kdn$i" --kerberos-keytab "$KDC/dn.keytab" --kerberos-principal dn/localhost@PILLAR.TEST \
+        --namenode-principal nn/localhost@PILLAR.TEST
 done
+# Impostors: no Kerberos at all, and a user's keytab. Neither may register.
+datanode 3 rogue-simple
+datanode 4 rogue-alice --kerberos-keytab "$KDC/alice.keytab" --kerberos-principal alice@PILLAR.TEST \
+    --namenode-principal nn/localhost@PILLAR.TEST
 for _ in $(seq 50); do [ "$(grep -c 'Registered datanode' "$WORK/nn.log")" -ge 3 ] && break; sleep 0.2; done
-sleep 1
+sleep 3
 
 cd "$HERE"
 java_client() {
@@ -64,4 +75,14 @@ fail() {
 # host it connects to (nn/_HOST -> nn/localhost).
 java_client hdfs://localhost:19100 kerberos "$KDC" || fail "kerberos"
 java_client hdfs://localhost:19100 simple || fail "simple"
+
+# Only the three Kerberized DataNodes joined; both impostors were refused.
+grep 'Registered datanode' "$WORK/nn.log" | grep -q rogue && fail "an impostor DataNode registered"
+grep -q 'no Kerberos credentials' "$WORK/nn.log" || fail "the SIMPLE DataNode was not refused"
+grep -q 'alice@PILLAR.TEST is not a dn principal' "$WORK/nn.log" || fail "alice's DataNode was not refused"
+echo "ok    DataNodes without a dn/ Kerberos principal cannot join"
+
+# The DataNode-to-NameNode authentication against this KDC: replays, users
+# and forged NameNode replies are refused.
+(cd "$ROOT" && PILLAR_KDC_DIR=$KDC cargo test -q -p pillar-common --lib grpc_auth 2>&1 | tail -3) || fail "grpc_auth tests"
 echo "Kerberos interop passed (Hadoop $HADOOP_VERSION)"

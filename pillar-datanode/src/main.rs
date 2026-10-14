@@ -75,6 +75,10 @@ struct Args {
     #[clap(long)]
     kerberos_principal: Option<String>,
 
+    /// The NameNode's Kerberos principal (default nn/<NameNode host>@<REALM>).
+    #[clap(long)]
+    namenode_principal: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -87,7 +91,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+        .unwrap_or_else(|_| EnvFilter::new(format!("{},krb5=warn", args.log_level)));
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -126,6 +130,9 @@ async fn main() -> Result<()> {
     }
     if args.kerberos_principal.is_some() {
         config.kerberos_principal = args.kerberos_principal;
+    }
+    if args.namenode_principal.is_some() {
+        config.namenode_principal = args.namenode_principal;
     }
 
     #[cfg(feature = "rdma")]

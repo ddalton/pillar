@@ -57,6 +57,11 @@ struct Args {
     #[clap(long)]
     kerberos_principal: Option<String>,
 
+    /// Principals DataNodes authenticate as, <service>/_HOST@<REALM> (any
+    /// host); default dn/_HOST in the NameNode's realm.
+    #[clap(long)]
+    datanode_principal: Option<String>,
+
     /// Require block access tokens on DataNodes (always on with Kerberos).
     #[clap(long)]
     block_access_tokens: bool,
@@ -73,7 +78,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+        .unwrap_or_else(|_| EnvFilter::new(format!("{},krb5=warn", args.log_level)));
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -107,6 +112,9 @@ async fn main() -> Result<()> {
     }
     if args.kerberos_principal.is_some() {
         config.kerberos_principal = args.kerberos_principal;
+    }
+    if args.datanode_principal.is_some() {
+        config.datanode_principal = args.datanode_principal;
     }
     config.block_access_tokens |= args.block_access_tokens;
 

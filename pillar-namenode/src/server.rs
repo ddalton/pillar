@@ -57,6 +57,10 @@ pub struct NameNodeConfig {
     /// principal (`nn/<host>@<REALM>`). Without them, SIMPLE.
     pub kerberos_keytab: Option<PathBuf>,
     pub kerberos_principal: Option<String>,
+    /// With Kerberos, the principals DataNodes must authenticate as
+    /// (`<service>/_HOST@<REALM>`, any host; default `dn/_HOST` in the
+    /// NameNode's realm).
+    pub datanode_principal: Option<String>,
 
     /// Block access tokens (HDFS dfs.block.access.token.enable); always on
     /// with Kerberos.
@@ -91,6 +95,7 @@ impl Default for NameNodeConfig {
             cluster_id: None,
             kerberos_keytab: None,
             kerberos_principal: None,
+            datanode_principal: None,
             block_access_tokens: false,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
@@ -147,6 +152,9 @@ impl NameNodeConfig {
         }
         if let Ok(val) = env::var("NAMENODE_KERBEROS_PRINCIPAL") {
             config.kerberos_principal = Some(val);
+        }
+        if let Ok(val) = env::var("NAMENODE_DATANODE_PRINCIPAL") {
+            config.datanode_principal = Some(val);
         }
 
         if let Ok(val) = env::var("NAMENODE_HANDLER_COUNT") {
@@ -373,6 +381,7 @@ impl NameNode {
         let ipc_server = Arc::new(ClientNamenodeProtocolServer::new(client_service_arc.clone()));
         let client_proto_server = ClientNamenodeProtocolServer::new(client_service_arc);
         let datanode_proto_server = DatanodeProtocolServer::new(datanode_service_arc);
+        let datanode_grpc = DatanodeProtoServer::new(datanode_proto_server);
 
         info!("Starting RPC server (Hadoop IPC + gRPC) on {}", self.config.rpc_addr);
         let auth = match (&self.config.kerberos_keytab, &self.config.kerberos_principal) {
@@ -384,10 +393,28 @@ impl NameNode {
             _ => anyhow::bail!("Kerberos needs both a keytab and a principal"),
         };
         let kerberos = matches!(auth, crate::ipc::Authentication::Kerberos(_));
+        // With Kerberos, DataNodes authenticate every DatanodeProtocol call
+        // (a Kerberos AP-REQ per call; see pillar_common::grpc_auth).
+        let datanode_acceptor = match (&self.config.kerberos_keytab, &self.config.kerberos_principal) {
+            (Some(keytab), Some(principal)) => {
+                let realm = principal.rsplit_once('@').map(|(_, r)| r).unwrap_or_default();
+                let callers = self.config.datanode_principal.clone().unwrap_or_else(|| format!("dn/_HOST@{}", realm));
+                let server = crate::ipc::KerberosServer::new(keytab, principal).map_err(|e| anyhow::anyhow!("Kerberos: {}", e))?;
+                let acceptor = pillar_common::grpc_auth::KerberosAcceptor::new(server, &callers)
+                    .map_err(|e| anyhow::anyhow!("--datanode-principal: {}", e))?;
+                info!("DataNodes must authenticate as {}", callers);
+                Some(Arc::new(acceptor))
+            }
+            _ => None,
+        };
         let incoming = crate::ipc::bind_shared_with(self.config.rpc_addr, ipc_server, Arc::new(auth)).await?;
         // ClientProtocol over gRPC has no authentication: with Kerberos on,
         // clients must come through Hadoop IPC.
         let client_grpc = (!kerberos).then(|| ClientNamenodeProtoServer::new(client_proto_server));
+        let (datanode_open, datanode_authenticated) = match datanode_acceptor {
+            Some(a) => (None, Some(pillar_common::grpc_auth::Authenticated::new(datanode_grpc, a))),
+            None => (Some(datanode_grpc), None),
+        };
 
         // Build server with performance optimizations
         let server = tonic::transport::Server::builder()
@@ -405,7 +432,8 @@ impl NameNode {
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
             .http2_adaptive_window(Some(true))
             // Add services
-            .add_service(DatanodeProtoServer::new(datanode_proto_server))
+            .add_optional_service(datanode_open)
+            .add_optional_service(datanode_authenticated)
             .add_optional_service(client_grpc)
             .serve_with_incoming_shutdown(incoming, async {
                 tokio::signal::ctrl_c().await.ok();

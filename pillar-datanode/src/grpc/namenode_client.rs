@@ -8,6 +8,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 
 use pillar_common::hdfs::block_list::{encode_block_list, ReportedBlock};
+use pillar_common::grpc_auth::{AuthChannel, KerberosClient};
 use pillar_common::hdfs::storage_identity::StorageIdentity;
 use pillar_proto::hdfs::datanode::datanode_protocol_service_client::DatanodeProtocolServiceClient;
 use pillar_proto::hdfs::datanode::{
@@ -86,7 +87,10 @@ pub struct NamenodeClient {
     block_pool_id: String,
     /// One lazily-connected channel shared by every RPC; tonic reconnects it
     /// on demand, so heartbeats don't pay a TCP + HTTP/2 handshake each.
-    client: DatanodeProtocolServiceClient<Channel>,
+    channel: Channel,
+    /// Over `channel`, with Kerberos credentials on every call once
+    /// [`Self::set_kerberos`] is called.
+    client: DatanodeProtocolServiceClient<AuthChannel>,
     replication_coordinator: Option<Arc<ReplicationCoordinator>>,
     transfer_slots: Arc<Semaphore>,
     /// The namespace this volume belongs to (its `current/VERSION`), once
@@ -126,7 +130,8 @@ impl NamenodeClient {
             // HDFS dfs.blockreport.intervalMsec default: 6 hours.
             block_report_interval: Duration::from_secs(6 * 3600),
             block_pool_id,
-            client: DatanodeProtocolServiceClient::new(channel),
+            client: DatanodeProtocolServiceClient::new(AuthChannel::new(channel.clone(), None)),
+            channel,
             replication_coordinator: None,
             transfer_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
             identity: std::sync::Mutex::new(identity),
@@ -183,11 +188,17 @@ impl NamenodeClient {
     }
 
     /// Set the replication coordinator (called after initialization)
+    /// Authenticate every call to the NameNode with Kerberos (and check the
+    /// NameNode's reply), as `kerberos`'s principal.
+    pub fn set_kerberos(&mut self, kerberos: Arc<KerberosClient>) {
+        self.client = DatanodeProtocolServiceClient::new(AuthChannel::new(self.channel.clone(), Some(kerberos)));
+    }
+
     pub fn set_replication_coordinator(&mut self, coordinator: Arc<ReplicationCoordinator>) {
         self.replication_coordinator = Some(coordinator);
     }
 
-    fn client(&self) -> DatanodeProtocolServiceClient<Channel> {
+    fn client(&self) -> DatanodeProtocolServiceClient<AuthChannel> {
         self.client.clone()
     }
 

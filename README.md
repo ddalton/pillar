@@ -387,13 +387,25 @@ IPC port a client authenticates with the block's token (SASL DIGEST-MD5,
 Hadoop's TOKEN method), so a Kerberized client can read a file still being
 written.
 
-What security does **not** cover yet: the DataNode-to-NameNode channel
-(gRPC) is not authenticated, so a host that can reach the NameNode could
-register as a DataNode and receive the block keys; permissions are
-recorded but not enforced; there are no proxy-user rules; RPC integrity
-and privacy (`hadoop.rpc.protection` beyond `authentication`) and data
-transfer encryption (`dfs.encrypt.data.transfer`,
-`dfs.data.transfer.protection`) are not offered.
+**DataNodes authenticate to the NameNode** too, with Kerberos on. HDFS
+runs DatanodeProtocol over Kerberized Hadoop IPC; Pillar's is gRPC, so
+every call carries its own Kerberos AP-REQ (`x-kerberos-ap-req`) and every
+reply the NameNode's AP-REP (`x-kerberos-ap-rep`). The NameNode only
+accepts DataNode principals (`--datanode-principal`, default
+`dn/_HOST@<its realm>`: any host) and refuses an authenticator it has seen
+before (a replay cache over the clock-skew window). The DataNode checks the
+AP-REP on every reply, so it takes commands only from the real NameNode. It
+logs in from its keytab (`--kerberos-keytab`, `--kerberos-principal`; KDCs
+from krb5.conf, `KRB5_CONFIG`) and renews its ticket for the NameNode
+(`--namenode-principal`, default `nn/<NameNode host>@<realm>`) in the
+background.
+
+What security does **not** cover yet: calls are authenticated, not
+protected. As with `hadoop.rpc.protection=authentication`, nothing gives
+them integrity or privacy, so someone on the network path could alter a
+call or its reply. Permissions are recorded but not enforced. There are no
+proxy-user rules. Data transfer encryption (`dfs.encrypt.data.transfer`,
+`dfs.data.transfer.protection`) is not offered.
 
 Not supported yet: block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA

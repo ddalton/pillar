@@ -17,8 +17,11 @@ dashmap = { workspace = true }
 pillar-proto = { path = "../pillar-proto" }
 prost = { workspace = true }
 async-trait = { workspace = true }
-# Kerberos (SASL GSSAPI) for Hadoop IPC
+# Kerberos (SASL GSSAPI) for Hadoop IPC, and per-call for gRPC
 krb5 = "0.5"
+tonic = { workspace = true }
+tower = { workspace = true }
+http = "1"
 # Block access tokens (HMAC-SHA1) and their SASL DIGEST-MD5 use
 hmac = "0.12"
 sha1 = "0.10"
