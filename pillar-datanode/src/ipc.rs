@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 
 use pillar_common::hdfs::block_token::{mode, parse_token_caller};
 use pillar_common::ipc::{Authentication, RpcError, RpcHandler, TokenAuthority};
+use pillar_common::sasl::Protection;
 use pillar_proto::hdfs::{GetReplicaVisibleLengthRequestProto, GetReplicaVisibleLengthResponseProto};
 
 use crate::storage::BlockStorage;
@@ -30,11 +31,12 @@ pub const CLIENT_DATANODE_PROTOCOL: &str = "org.apache.hadoop.hdfs.protocol.Clie
 pub struct ClientDatanodeProtocol {
     storage: Arc<BlockStorage>,
     auth: Authentication,
+    protection: Protection,
 }
 
 impl ClientDatanodeProtocol {
-    pub fn new(storage: Arc<BlockStorage>, auth: Authentication) -> Self {
-        Self { storage, auth }
+    pub fn new(storage: Arc<BlockStorage>, auth: Authentication, protection: Protection) -> Self {
+        Self { storage, auth, protection }
     }
 
     /// HDFS `getReplicaVisibleLength`: all of a finalized replica, the
@@ -87,6 +89,10 @@ impl RpcHandler for ClientDatanodeProtocol {
         Some(&self.storage.tokens)
     }
 
+    fn protection(&self) -> Protection {
+        self.protection.clone()
+    }
+
     async fn call(&self, method: &str, body: &[u8], user: &str) -> Result<Vec<u8>, RpcError> {
         match method {
             "getReplicaVisibleLength" => self.replica_visible_length(body, user),
@@ -97,9 +103,14 @@ impl RpcHandler for ClientDatanodeProtocol {
 
 /// Bind `addr` and serve `ClientDatanodeProtocol` on it in the background,
 /// authenticating callers by `auth`.
-pub async fn serve(addr: SocketAddr, storage: Arc<BlockStorage>, auth: Authentication) -> std::io::Result<SocketAddr> {
+pub async fn serve(
+    addr: SocketAddr,
+    storage: Arc<BlockStorage>,
+    auth: Authentication,
+    protection: Protection,
+) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    tokio::spawn(pillar_common::ipc::serve(listener, Arc::new(ClientDatanodeProtocol::new(storage, auth))));
+    tokio::spawn(pillar_common::ipc::serve(listener, Arc::new(ClientDatanodeProtocol::new(storage, auth, protection))));
     Ok(bound)
 }

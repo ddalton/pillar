@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use pillar_proto::hadoop::hdfs::client_namenode_protocol_server::ClientNamenodeProtocol;
 
 pub use pillar_common::ipc::{is_hadoop_ipc, Authentication, KerberosServer, RpcError, RpcHandler};
+pub use pillar_common::sasl::Protection;
 
 /// The protocol Hadoop clients name in `RequestHeaderProto`.
 pub const CLIENT_PROTOCOL: &str = "org.apache.hadoop.hdfs.protocol.ClientProtocol";
@@ -72,6 +73,7 @@ pub fn rpc_error(s: tonic::Status) -> RpcError {
 pub struct ClientProtocol<T> {
     svc: Arc<T>,
     auth: Arc<Authentication>,
+    protection: Protection,
 }
 
 #[async_trait]
@@ -82,6 +84,10 @@ impl<T: ClientNamenodeProtocol> RpcHandler for ClientProtocol<T> {
 
     fn authentication(&self) -> &Authentication {
         &self.auth
+    }
+
+    fn protection(&self) -> Protection {
+        self.protection.clone()
     }
 
     async fn call(&self, method: &str, body: &[u8], user: &str) -> Result<Vec<u8>, RpcError> {
@@ -97,11 +103,12 @@ pub async fn accept_loop<T>(
     listener: TcpListener,
     svc: Arc<T>,
     auth: Arc<Authentication>,
+    protection: Protection,
     grpc: mpsc::Sender<std::io::Result<TcpStream>>,
 ) where
     T: ClientNamenodeProtocol,
 {
-    let handler = Arc::new(ClientProtocol { svc, auth });
+    let handler = Arc::new(ClientProtocol { svc, auth, protection });
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -137,23 +144,25 @@ pub async fn bind_shared<T: ClientNamenodeProtocol>(
     addr: SocketAddr,
     svc: Arc<T>,
 ) -> std::io::Result<tokio_stream::wrappers::ReceiverStream<std::io::Result<TcpStream>>> {
-    bind_shared_with(addr, svc, Arc::new(Authentication::Simple)).await
+    bind_shared_with(addr, svc, Arc::new(Authentication::Simple), Protection::default()).await
 }
 
-/// [`bind_shared`], with Hadoop IPC callers authenticated by `auth`.
+/// [`bind_shared`], with Hadoop IPC callers authenticated by `auth`, and
+/// their calls protected as `protection` allows (SASL callers).
 pub async fn bind_shared_with<T: ClientNamenodeProtocol>(
     addr: SocketAddr,
     svc: Arc<T>,
     auth: Arc<Authentication>,
+    protection: Protection,
 ) -> std::io::Result<tokio_stream::wrappers::ReceiverStream<std::io::Result<TcpStream>>> {
     let listener = TcpListener::bind(addr).await?;
     let mode = match &*auth {
         Authentication::Simple => "SIMPLE".to_string(),
         Authentication::Kerberos(k) => format!("Kerberos as {}", k.principal()),
     };
-    info!("Client RPC port {}: Hadoop IPC ({}) and gRPC", listener.local_addr()?, mode);
+    info!("Client RPC port {}: Hadoop IPC ({}, protection {}) and gRPC", listener.local_addr()?, mode, protection);
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(accept_loop(listener, svc, auth, tx));
+    tokio::spawn(accept_loop(listener, svc, auth, protection, tx));
     Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 

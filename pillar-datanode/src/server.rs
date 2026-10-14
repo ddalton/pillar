@@ -35,6 +35,9 @@ pub struct DataNodeConfig {
     /// authenticates to on every call (default `nn/<NameNode host>@<the
     /// DataNode's realm>`).
     pub namenode_principal: Option<String>,
+    /// The protection IPC callers may negotiate with SASL
+    /// (`hadoop.rpc.protection`).
+    pub rpc_protection: pillar_common::sasl::Protection,
 
     /// Data transfer server address (for block I/O)
     pub data_addr: SocketAddr,
@@ -102,6 +105,7 @@ impl Default for DataNodeConfig {
             kerberos_keytab: None,
             kerberos_principal: None,
             namenode_principal: None,
+            rpc_protection: Default::default(),
             data_addr: "0.0.0.0:50010".parse().unwrap(),
             http_addr: "0.0.0.0:50075".parse().unwrap(),
             volume_mount_point: PathBuf::from("/mnt/pillar-data"),
@@ -153,6 +157,12 @@ impl DataNodeConfig {
         }
         if let Ok(val) = env::var("DATANODE_NAMENODE_PRINCIPAL") {
             config.namenode_principal = Some(val);
+        }
+        if let Ok(val) = env::var("DATANODE_RPC_PROTECTION") {
+            match val.parse() {
+                Ok(p) => config.rpc_protection = p,
+                Err(e) => warn!("DATANODE_RPC_PROTECTION: {}", e),
+            }
         }
 
         if let Ok(val) = env::var("DATANODE_RPC_PORT") {
@@ -484,7 +494,7 @@ impl DataNode {
             (None, None) => pillar_common::ipc::Authentication::Simple,
             _ => anyhow::bail!("Kerberos needs both a keytab and a principal"),
         };
-        let ipc = crate::ipc::serve(self.config.rpc_addr, self.block_storage.clone(), auth)
+        let ipc = crate::ipc::serve(self.config.rpc_addr, self.block_storage.clone(), auth, self.config.rpc_protection.clone())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind the IPC port {}: {}", self.config.rpc_addr, e))?;
         info!("DataNode IPC (ClientDatanodeProtocol) on {}", ipc);

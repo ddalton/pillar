@@ -400,11 +400,21 @@ from krb5.conf, `KRB5_CONFIG`) and renews its ticket for the NameNode
 (`--namenode-principal`, default `nn/<NameNode host>@<realm>`) in the
 background.
 
-What security does **not** cover yet: calls are authenticated, not
-protected. As with `hadoop.rpc.protection=authentication`, nothing gives
-them integrity or privacy, so someone on the network path could alter a
-call or its reply. Permissions are recorded but not enforced. There are no
-proxy-user rules. Data transfer encryption (`dfs.encrypt.data.transfer`,
+**RPC integrity and privacy** (`hadoop.rpc.protection`): `--rpc-protection`
+on the NameNode and DataNodes takes `authentication` (the default),
+`integrity`, `privacy`, or several comma separated, and SASL callers
+negotiate one of them. With `integrity` every call and reply on the Hadoop
+IPC ports is signed, with `privacy` signed and encrypted, after
+authentication: Kerberos callers through the GSSAPI security layer (RFC
+4121 Wrap tokens), block-token callers through DIGEST-MD5's (`auth-int`,
+`auth-conf` with RC4, RFC 2831). Messages out of sequence are refused, and
+so is a client that asks for less than the server requires ("No common
+protection layer"). The Java client sets the same `hadoop.rpc.protection`.
+
+What security does **not** cover yet: the DataNode-to-NameNode gRPC calls
+are authenticated, not protected (`--rpc-protection` applies to Hadoop
+IPC). Permissions are recorded but not enforced. There are no proxy-user
+rules. Data transfer encryption (`dfs.encrypt.data.transfer`,
 `dfs.data.transfer.protection`) is not offered.
 
 Not supported yet: block checksum (`-checksum`), short-circuit

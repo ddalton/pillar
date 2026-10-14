@@ -61,6 +61,9 @@ pub struct NameNodeConfig {
     /// (`<service>/_HOST@<REALM>`, any host; default `dn/_HOST` in the
     /// NameNode's realm).
     pub datanode_principal: Option<String>,
+    /// The protection Hadoop IPC callers may negotiate with SASL
+    /// (`hadoop.rpc.protection`: authentication, integrity, privacy).
+    pub rpc_protection: pillar_common::sasl::Protection,
 
     /// Block access tokens (HDFS dfs.block.access.token.enable); always on
     /// with Kerberos.
@@ -96,6 +99,7 @@ impl Default for NameNodeConfig {
             kerberos_keytab: None,
             kerberos_principal: None,
             datanode_principal: None,
+            rpc_protection: Default::default(),
             block_access_tokens: false,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
@@ -155,6 +159,12 @@ impl NameNodeConfig {
         }
         if let Ok(val) = env::var("NAMENODE_DATANODE_PRINCIPAL") {
             config.datanode_principal = Some(val);
+        }
+        if let Ok(val) = env::var("NAMENODE_RPC_PROTECTION") {
+            match val.parse() {
+                Ok(p) => config.rpc_protection = p,
+                Err(e) => tracing::warn!("NAMENODE_RPC_PROTECTION: {}", e),
+            }
         }
 
         if let Ok(val) = env::var("NAMENODE_HANDLER_COUNT") {
@@ -407,7 +417,7 @@ impl NameNode {
             }
             _ => None,
         };
-        let incoming = crate::ipc::bind_shared_with(self.config.rpc_addr, ipc_server, Arc::new(auth)).await?;
+        let incoming = crate::ipc::bind_shared_with(self.config.rpc_addr, ipc_server, Arc::new(auth), self.config.rpc_protection.clone()).await?;
         // ClientProtocol over gRPC has no authentication: with Kerberos on,
         // clients must come through Hadoop IPC.
         let client_grpc = (!kerberos).then(|| ClientNamenodeProtoServer::new(client_proto_server));

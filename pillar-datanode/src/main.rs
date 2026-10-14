@@ -79,6 +79,11 @@ struct Args {
     #[clap(long)]
     namenode_principal: Option<String>,
 
+    /// Protection IPC callers may negotiate (hadoop.rpc.protection):
+    /// authentication, integrity, privacy (comma separated for several).
+    #[clap(long)]
+    rpc_protection: Option<pillar_common::sasl::Protection>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -133,6 +138,9 @@ async fn main() -> Result<()> {
     }
     if args.namenode_principal.is_some() {
         config.namenode_principal = args.namenode_principal;
+    }
+    if let Some(p) = args.rpc_protection {
+        config.rpc_protection = p;
     }
 
     #[cfg(feature = "rdma")]

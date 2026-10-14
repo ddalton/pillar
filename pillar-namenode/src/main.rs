@@ -62,6 +62,12 @@ struct Args {
     #[clap(long)]
     datanode_principal: Option<String>,
 
+    /// Protection Hadoop IPC callers may negotiate with Kerberos or tokens,
+    /// as hadoop.rpc.protection: authentication, integrity, privacy
+    /// (comma separated for several).
+    #[clap(long)]
+    rpc_protection: Option<pillar_common::sasl::Protection>,
+
     /// Require block access tokens on DataNodes (always on with Kerberos).
     #[clap(long)]
     block_access_tokens: bool,
@@ -115,6 +121,9 @@ async fn main() -> Result<()> {
     }
     if args.datanode_principal.is_some() {
         config.datanode_principal = args.datanode_principal;
+    }
+    if let Some(p) = args.rpc_protection {
+        config.rpc_protection = p;
     }
     config.block_access_tokens |= args.block_access_tokens;
 
