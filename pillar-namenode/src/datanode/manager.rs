@@ -10,8 +10,6 @@ pub enum DatanodeManagerError {
     #[error("Datanode not found: {0}")]
     DatanodeNotFound(String),
 
-    #[error("Datanode already registered: {0}")]
-    DatanodeAlreadyRegistered(String),
 
     #[error("Insufficient datanodes for replication")]
     InsufficientDatanodes,
@@ -158,17 +156,15 @@ impl DatanodeManager {
         Self { stale_interval, dead_interval, ..Self::new() }
     }
 
-    /// Register a new datanode
+    /// Register a datanode. A node that registers again (it restarted,
+    /// possibly with new addresses) replaces its old entry; its full block
+    /// report follows.
     pub fn register(&self, id: DatanodeId, capacity: u64) -> Result<()> {
         let uuid = id.uuid.clone();
-
-        if self.datanodes.contains_key(&uuid) {
-            return Err(DatanodeManagerError::DatanodeAlreadyRegistered(uuid));
-        }
-
         let descriptor = DatanodeDescriptor::new(id, capacity);
-        self.datanodes.insert(uuid, descriptor);
-
+        if self.datanodes.insert(uuid.clone(), descriptor).is_some() {
+            tracing::info!("DataNode {} registered again", uuid);
+        }
         Ok(())
     }
 

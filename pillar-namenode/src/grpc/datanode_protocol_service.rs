@@ -86,9 +86,17 @@ impl DatanodeProtocolService {
         let xceiver_count = 0;
         let failed_volumes = 0;
 
-        self.datanode_manager
-            .heartbeat(uuid, storage, xceiver_count, failed_volumes)
-            .map_err(|e| Status::internal(format!("Heartbeat failed: {}", e)))?;
+        match self.datanode_manager.heartbeat(uuid, storage, xceiver_count, failed_volumes) {
+            Ok(()) => {}
+            // Not registered here: this NameNode restarted, or declared the
+            // node dead. Ask it to register again (HDFS DNA_REGISTER); it
+            // follows up with a full block report.
+            Err(crate::datanode::manager::DatanodeManagerError::DatanodeNotFound(_)) => {
+                info!("Heartbeat from unregistered DataNode {}; asking it to re-register", uuid);
+                return Ok(vec![DatanodeCommand::Register]);
+            }
+            Err(e) => return Err(Status::internal(format!("Heartbeat failed: {}", e))),
+        }
 
         // Hand over whatever the replication monitor queued for this node,
         // plus deletions of replicas whose blocks were removed.
@@ -199,6 +207,9 @@ pub enum DatanodeCommand {
     InvalidateBlocks {
         blocks: Vec<BlockId>,
     },
+
+    /// Register again, then send a full block report.
+    Register,
 }
 
 #[cfg(test)]
