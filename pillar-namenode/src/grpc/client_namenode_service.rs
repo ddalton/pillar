@@ -32,7 +32,12 @@ pub struct ClientNamenodeService {
     recovering: dashmap::DashMap<u64, Recovering>,
     /// Mints block access tokens, when they are enabled.
     block_tokens: std::sync::OnceLock<Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>>,
+    /// Permission enforcement, once configured (off until then).
+    permissions: std::sync::OnceLock<crate::permission::Permissions>,
 }
+
+static NO_PERMISSIONS: std::sync::LazyLock<crate::permission::Permissions> =
+    std::sync::LazyLock::new(crate::permission::Permissions::disabled);
 
 /// A block recovery under way.
 struct Recovering {
@@ -65,7 +70,39 @@ impl ClientNamenodeService {
             datanode_commands: std::sync::OnceLock::new(),
             recovering: dashmap::DashMap::new(),
             block_tokens: std::sync::OnceLock::new(),
+            permissions: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Enforce `permissions` (HDFS `dfs.permissions.enabled`).
+    pub fn set_permissions(&self, permissions: crate::permission::Permissions) {
+        let _ = self.permissions.set(permissions);
+    }
+
+    pub fn permissions(&self) -> &crate::permission::Permissions {
+        self.permissions.get().unwrap_or(&NO_PERMISSIONS)
+    }
+
+    /// Check that `user` may do `check` on `path`.
+    pub async fn permit(&self, user: &str, path: &str, check: crate::permission::Check) -> Result<(), Status> {
+        self.permissions().check(&self.namespace, user, path, check).await
+    }
+
+    /// The group a new inode at `path` gets: its nearest existing
+    /// ancestor's (HDFS gives a new inode its parent directory's group).
+    pub async fn inherited_group(&self, path: &str) -> String {
+        let attrs = self.namespace.resolve_attrs(path).await;
+        attrs[..attrs.len() - 1].iter().rev().flatten().next().map(|a| a.group.clone()).unwrap_or_else(|| "supergroup".into())
+    }
+
+    /// Whether `path` names an existing directory.
+    pub async fn is_dir(&self, path: &str) -> bool {
+        matches!(self.namespace.resolve_attrs(path).await.last(), Some(Some(a)) if a.is_dir)
+    }
+
+    /// Whether `path` exists.
+    pub async fn exists(&self, path: &str) -> bool {
+        matches!(self.namespace.resolve_attrs(path).await.last(), Some(Some(_)))
     }
 
     /// Issue block access tokens with `manager`.

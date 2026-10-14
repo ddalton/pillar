@@ -72,10 +72,22 @@ public class KerberosInterop {
         }
         Configuration conf = conf(uri, "kerberos");
         UserGroupInformation.setConfiguration(conf);
+
+        // Permissions are enforced: hdfs (the superuser) opens / to users.
+        UserGroupInformation hdfs = UserGroupInformation.loginUserFromKeytabAndReturnUGI("hdfs@PILLAR.TEST", dir + "/hdfs.keytab");
+        hdfs.doAs((PrivilegedExceptionAction<Void>) () -> {
+            try (FileSystem su = FileSystem.newInstance(conf)) {
+                su.setPermission(new Path("/"), new org.apache.hadoop.fs.permission.FsPermission((short) 01777));
+            }
+            return null;
+        });
+
         UserGroupInformation.loginUserFromKeytab("alice@PILLAR.TEST", dir + "/alice.keytab");
         FileSystem fs = FileSystem.get(conf);
 
         fs.mkdirs(new Path("/secure"));
+        // bob writes here below; the authenticated user is what counts.
+        fs.setPermission(new Path("/secure"), new org.apache.hadoop.fs.permission.FsPermission((short) 01777));
         byte[] data = new byte[(3 << 19) + 99];
         new Random(3).nextBytes(data);
         Path f = new Path("/secure/alice.bin");
@@ -111,6 +123,18 @@ public class KerberosInterop {
             }
         });
         check(bobOwner.equals("bob"), "bob's file is owned by bob");
+
+        // Permissions hold for authenticated users: alice's 600 file is hers.
+        fs.setPermission(f, new org.apache.hadoop.fs.permission.FsPermission((short) 0600));
+        String denied = bob.doAs((PrivilegedExceptionAction<String>) () -> {
+            try (FileSystem bfs = FileSystem.newInstance(conf); FSDataInputStream in = bfs.open(f)) {
+                in.read();
+                return "";
+            } catch (org.apache.hadoop.security.AccessControlException e) {
+                return e.getMessage().split("\n")[0];
+            }
+        });
+        check(denied.contains("user=bob, access=READ"), "bob cannot read alice's 600 file (" + denied + ")");
 
         // alice cannot act as bob: no proxy-user rules.
         UserGroupInformation proxy = UserGroupInformation.createProxyUser("bob", UserGroupInformation.getLoginUser());

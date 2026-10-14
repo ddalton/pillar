@@ -5,6 +5,13 @@ use tracing::{info, warn, error};
 use pillar_proto::hadoop::hdfs::*;
 use crate::grpc::ClientNamenodeService;
 use pillar_common::hdfs::block_token::mode;
+use crate::permission::{action, Check};
+
+/// `src`'s last component under the directory `dst` (rename into a directory).
+fn rename_target(src: &str, dst: &str) -> String {
+    let name = src.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    format!("{}/{}", dst.trim_end_matches('/'), name)
+}
 
 /// The user a request runs as: the Hadoop IPC connection's effective user
 /// (SIMPLE auth), or `hdfs` for gRPC callers, which carry none.
@@ -17,6 +24,10 @@ fn caller<T>(request: &Request<T>) -> String {
         .unwrap_or_else(|| "hdfs".to_string())
 }
 
+fn access_denied(message: String) -> Status {
+    crate::ipc::hadoop_status(tonic::Code::PermissionDenied, "org.apache.hadoop.security.AccessControlException", message)
+}
+
 /// gRPC service implementation for ClientNamenodeProtocol
 /// This implements the actual Hadoop wire protocol
 pub struct ClientNamenodeProtocolServer {
@@ -27,6 +38,14 @@ impl ClientNamenodeProtocolServer {
     pub fn new(service: Arc<ClientNamenodeService>) -> Self {
         Self { service }
     }
+
+    /// Renaming `src` to `target`: WRITE on the source's parent (and its
+    /// sticky bit), WRITE on the target's nearest existing ancestor, and
+    /// the sticky bit of an entry the rename would replace.
+    async fn permit_rename(&self, user: &str, src: &str, target: &str) -> Result<(), Status> {
+        self.service.permit(user, src, Check { parent: Some(action::WRITE), sticky: true, ..Default::default() }).await?;
+        self.service.permit(user, target, Check { ancestor: Some(action::WRITE), sticky: true, ..Default::default() }).await
+    }
 }
 
 #[tonic::async_trait]
@@ -36,10 +55,12 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<GetFileInfoRequestProto>,
     ) -> Result<Response<GetFileInfoResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
 
         info!("get_file_info: {}", path);
+        self.service.permit(&user, &path, Check::default()).await?;
 
         let file_info = self.service.handle_get_file_info(&path).await?;
         Ok(Response::new(GetFileInfoResponseProto { fs: Some(file_status_proto(file_info, path)) }))
@@ -50,10 +71,13 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<GetListingRequestProto>,
     ) -> Result<Response<GetListingResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
 
         info!("get_listing: {}", path);
+        let access = self.service.is_dir(&path).await.then_some(action::READ_EXECUTE);
+        self.service.permit(&user, &path, Check { access, ..Default::default() }).await?;
 
         match self.service.handle_get_listing(&path).await {
             Ok(entries) => {
@@ -110,12 +134,17 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let masked = req.masked;
 
         info!("mkdirs: {}", path);
+        // An existing directory needs only traversal; a new one WRITE on
+        // the nearest existing ancestor.
+        let ancestor = (!self.service.exists(&path).await).then_some(action::WRITE);
+        self.service.permit(&owner, &path, Check { ancestor, ..Default::default() }).await?;
+        let group = self.service.inherited_group(&path).await;
 
         match self.service
             .handle_mkdirs(
                 &path,
                 owner,
-                "supergroup".to_string(),
+                group,
                 masked.perm as u16,
                 req.create_parent,
             )
@@ -142,11 +171,16 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         // CreateFlagProto: CREATE = 0x01, OVERWRITE = 0x02, APPEND = 0x04.
         let overwrite = req.create_flag & 0x02 != 0;
+        // WRITE on the nearest existing ancestor, and on the file it
+        // replaces.
+        let access = (overwrite && self.service.exists(&path).await).then_some(action::WRITE);
+        self.service.permit(&owner, &path, Check { ancestor: Some(action::WRITE), access, ..Default::default() }).await?;
+        let group = self.service.inherited_group(&path).await;
         match self.service
             .handle_create_with(
                 &path,
                 owner.clone(),
-                "supergroup".to_string(),
+                group.clone(),
                 masked.perm as u16,
                 replication,
                 block_size,
@@ -163,7 +197,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                     length: 0,
                     permission: masked,
                     owner,
-                    group: "supergroup".to_string(),
+                    group,
                     modification_time: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -191,11 +225,16 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<DeleteRequestProto>,
     ) -> Result<Response<DeleteResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
         let recursive = req.recursive;
 
         info!("delete: {} (recursive={})", path, recursive);
+        // WRITE on the parent, everything on what is under it, and the
+        // sticky bit.
+        let check = Check { parent: Some(action::WRITE), sub: Some(action::ALL), ignore_empty_dir: true, sticky: true, ..Default::default() };
+        self.service.permit(&user, &path, check).await?;
 
         match self.service.handle_delete(&path, recursive).await {
             Ok(result) => Ok(Response::new(DeleteResponseProto { result })),
@@ -208,11 +247,14 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<RenameRequestProto>,
     ) -> Result<Response<RenameResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let src = req.src;
         let dst = req.dst;
 
         info!("rename: {} -> {}", src, dst);
+        let target = if self.service.is_dir(&dst).await { rename_target(&src, &dst) } else { dst.clone() };
+        self.permit_rename(&user, &src, &target).await?;
 
         match self.service.handle_rename(&src, &dst).await {
             Ok(result) => Ok(Response::new(RenameResponseProto { result })),
@@ -230,6 +272,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let path = req.src;
         let offset = req.offset;
         let length = req.length;
+        self.service.permit(&user, &path, Check { access: Some(action::READ), ..Default::default() }).await?;
 
         info!("get_block_locations: {} (offset={}, length={})", path, offset, length);
 
@@ -352,7 +395,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<SetReplicationRequestProto>,
     ) -> Result<Response<SetReplicationResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
+        self.service.permit(&user, &req.src, Check { access: Some(action::WRITE), ..Default::default() }).await?;
         let result = self.service.handle_set_replication(&req.src, req.replication).await?;
         Ok(Response::new(SetReplicationResponseProto { result }))
     }
@@ -362,7 +407,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<SetPermissionRequestProto>,
     ) -> Result<Response<SetPermissionResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
+        // Only the owner (or the superuser) changes a mode.
+        self.service.permit(&user, &req.src, Check { owner: true, ..Default::default() }).await?;
         let attrs = crate::metadata::edit_log::InodeAttributes {
             permission: Some(req.permission.perm as u16),
             ..Default::default()
@@ -376,9 +424,22 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<SetOwnerRequestProto>,
     ) -> Result<Response<SetOwnerResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         if req.username.is_none() && req.groupname.is_none() {
             return Err(Status::invalid_argument("setOwner: neither user nor group given"));
+        }
+        // The owner may give the file to a group it belongs to; only the
+        // superuser may change the owner.
+        self.service.permit(&user, &req.src, Check { owner: true, ..Default::default() }).await?;
+        let p = self.service.permissions();
+        if p.enabled && !p.is_superuser(&user) {
+            if req.username.as_ref().is_some_and(|u| *u != user) {
+                return Err(access_denied(format!("User {} is not a super user (non-super user cannot change owner).", user)));
+            }
+            if let Some(g) = req.groupname.as_ref().filter(|g| !p.is_member(&user, g)) {
+                return Err(access_denied(format!("User {} does not belong to {}", user, g)));
+            }
         }
         let attrs = crate::metadata::edit_log::InodeAttributes {
             owner: req.username,
@@ -467,7 +528,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<SetTimesRequestProto>,
     ) -> Result<Response<SetTimesResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
+        self.service.permit(&user, &req.src, Check { access: Some(action::WRITE), ..Default::default() }).await?;
         // -1 (all bits set on the wire) leaves a time unchanged.
         let time = |t: u64| (t != u64::MAX).then_some(t);
         let attrs = crate::metadata::edit_log::InodeAttributes {
@@ -483,7 +546,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<IsFileClosedRequestProto>,
     ) -> Result<Response<IsFileClosedResponseProto>, Status> {
-        let result = self.service.handle_is_file_closed(&request.into_inner().src).await?;
+        let user = caller(&request);
+        let src = request.into_inner().src;
+        self.service.permit(&user, &src, Check::default()).await?;
+        let result = self.service.handle_is_file_closed(&src).await?;
         Ok(Response::new(IsFileClosedResponseProto { result }))
     }
 
@@ -491,7 +557,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<GetContentSummaryRequestProto>,
     ) -> Result<Response<GetContentSummaryResponseProto>, Status> {
-        let s = self.service.handle_get_content_summary(&request.into_inner().path).await?;
+        let user = caller(&request);
+        let path = request.into_inner().path;
+        self.service.permit(&user, &path, Check { sub: Some(action::READ_EXECUTE), ..Default::default() }).await?;
+        let s = self.service.handle_get_content_summary(&path).await?;
         Ok(Response::new(GetContentSummaryResponseProto {
             summary: ContentSummaryProto {
                 length: s.length,
@@ -517,6 +586,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
     ) -> Result<Response<AppendResponseProto>, Status> {
         let user = caller(&request);
         let req = request.into_inner();
+        self.service.permit(&user, &req.src, Check { access: Some(action::WRITE), ..Default::default() }).await?;
         // CreateFlagProto NEW_BLOCK = 0x20.
         let new_block = req.flag.unwrap_or(0) & 0x20 != 0;
         info!("append: {} (new_block={})", req.src, new_block);
@@ -786,12 +856,20 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<ConcatRequestProto>,
     ) -> Result<Response<ConcatResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
 
         info!(
             "concat: target={} sources={:?}",
             req.trg, req.srcs
         );
+        // WRITE on the target; each source is read and removed from its
+        // directory.
+        self.service.permit(&user, &req.trg, Check { access: Some(action::WRITE), ..Default::default() }).await?;
+        for src in &req.srcs {
+            let check = Check { parent: Some(action::WRITE), access: Some(action::READ), ..Default::default() };
+            self.service.permit(&user, src, check).await?;
+        }
 
         self.service.handle_concat(&req.trg, &req.srcs).await?;
 
@@ -802,7 +880,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<TruncateRequestProto>,
     ) -> Result<Response<TruncateResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
+        self.service.permit(&user, &req.src, Check { access: Some(action::WRITE), ..Default::default() }).await?;
 
         info!(
             "truncate: src={} new_length={} client={}",
@@ -821,8 +901,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<Rename2RequestProto>,
     ) -> Result<Response<Rename2ResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         info!("rename2: {} -> {} (overwrite={})", req.src, req.dst, req.overwrite_dest);
+        self.permit_rename(&user, &req.src, &req.dst).await?;
         self.service.handle_rename2(&req.src, &req.dst, req.overwrite_dest).await?;
         Ok(Response::new(Rename2ResponseProto {}))
     }
@@ -838,11 +920,13 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<RecoverLeaseRequestProto>,
     ) -> Result<Response<RecoverLeaseResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
         let client_name = req.client_name;
 
         info!("recover_lease: {} client={}", path, client_name);
+        self.service.permit(&user, &path, Check { access: Some(action::WRITE), ..Default::default() }).await?;
 
         let result = self.service.handle_recover_lease(&path, &client_name).await?;
 
@@ -865,16 +949,18 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn get_datanode_report(
         &self,
-        _request: Request<GetDatanodeReportRequestProto>,
+        request: Request<GetDatanodeReportRequestProto>,
     ) -> Result<Response<GetDatanodeReportResponseProto>, Status> {
+        self.service.permissions().check_superuser(&caller(&request))?;
         let di = self.service.handle_get_datanode_report().await?.into_iter().map(datanode_report_proto).collect();
         Ok(Response::new(GetDatanodeReportResponseProto { di }))
     }
 
     async fn get_datanode_storage_report(
         &self,
-        _request: Request<GetDatanodeStorageReportRequestProto>,
+        request: Request<GetDatanodeStorageReportRequestProto>,
     ) -> Result<Response<GetDatanodeStorageReportResponseProto>, Status> {
+        self.service.permissions().check_superuser(&caller(&request))?;
         // One storage per DataNode (its volume), keyed by the DataNode uuid.
         let reports = self
             .service
@@ -997,6 +1083,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<ListOpenFilesRequestProto>,
     ) -> Result<Response<ListOpenFilesResponseProto>, Status> {
+        self.service.permissions().check_superuser(&caller(&request))?;
         // Batches are keyed by inode id: return those after `id`, under
         // `path` if given, 1000 at a time (HDFS dfs.namenode.list.openfiles.num.responses).
         let req = request.into_inner();
@@ -1349,7 +1436,11 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<CheckAccessRequestProto>,
     ) -> Result<Response<CheckAccessResponseProto>, Status> {
-        self.service.handle_check_access(&request.into_inner().path).await?;
+        let user = caller(&request);
+        let req = request.into_inner();
+        self.service.handle_check_access(&req.path).await?;
+        // The FsActionProto values are the access bits.
+        self.service.permit(&user, &req.path, Check { access: Some(req.mode as u8 & action::ALL), ..Default::default() }).await?;
         Ok(Response::new(CheckAccessResponseProto {}))
     }
 

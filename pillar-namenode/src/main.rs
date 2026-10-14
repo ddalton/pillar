@@ -2,6 +2,7 @@ mod metadata;
 mod datanode;
 mod grpc;
 mod ipc;
+mod permission;
 mod server;
 
 use std::net::SocketAddr;
@@ -68,6 +69,23 @@ struct Args {
     #[clap(long)]
     rpc_protection: Option<pillar_common::sasl::Protection>,
 
+    /// Enforce permissions (HDFS dfs.permissions.enabled; default true).
+    #[clap(long, action = clap::ArgAction::Set)]
+    permissions: Option<bool>,
+
+    /// The superuser, who passes every permission check (default hdfs).
+    #[clap(long)]
+    superuser: Option<String>,
+
+    /// Members of this group are superusers too (default supergroup).
+    #[clap(long)]
+    superusergroup: Option<String>,
+
+    /// Users' groups, user=group,group;user=group (users not listed have
+    /// none).
+    #[clap(long)]
+    user_groups: Option<String>,
+
     /// Require block access tokens on DataNodes (always on with Kerberos).
     #[clap(long)]
     block_access_tokens: bool,
@@ -126,6 +144,18 @@ async fn main() -> Result<()> {
         config.rpc_protection = p;
     }
     config.block_access_tokens |= args.block_access_tokens;
+    if let Some(on) = args.permissions {
+        config.permissions.enabled = on;
+    }
+    if let Some(u) = args.superuser {
+        config.permissions.superuser = u;
+    }
+    if let Some(g) = args.superusergroup {
+        config.permissions.supergroup = g;
+    }
+    if let Some(g) = args.user_groups {
+        config.permissions.groups = pillar_namenode_groups(&g)?;
+    }
 
     info!("Configuration loaded from environment and CLI arguments");
     info!("Etcd endpoints: {:?}", config.etcd_endpoints);
@@ -164,4 +194,8 @@ fn print_banner(namenode: &NameNode) {
     println!("║    Used:           {} GB                          ║", stats.total_used / 1_000_000_000);
     println!("║    Remaining:      {} GB                          ║", stats.total_remaining / 1_000_000_000);
     println!("╚═══════════════════════════════════════════════════════════╝\n");
+}
+
+fn pillar_namenode_groups(s: &str) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+    permission::Permissions::parse_groups(s).map_err(|e| anyhow::anyhow!("--user-groups: {}", e))
 }

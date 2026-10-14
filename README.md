@@ -419,10 +419,44 @@ subkey, so a reply that unwraps proves it came from the NameNode. A
 DataNode asks for the strongest level of its own `--rpc-protection`; the
 NameNode refuses a level it does not allow.
 
-What security does **not** cover yet: permissions are recorded but not
-enforced. There are no proxy-user
-rules. Data transfer encryption (`dfs.encrypt.data.transfer`,
-`dfs.data.transfer.protection`) is not offered.
+**Permissions** are enforced as in HDFS (`dfs.permissions.enabled`, on by
+default; `--permissions false` turns them off). A caller is checked
+against an inode's owner, group or other bits; every operation needs
+EXECUTE on the directories above its path, and each its own access:
+
+| Operation | Needs |
+|---|---|
+| getFileInfo, isFileClosed | traversal |
+| getListing | READ+EXECUTE on the directory |
+| open (getBlockLocations) | READ |
+| create, mkdirs | WRITE on the nearest existing ancestor (and on a file `create` overwrites) |
+| append, truncate, setReplication, setTimes, recoverLease | WRITE |
+| delete | WRITE on the parent, ALL on every non-empty directory below, the sticky bit |
+| rename | WRITE on both parents, the sticky bit on source and replaced target |
+| setPermission | ownership |
+| setOwner | ownership; only the superuser changes the owner, and a group must be one of the caller's |
+| getContentSummary | READ+EXECUTE on every directory below |
+| concat | WRITE on the target, READ on each source and WRITE on its parent |
+| listOpenFiles, datanode reports | the superuser |
+
+In a sticky directory (mode `1xxx`, like `/tmp`) only an entry's owner, the
+directory's owner or the superuser may delete or rename it. The superuser
+(`--superuser`, default `hdfs`, the owner of `/`) and members of the
+supergroup (`--superusergroup`, default `supergroup`) pass every check.
+Groups come from `--user-groups "alice=staff,admins;bob=staff"` (as
+Hadoop's static group mapping); users not listed have no groups. A new
+file or directory takes its parent's group. Refusals are
+`AccessControlException`s with HDFS's messages (`Permission denied:
+user=bob, access=WRITE, inode="/data":alice:staff:drwxr-x---`). With
+SIMPLE authentication (no Kerberos) callers name themselves, so
+permissions guard against mistakes, not attackers, as in HDFS; gRPC
+ClientProtocol callers (no Kerberos) act as `hdfs`.
+
+What security does **not** cover yet: ACLs, proxy users (impersonation is
+refused), and data transfer encryption (`dfs.encrypt.data.transfer`,
+`dfs.data.transfer.protection`). Permission checks run before an
+operation rather than under one namespace lock, so a concurrent chmod can
+race an operation that already passed its check.
 
 Not supported yet: block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA

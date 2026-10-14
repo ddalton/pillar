@@ -7,6 +7,7 @@
 # live in <dir>. Principals, each with a keytab in <dir>:
 #   nn/localhost   the NameNode        (nn.keytab)
 #   dn/localhost   every DataNode      (dn.keytab)
+#   hdfs           the HDFS superuser  (hdfs.keytab)
 #   alice, bob     users               (alice.keytab, bob.keytab)
 # Needs MIT krb5's krb5kdc, kdb5_util and kadmin.local (Debian/Ubuntu:
 # krb5-kdc krb5-admin-server; macOS: brew install krb5). Stop it with
@@ -68,7 +69,7 @@ k() {
         echo "kadmin.local -q '$*' failed:" >&2; echo "$out" >&2; exit 1
     fi
 }
-for p in nn/localhost dn/localhost alice bob; do
+for p in nn/localhost dn/localhost hdfs alice bob; do
     k addprinc -randkey "$p"
     k ktadd -k "$DIR/$(echo "$p" | cut -d/ -f1).keytab" "$p"
 done
