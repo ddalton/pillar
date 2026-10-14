@@ -67,6 +67,14 @@ struct Args {
     #[clap(long, default_value = "128")]
     rdma_queue_depth: u32,
 
+    /// Kerberos keytab for the IPC port (with --kerberos-principal).
+    #[clap(long)]
+    kerberos_keytab: Option<std::path::PathBuf>,
+
+    /// The DataNode's Kerberos principal, dn/<host>@<REALM>.
+    #[clap(long)]
+    kerberos_principal: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -113,6 +121,12 @@ async fn main() -> Result<()> {
     config.volume_mount_point = args.volume_mount_point;
     config.block_pool_id = args.block_pool_id;
     config.transport = args.transport;
+    if args.kerberos_keytab.is_some() {
+        config.kerberos_keytab = args.kerberos_keytab;
+    }
+    if args.kerberos_principal.is_some() {
+        config.kerberos_principal = args.kerberos_principal;
+    }
 
     #[cfg(feature = "rdma")]
     {

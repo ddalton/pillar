@@ -17,6 +17,8 @@ dashmap = { workspace = true }
 pillar-proto = { path = "../pillar-proto" }
 prost = { workspace = true }
 async-trait = { workspace = true }
+# Kerberos (SASL GSSAPI) for Hadoop IPC
+krb5 = "0.5"
 
 # Checksums
 sha2 = { workspace = true }

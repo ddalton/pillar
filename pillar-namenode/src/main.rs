@@ -49,6 +49,14 @@ struct Args {
     #[clap(long)]
     cluster_id: Option<String>,
 
+    /// Kerberos keytab for Hadoop IPC clients (with --kerberos-principal).
+    #[clap(long)]
+    kerberos_keytab: Option<std::path::PathBuf>,
+
+    /// The NameNode's Kerberos principal, nn/<host>@<REALM>.
+    #[clap(long)]
+    kerberos_principal: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -89,6 +97,12 @@ async fn main() -> Result<()> {
     }
     if args.cluster_id.is_some() {
         config.cluster_id = args.cluster_id;
+    }
+    if args.kerberos_keytab.is_some() {
+        config.kerberos_keytab = args.kerberos_keytab;
+    }
+    if args.kerberos_principal.is_some() {
+        config.kerberos_principal = args.kerberos_principal;
     }
 
     info!("Configuration loaded from environment and CLI arguments");

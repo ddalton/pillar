@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use prost::Message;
 use tokio::net::TcpListener;
 
-use pillar_common::ipc::{RpcError, RpcHandler};
+use pillar_common::ipc::{Authentication, RpcError, RpcHandler};
 use pillar_proto::hdfs::{GetReplicaVisibleLengthRequestProto, GetReplicaVisibleLengthResponseProto};
 
 use crate::storage::BlockStorage;
@@ -24,11 +24,12 @@ pub const CLIENT_DATANODE_PROTOCOL: &str = "org.apache.hadoop.hdfs.protocol.Clie
 
 pub struct ClientDatanodeProtocol {
     storage: Arc<BlockStorage>,
+    auth: Authentication,
 }
 
 impl ClientDatanodeProtocol {
-    pub fn new(storage: Arc<BlockStorage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<BlockStorage>, auth: Authentication) -> Self {
+        Self { storage, auth }
     }
 
     /// HDFS `getReplicaVisibleLength`: all of a finalized replica, the
@@ -62,6 +63,10 @@ impl RpcHandler for ClientDatanodeProtocol {
         CLIENT_DATANODE_PROTOCOL
     }
 
+    fn authentication(&self) -> &Authentication {
+        &self.auth
+    }
+
     async fn call(&self, method: &str, body: &[u8], _user: &str) -> Result<Vec<u8>, RpcError> {
         match method {
             "getReplicaVisibleLength" => self.replica_visible_length(body),
@@ -70,10 +75,11 @@ impl RpcHandler for ClientDatanodeProtocol {
     }
 }
 
-/// Bind `addr` and serve `ClientDatanodeProtocol` on it in the background.
-pub async fn serve(addr: SocketAddr, storage: Arc<BlockStorage>) -> std::io::Result<SocketAddr> {
+/// Bind `addr` and serve `ClientDatanodeProtocol` on it in the background,
+/// authenticating callers by `auth`.
+pub async fn serve(addr: SocketAddr, storage: Arc<BlockStorage>, auth: Authentication) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    tokio::spawn(pillar_common::ipc::serve(listener, Arc::new(ClientDatanodeProtocol::new(storage))));
+    tokio::spawn(pillar_common::ipc::serve(listener, Arc::new(ClientDatanodeProtocol::new(storage, auth))));
     Ok(bound)
 }

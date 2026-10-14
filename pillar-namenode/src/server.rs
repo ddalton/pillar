@@ -53,6 +53,11 @@ pub struct NameNodeConfig {
     /// `namenode -format -clusterid`); must match an existing one.
     pub cluster_id: Option<String>,
 
+    /// Kerberos for Hadoop IPC clients: the keytab and the NameNode's
+    /// principal (`nn/<host>@<REALM>`). Without them, SIMPLE.
+    pub kerberos_keytab: Option<PathBuf>,
+    pub kerberos_principal: Option<String>,
+
     /// A DataNode silent this long is stale, and this long dead (HDFS
     /// defaults: 30 s, 10.5 min).
     pub datanode_stale_interval: std::time::Duration,
@@ -80,6 +85,8 @@ impl Default for NameNodeConfig {
             checkpoint_txns: 1_000_000,
             checkpoint_period: std::time::Duration::from_secs(3600),
             cluster_id: None,
+            kerberos_keytab: None,
+            kerberos_principal: None,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
             lease_soft_limit: crate::metadata::lease_manager::DEFAULT_SOFT_LIMIT,
@@ -128,6 +135,13 @@ impl NameNodeConfig {
             if !val.is_empty() {
                 config.name_dir = Some(PathBuf::from(val));
             }
+        }
+
+        if let Ok(val) = env::var("NAMENODE_KERBEROS_KEYTAB") {
+            config.kerberos_keytab = Some(PathBuf::from(val));
+        }
+        if let Ok(val) = env::var("NAMENODE_KERBEROS_PRINCIPAL") {
+            config.kerberos_principal = Some(val);
         }
 
         if let Ok(val) = env::var("NAMENODE_HANDLER_COUNT") {
@@ -332,7 +346,19 @@ impl NameNode {
         let datanode_proto_server = DatanodeProtocolServer::new(datanode_service_arc);
 
         info!("Starting RPC server (Hadoop IPC + gRPC) on {}", self.config.rpc_addr);
-        let incoming = crate::ipc::bind_shared(self.config.rpc_addr, ipc_server).await?;
+        let auth = match (&self.config.kerberos_keytab, &self.config.kerberos_principal) {
+            (Some(keytab), Some(principal)) => crate::ipc::Authentication::Kerberos(
+                crate::ipc::KerberosServer::new(keytab, principal)
+                    .map_err(|e| anyhow::anyhow!("Kerberos: {}", e))?,
+            ),
+            (None, None) => crate::ipc::Authentication::Simple,
+            _ => anyhow::bail!("Kerberos needs both a keytab and a principal"),
+        };
+        let kerberos = matches!(auth, crate::ipc::Authentication::Kerberos(_));
+        let incoming = crate::ipc::bind_shared_with(self.config.rpc_addr, ipc_server, Arc::new(auth)).await?;
+        // ClientProtocol over gRPC has no authentication: with Kerberos on,
+        // clients must come through Hadoop IPC.
+        let client_grpc = (!kerberos).then(|| ClientNamenodeProtoServer::new(client_proto_server));
 
         // Build server with performance optimizations
         let server = tonic::transport::Server::builder()
@@ -350,8 +376,8 @@ impl NameNode {
             .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
             .http2_adaptive_window(Some(true))
             // Add services
-            .add_service(ClientNamenodeProtoServer::new(client_proto_server))
             .add_service(DatanodeProtoServer::new(datanode_proto_server))
+            .add_optional_service(client_grpc)
             .serve_with_incoming_shutdown(incoming, async {
                 tokio::signal::ctrl_c().await.ok();
                 info!("Shutdown signal received");
