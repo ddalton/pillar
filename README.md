@@ -411,9 +411,16 @@ authentication: Kerberos callers through the GSSAPI security layer (RFC
 so is a client that asks for less than the server requires ("No common
 protection layer"). The Java client sets the same `hadoop.rpc.protection`.
 
-What security does **not** cover yet: the DataNode-to-NameNode gRPC calls
-are authenticated, not protected (`--rpc-protection` applies to Hadoop
-IPC). Permissions are recorded but not enforced. There are no proxy-user
+The DataNode-to-NameNode gRPC calls follow the same `--rpc-protection`:
+with `integrity` or `privacy` each call's body is an RFC 4121 Wrap token
+under the call's own Kerberos subkey (from its AP-REQ), sealed for privacy,
+and so is the reply, gRPC status included. Only the NameNode can read the
+subkey, so a reply that unwraps proves it came from the NameNode. A
+DataNode asks for the strongest level of its own `--rpc-protection`; the
+NameNode refuses a level it does not allow.
+
+What security does **not** cover yet: permissions are recorded but not
+enforced. There are no proxy-user
 rules. Data transfer encryption (`dfs.encrypt.data.transfer`,
 `dfs.data.transfer.protection`) is not offered.
 

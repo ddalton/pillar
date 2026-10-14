@@ -22,6 +22,9 @@ krb5 = "0.5"
 tonic = { workspace = true }
 tower = { workspace = true }
 http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tokio-stream = { workspace = true }
 # Block access tokens (HMAC-SHA1) and their SASL DIGEST-MD5 use
 hmac = "0.12"
 sha1 = "0.10"

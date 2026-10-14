@@ -422,7 +422,7 @@ impl DataNode {
                 format!("nn/{}@{}", host, realm)
             });
             let kerberos = Arc::new(
-                pillar_common::grpc_auth::KerberosClient::new(keytab, principal, &service)
+                pillar_common::grpc_auth::KerberosClient::new(keytab, principal, &service, &config.rpc_protection)
                     .map_err(|e| anyhow::anyhow!("Kerberos to the NameNode: {}", e))?,
             );
             kerberos.clone().spawn_refresher();
