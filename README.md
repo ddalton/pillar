@@ -322,9 +322,23 @@ or with `CreateFlag.NEW_BLOCK`. Extending a partially filled last block is
 refused with `UnsupportedOperationException` (hdfs-native then retries
 with a new block).
 
+**Leases.** A file is open for writing from `create` (or `append`) until
+`complete`, by one client at a time: other writers get
+`AlreadyBeingCreatedException`, and write calls from a client that lost
+its lease get `LeaseExpiredException`. Readers see an open file's finished
+blocks. Clients renew their lease (`renewLease`); after the soft limit
+(60 s) another client may take the file over, and after the hard limit
+(20 min) the NameNode recovers it. `recoverLease`, `isFileClosed` and
+`listOpenFiles` work. Open files survive a NameNode restart, and their
+writers get a fresh lease. Recovery keeps the blocks DataNodes finished and
+drops a last block none of them finished, whose data was never
+acknowledged (without hflush, a writer's partial last block is not
+durable). Unlike HDFS, it also drops a finished last block whose every
+replica holder is offline at the time; DataNode-side block recovery is not
+implemented yet.
+
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
-leases and files under construction, hflush/hsync, pipeline recovery after
-a DataNode fails mid-write, block checksum (`-checksum`), short-circuit
+hflush/hsync, pipeline recovery after a DataNode fails mid-write, block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with
 `UnsupportedOperationException` rather than pretending to succeed.

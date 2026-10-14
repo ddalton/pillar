@@ -21,6 +21,18 @@
 
 pub mod dispatch;
 
+/// Metadata key naming the Java exception a Status stands for, when no
+/// status code maps to it (see [`hadoop_status`]).
+const EXCEPTION_KEY: &str = "x-hadoop-exception";
+
+/// A Status that Hadoop IPC clients receive as the Java exception `class`
+/// (e.g. `org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException`).
+pub fn hadoop_status(code: tonic::Code, class: &'static str, message: impl Into<String>) -> tonic::Status {
+    let mut s = tonic::Status::new(code, message);
+    s.metadata_mut().insert(EXCEPTION_KEY, tonic::metadata::MetadataValue::from_static(class));
+    s
+}
+
 /// The effective user of the Hadoop IPC connection a request came in on
 /// (from its connection context; SIMPLE auth), attached to every request's
 /// extensions.
@@ -91,6 +103,9 @@ impl RpcError {
     pub fn from_status(s: tonic::Status) -> Self {
         use tonic::Code;
         let msg = s.message();
+        if let Some(class) = s.metadata().get(EXCEPTION_KEY).and_then(|v| v.to_str().ok()) {
+            return Self::new(class, msg, RpcErrorCodeProto::ErrorApplication);
+        }
         let lower = msg.to_ascii_lowercase();
         let class = match s.code() {
             Code::NotFound => "java.io.FileNotFoundException",

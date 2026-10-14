@@ -1,0 +1,29 @@
+# Streams 1 MiB every 0.3 s into one HDFS file, until it is killed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+  - name: writer
+    image: apache/hadoop:3.3.6
+    command:
+    - bash
+    - -c
+    - |
+      while true; do head -c 1048576 /dev/urandom; sleep 0.3; done | hdfs dfs -put -d - /stream.bin
+    env:
+    - name: HADOOP_USER_NAME
+      value: hdfs
+    volumeMounts:
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/core-site.xml
+      subPath: core-site.xml
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/hdfs-site.xml
+      subPath: hdfs-site.xml
+  volumes:
+  - name: conf
+    configMap:
+      name: hadoop-client-conf

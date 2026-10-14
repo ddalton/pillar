@@ -52,6 +52,11 @@ pub struct NameNodeConfig {
     /// Cluster id to format a new name directory with (HDFS
     /// `namenode -format -clusterid`); must match an existing one.
     pub cluster_id: Option<String>,
+
+    /// Write leases: another client may take an open file over after the
+    /// soft limit; the NameNode recovers it after the hard limit.
+    pub lease_soft_limit: std::time::Duration,
+    pub lease_hard_limit: std::time::Duration,
 }
 
 impl Default for NameNodeConfig {
@@ -70,6 +75,8 @@ impl Default for NameNodeConfig {
             checkpoint_txns: 1_000_000,
             checkpoint_period: std::time::Duration::from_secs(3600),
             cluster_id: None,
+            lease_soft_limit: crate::metadata::lease_manager::DEFAULT_SOFT_LIMIT,
+            lease_hard_limit: crate::metadata::lease_manager::DEFAULT_HARD_LIMIT,
         }
     }
 }
@@ -239,7 +246,15 @@ impl NameNode {
         )
         .with_edit_log(self.edit_log.clone())
         .with_defaults(self.config.default_block_size, self.config.default_replication)
-        .with_block_pool_id(self.identity.block_pool_id.clone());
+        .with_block_pool_id(self.identity.block_pool_id.clone())
+        .with_leases(Arc::new(crate::metadata::lease_manager::LeaseManager::new(
+            self.config.lease_soft_limit,
+            self.config.lease_hard_limit,
+        )));
+        let open = client_service.restore_leases().await;
+        if open > 0 {
+            info!("{} files are open for writing; their writers have {:?} to renew", open, self.config.lease_hard_limit);
+        }
 
         if self.edit_log.is_durable() {
             tokio::spawn(run_checkpoints(
@@ -269,6 +284,19 @@ impl NameNode {
 
         // Wrap services in Arc for the gRPC implementation
         let client_service_arc = Arc::new(client_service);
+
+        // Lease monitor (HDFS LeaseManager.Monitor): recover files whose
+        // writer stopped renewing past the hard limit.
+        tokio::spawn({
+            let service = client_service_arc.clone();
+            async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+                    service.check_leases().await;
+                }
+            }
+        });
         let datanode_service_arc = Arc::new(datanode_service);
 
         // Replication monitor: dead DataNodes and under-replicated blocks

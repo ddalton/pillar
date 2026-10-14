@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lease-recovery
+spec:
+  description: >-
+    A writer pod streaming into a file is force-killed mid-file. The file
+    stays open (listOpenFiles shows it, another client cannot overwrite
+    it) until hdfs debug recoverLease closes it, keeping exactly the blocks
+    the DataNodes finished.
+  steps:
+  - name: cluster
+    try:
+    - apply:
+        file: ../../common/pillar-cluster.yaml
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+  - name: write-then-die
+    try:
+    - apply:
+        file: writer.yaml
+    - script:
+        content: |
+          set -eu
+          # Wait for at least three finished 1 MiB blocks.
+          for _ in $(seq 90); do
+            n=$(kubectl -n "$NAMESPACE" exec hadoop-client -- hdfs dfs -stat %b /stream.bin 2>/dev/null || echo 0)
+            [ "$n" -ge 3145728 ] && break
+            sleep 2
+          done
+          echo "finished bytes before the kill: $n"
+          [ "$n" -ge 3145728 ] || { echo "FAIL: the writer made no progress"; exit 1; }
+          kubectl -n "$NAMESPACE" delete pod writer --grace-period=0 --force --wait=true
+  - name: open-until-recovered
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          fails() { if "$@"; then echo "FAIL: succeeded: $*"; exit 1; fi; }
+          hdfs dfsadmin -listOpenFiles | tee /dev/stderr | grep -q /stream.bin
+          # Another client cannot overwrite a file someone holds open.
+          echo x | fails hdfs dfs -put -f -d - /stream.bin
+          hdfs debug recoverLease -path /stream.bin -retries 3 | tee /dev/stderr | grep -q SUCCEEDED
+          fails bash -c 'hdfs dfsadmin -listOpenFiles | grep -q /stream.bin'
+          # Whole finished blocks only, every byte readable.
+          len=$(hdfs dfs -stat %b /stream.bin)
+          [ $((len % 1048576)) -eq 0 ] && [ "$len" -ge 3145728 ]
+          [ "$(hdfs dfs -cat /stream.bin | wc -c)" -eq "$len" ]
+          # Closed: it can be written again.
+          echo again | hdfs dfs -appendToFile - /stream.bin
+          [ "$(hdfs dfs -stat %b /stream.bin)" -eq $((len + 6)) ]
+          echo PASS
+          SCRIPT

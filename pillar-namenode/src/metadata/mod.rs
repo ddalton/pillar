@@ -2,6 +2,7 @@ pub mod namespace;
 pub mod block_manager;
 pub mod persistence;
 pub mod edit_log;
+pub mod lease_manager;
 pub mod etcd_store;
 
 pub use namespace::Namespace;

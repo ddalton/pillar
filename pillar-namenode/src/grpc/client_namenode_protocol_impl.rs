@@ -80,7 +80,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                             storage_policy: Some(0),
                             ec_policy: None,
                             flags: Some(0),
-                            file_id: Some(0),
+                            file_id: Some(file_info.file_id),
                             children_num: Some(0),
                             file_encryption_info: None,
                             locations: None,
@@ -151,10 +151,11 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 block_size,
                 req.create_parent,
                 overwrite,
+                &req.client_name,
             )
             .await
         {
-            Ok(_) => Ok(Response::new(CreateResponseProto {
+            Ok(file_id) => Ok(Response::new(CreateResponseProto {
                 fs: Some(HdfsFileStatusProto {
                     file_type: hdfs_file_status_proto::FileType::IsFile as i32,
                     path: path.into(),
@@ -173,7 +174,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                     storage_policy: Some(0),
                     ec_policy: None,
                     flags: Some(0),
-                    file_id: Some(0),
+                    file_id: Some(file_id),
                     children_num: Some(0),
                     file_encryption_info: None,
                     locations: None,
@@ -260,10 +261,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         info!("add_block: {}", path);
 
         if let Some(prev) = &req.previous {
-            self.service.handle_commit_block(&path, prev.block_id, prev.num_bytes.unwrap_or(0)).await?;
+            self.service.handle_commit_block_as(&path, prev.block_id, prev.num_bytes.unwrap_or(0), &req.client_name).await?;
         }
 
-        match self.service.handle_add_block(&path).await {
+        match self.service.handle_add_block_as(&path, &req.client_name).await {
             Ok(block) => {
                 let response = AddBlockResponseProto {
                     block: fill_storages(LocatedBlockProto {
@@ -333,10 +334,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         info!("complete: {}", path);
 
         if let Some(last) = &req.last {
-            self.service.handle_commit_block(&path, last.block_id, last.num_bytes.unwrap_or(0)).await?;
+            self.service.handle_commit_block_as(&path, last.block_id, last.num_bytes.unwrap_or(0), &req.client_name).await?;
         }
 
-        match self.service.handle_complete(&path).await {
+        match self.service.handle_complete_as(&path, &req.client_name).await {
             Ok(result) => Ok(Response::new(CompleteResponseProto { result })),
             Err(e) => Err(e),
         }
@@ -387,9 +388,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
     /// Renew lease (for write locks)
     async fn renew_lease(
         &self,
-        _request: Request<RenewLeaseRequestProto>,
+        request: Request<RenewLeaseRequestProto>,
     ) -> Result<Response<RenewLeaseResponseProto>, Status> {
-        // Simplified implementation - lease management
+        self.service.handle_renew_lease(&request.into_inner().client_name);
         Ok(Response::new(RenewLeaseResponseProto {}))
     }
 
@@ -474,11 +475,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn is_file_closed(
         &self,
-        _request: Request<IsFileClosedRequestProto>,
+        request: Request<IsFileClosedRequestProto>,
     ) -> Result<Response<IsFileClosedResponseProto>, Status> {
-        Ok(Response::new(IsFileClosedResponseProto {
-            result: true,
-        }))
+        let result = self.service.handle_is_file_closed(&request.into_inner().src).await?;
+        Ok(Response::new(IsFileClosedResponseProto { result }))
     }
 
     async fn get_content_summary(
@@ -515,7 +515,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         info!("append: {} (new_block={})", req.src, new_block);
         // Always a new block: no last block to extend, so the client's next
         // call is addBlock.
-        self.service.handle_append(&req.src, new_block).await?;
+        self.service.handle_append_as(&req.src, new_block, &req.client_name).await?;
         let stat = file_status_proto(self.service.handle_get_file_info(&req.src).await?, req.src);
         Ok(Response::new(AppendResponseProto { block: None, stat: Some(stat) }))
     }
@@ -530,7 +530,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         info!("abandon_block: {} block_id={}", path, block.block_id);
 
-        self.service.handle_abandon_block(&path, block.block_id).await?;
+        self.service.handle_abandon_block_as(&path, block.block_id, &req.holder).await?;
 
         Ok(Response::new(AbandonBlockResponseProto {}))
     }
@@ -640,9 +640,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         );
 
         // Update block with new generation stamp
-        let located_block = self.service.handle_update_block_for_pipeline(
+        let located_block = self.service.handle_update_block_for_pipeline_as(
             block.block_id,
             block.generation_stamp,
+            &req.client_name,
         ).await?;
 
         // Convert to proto
@@ -979,9 +980,35 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn list_open_files(
         &self,
-        _request: Request<ListOpenFilesRequestProto>,
+        request: Request<ListOpenFilesRequestProto>,
     ) -> Result<Response<ListOpenFilesResponseProto>, Status> {
-        Err(Status::unimplemented("List open files not supported"))
+        // Batches are keyed by inode id: return those after `id`, under
+        // `path` if given, 1000 at a time (HDFS dfs.namenode.list.openfiles.num.responses).
+        let req = request.into_inner();
+        let prefix = req.path.filter(|p| !p.is_empty() && p != "/");
+        let mut files: Vec<_> = self
+            .service
+            .handle_list_open_files()
+            .await
+            .into_iter()
+            .filter(|(id, path, _)| {
+                *id as i64 > req.id
+                    && prefix.as_ref().is_none_or(|p| path == p || path.starts_with(&format!("{}/", p.trim_end_matches('/'))))
+            })
+            .collect();
+        files.sort();
+        let has_more = files.len() > 1000;
+        files.truncate(1000);
+        let entries = files
+            .into_iter()
+            .map(|(id, path, client_name)| OpenFilesBatchResponseProto {
+                id: id as i64,
+                path,
+                client_name,
+                client_machine: String::new(),
+            })
+            .collect();
+        Ok(Response::new(ListOpenFilesResponseProto { entries, has_more, types: req.types }))
     }
 
     async fn msync(
@@ -1485,7 +1512,7 @@ fn file_status_proto(info: crate::grpc::client_namenode_service::FileInfo, path:
         storage_policy: Some(0),
         ec_policy: None,
         flags: Some(0),
-        file_id: Some(0),
+        file_id: Some(info.file_id),
         children_num: Some(0),
         file_encryption_info: None,
         locations: None,

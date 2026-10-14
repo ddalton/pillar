@@ -145,6 +145,29 @@ public class HdfsInterop {
         check(got.length == head.length + 8 && Arrays.equals(Arrays.copyOf(got, head.length), head)
               && new String(got, head.length, 8).equals("tailmore"), "append with NEW_BLOCK; content intact");
 
+        // Leases: one writer at a time; recoverLease takes a file from a
+        // writer that is gone.
+        DistributedFileSystem dfs = (DistributedFileSystem) fs;
+        Path lp = new Path("/java/leased.bin");
+        FSDataOutputStream held = fs.create(lp);
+        held.write(new byte[1000]);   // buffered: no block allocated yet
+        check(!dfs.isFileClosed(lp), "isFileClosed is false while the file is being written");
+        long id1 = dfs.getClient().getFileInfo(lp.toString()).getFileId();
+        long id2 = dfs.getClient().getFileInfo("/java/put.txt").getFileId();
+        check(id1 > 0 && id2 > 0 && id1 != id2, "files have distinct, non-zero file ids (" + id1 + ", " + id2 + ")");
+        FileSystem other = FileSystem.newInstance(fs.getUri(), conf);   // another client name
+        boolean refused2 = false;
+        try { other.create(lp, true).close(); }
+        catch (java.io.IOException e) { refused2 = e.toString().contains("AlreadyBeingCreatedException"); }
+        check(refused2, "a second client cannot create a file another client is writing");
+        check(((DistributedFileSystem) other).recoverLease(lp), "recoverLease by the second client");
+        check(dfs.isFileClosed(lp), "the file is closed after recoverLease");
+        boolean lost = false;
+        try { held.close(); }
+        catch (java.io.IOException e) { lost = e.toString().contains("LeaseExpiredException"); }
+        check(lost, "the first writer has lost its lease (LeaseExpiredException on close)");
+        other.close();
+
         check(fs.delete(new Path("/java"), true), "recursive delete");
         check(!fs.exists(new Path("/java")), "gone after delete");
 

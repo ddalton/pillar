@@ -20,7 +20,7 @@ use pillar_datanode::storage::{BlockStorage, VolumeManager};
 use pillar_datanode::transport::tcp::TcpTransport;
 use pillar_datanode::transport::DataTransport;
 use pillar_namenode::datanode::DatanodeManager;
-use pillar_namenode::metadata::BlockManager;
+use pillar_namenode::metadata::{BlockManager, Namespace};
 use pillar_namenode::{NameNode, NameNodeConfig};
 use tempfile::TempDir;
 
@@ -37,26 +37,32 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 /// A NameNode on its own runtime, plus handles to inspect it.
 struct RunningNameNode {
     rt: tokio::runtime::Runtime,
+    namespace: Arc<Namespace>,
     blocks: Arc<BlockManager>,
     datanodes: Arc<DatanodeManager>,
 }
 
 async fn start_namenode(addr: SocketAddr, name_dir: &Path) -> RunningNameNode {
+    start_namenode_with(addr, name_dir, NameNodeConfig::default()).await
+}
+
+/// `base` supplies everything but the addresses, etcd and name directory.
+async fn start_namenode_with(addr: SocketAddr, name_dir: &Path, base: NameNodeConfig) -> RunningNameNode {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let config = NameNodeConfig {
         rpc_addr: addr,
         http_addr: free_addr(),
         etcd_endpoints: vec!["none".into()],
         name_dir: Some(PathBuf::from(name_dir)),
-        ..Default::default()
+        ..base
     };
     let nn = Arc::new(rt.spawn(NameNode::new(config)).await.unwrap().unwrap());
-    let (blocks, datanodes) = (nn.block_manager(), nn.datanode_manager());
+    let (namespace, blocks, datanodes) = (nn.namespace(), nn.block_manager(), nn.datanode_manager());
     // Only the runtime holds the NameNode, so shutting it down frees all.
     rt.spawn(async move {
         nn.start().await.unwrap();
     });
-    RunningNameNode { rt, blocks, datanodes }
+    RunningNameNode { rt, namespace, blocks, datanodes }
 }
 
 impl RunningNameNode {
@@ -239,5 +245,70 @@ async fn datanodes_refuse_a_namenode_with_another_identity() {
     assert_eq!(read(&client(nn_addr), "/precious.bin").await, data);
     let after: Vec<usize> = dns.iter().map(|(_, s)| s.get_block_count()).collect();
     assert_eq!(after, per_dn);
+    nn.crash().await;
+}
+
+/// A writer that dies without closing leaves its file open. The open state
+/// survives a NameNode crash (the holder's lease is restored), and once the
+/// hard limit passes without renewals the NameNode recovers the file: the
+/// blocks DataNodes finished are kept, the half-written last one dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_writers_file_is_recovered_even_across_a_restart() {
+    let leases = || NameNodeConfig {
+        lease_soft_limit: Duration::from_millis(500),
+        lease_hard_limit: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let name_dir = TempDir::new().unwrap();
+    let nn_addr = free_addr();
+    let nn = start_namenode_with(nn_addr, name_dir.path(), leases()).await;
+    let _dns = start_datanodes(nn_addr, 3).await;
+    eventually("three live DataNodes", || nn.datanodes.get_live_datanodes().len() == 3).await;
+
+    let is_open = |ns: Arc<Namespace>| async move {
+        ns.lookup("/open.bin").await.unwrap().read().await.under_construction.clone()
+    };
+    let data = pattern(5 * MB / 2, 0x31);
+    {
+        let writer = client(nn_addr);
+        let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(3), ..Default::default() };
+        let mut w = writer.create("/open.bin", opts).await.unwrap();
+        w.write_bytes(Bytes::from(data.clone())).await.unwrap();
+        // The first two blocks are full: the DataNodes finish and report them.
+        eventually("two finished blocks", || {
+            nn.blocks.blocks_snapshot().iter().filter(|(_, _, _, h)| h.len() == 3).count() >= 2
+        })
+        .await;
+        // The writer dies: no close(), no more renewals.
+        drop(w);
+        drop(writer);
+    }
+    let holder = is_open(nn.namespace.clone()).await.expect("open while its writer is alive").holder;
+
+    nn.crash().await;
+    let nn = start_namenode_with(nn_addr, name_dir.path(), leases()).await;
+    let reopened = is_open(nn.namespace.clone()).await.expect("still open after the restart");
+    assert_eq!(reopened.holder, holder);
+
+    // The lease monitor recovers it once the restored lease passes the hard limit.
+    let mut closed = false;
+    for _ in 0..100 {
+        if is_open(nn.namespace.clone()).await.is_none() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(closed, "the file was never recovered");
+    eventually("DataNodes re-register", || nn.datanodes.get_live_datanodes().len() == 3).await;
+    let fs = client(nn_addr);
+    let back = read(&fs, "/open.bin").await;
+    assert_eq!(back.len(), 2 * MB, "the two finished blocks, without the unfinished one");
+    assert!(back[..] == data[..2 * MB]);
+    // Closed: anyone may append now.
+    let mut w = fs.append("/open.bin").await.unwrap();
+    w.write_bytes(Bytes::from_static(b"after recovery")).await.unwrap();
+    w.close().await.unwrap();
+    assert_eq!(read(&fs, "/open.bin").await.len(), 2 * MB + 14);
     nn.crash().await;
 }
