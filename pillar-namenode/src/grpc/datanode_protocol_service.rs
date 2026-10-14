@@ -136,6 +136,11 @@ impl DatanodeProtocolService {
         Ok(commands)
     }
 
+    /// See [`BlockManager::drop_corrupt_replica`].
+    pub fn drop_corrupt_replica(&self, block: &BlockId, uuid: &str) -> bool {
+        self.block_manager.drop_corrupt_replica(block, uuid)
+    }
+
     /// Queue a command for `uuid`'s next heartbeat.
     pub fn queue_command(&self, uuid: &str, command: DatanodeCommand) {
         self.pending_commands.entry(uuid.to_string()).or_default().push(command);

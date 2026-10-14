@@ -118,6 +118,45 @@ pub enum EditOp {
     SetBlocks { inode: u64, blocks: Vec<BlockInfo> },
     /// Move the sources' blocks to the end of `target`, then delete them.
     Concat { target: String, sources: Vec<String> },
+    /// setPermission / setOwner / setTimes / setReplication: the fields
+    /// that are `Some` change. (Appended last: postcard encodes the variant
+    /// index, so existing logs keep decoding.)
+    SetAttributes { path: String, attrs: InodeAttributes },
+}
+
+/// Attribute changes carried by [`EditOp::SetAttributes`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InodeAttributes {
+    pub permission: Option<u16>,
+    pub owner: Option<String>,
+    pub group: Option<String>,
+    pub mtime: Option<u64>,
+    pub atime: Option<u64>,
+    pub replication: Option<u16>,
+}
+
+impl InodeAttributes {
+    /// Apply to `inode` (replication only to files).
+    pub fn apply(&self, inode: &mut INode) {
+        if let Some(p) = self.permission {
+            inode.permissions = FsPermission::new(p);
+        }
+        if let Some(o) = &self.owner {
+            inode.owner = o.clone();
+        }
+        if let Some(g) = &self.group {
+            inode.group = g.clone();
+        }
+        if let Some(t) = self.mtime {
+            inode.mtime = t;
+        }
+        if let Some(t) = self.atime {
+            inode.atime = t;
+        }
+        if let (Some(r), false) = (self.replication, inode.is_dir) {
+            inode.replication = r;
+        }
+    }
 }
 
 /// Id allocators, persisted so ids are never reused after a restart (a
@@ -513,6 +552,10 @@ async fn apply(ns: &Namespace, op: &EditOp, counters: &mut Counters) -> Result<(
             }
             file(*inode)?.write().await.blocks = Some(blocks.clone());
         }
+        EditOp::SetAttributes { path, attrs } => {
+            let inode = ns.lookup(path).await.map_err(|e| e.to_string())?;
+            attrs.apply(&mut *inode.write().await);
+        }
         EditOp::Concat { target, sources } => {
             let t = ns.lookup(target).await.map_err(|e| e.to_string())?;
             for s in sources {
@@ -775,6 +818,17 @@ mod tests {
         let last = nn.ns.lookup("/a/t").await.unwrap().read().await.blocks.clone().unwrap()[1].clone();
         let bumped = svc.handle_update_block_for_pipeline(last.block_id, last.generation_stamp).await.unwrap();
         svc.handle_delete("/a/b", true).await.unwrap();
+        let attrs = InodeAttributes {
+            permission: Some(0o600),
+            owner: Some("alice".into()),
+            group: Some("eng".into()),
+            mtime: Some(1_000),
+            atime: Some(2_000),
+            replication: None,
+        };
+        svc.handle_set_attributes("/a/f", attrs).await.unwrap();
+        assert!(svc.handle_set_replication("/a/f", 2).await.unwrap());
+        assert!(!svc.handle_set_replication("/a", 2).await.unwrap(), "a directory has no replication");
         // complete() retries re-commit the same length; that logs nothing.
         let txid = nn.log.last_txid();
         svc.handle_commit_block("/a/t", last.block_id, 50).await.unwrap();
@@ -793,6 +847,11 @@ mod tests {
         let lens: Vec<u64> = f.read().await.blocks.as_ref().unwrap().iter().map(|b| b.num_bytes).collect();
         assert_eq!(lens, vec![100, 50, 7, 9, 4]);
         assert!(nn.ns.lookup("/a/s1").await.is_err() && nn.ns.lookup("/a/b").await.is_err());
+        {
+            let f = f.read().await;
+            assert_eq!((f.permissions.mode, f.owner.as_str(), f.group.as_str()), (0o600, "alice", "eng"));
+            assert_eq!((f.mtime, f.atime, f.replication), (1_000, 2_000, 2));
+        }
 
         // Ids are never reused, including the abandoned block's.
         assert!(Counters::of(&nn.ns, &nn.blocks).next_block_id >= counters.next_block_id);

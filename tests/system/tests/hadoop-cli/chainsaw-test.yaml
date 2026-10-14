@@ -6,7 +6,7 @@ metadata:
 spec:
   description: >-
     More of the hadoop fs command set, including the commands that must
-    fail. Not covered because Pillar does not implement them: -checksum,
+    fail, and setrep/chmod/chown taking effect. Not covered because Pillar does not implement them: -checksum,
     fsck and the NameNode web UI.
   steps:
   - name: cluster
@@ -45,7 +45,12 @@ spec:
           hdfs dfs -count /user/test | tee /dev/stderr | awk '{ exit !($1 == 3 && $2 == 1 && $3 == 13) }'
           hdfs dfs -du -s /user/test | tee /dev/stderr | awk '{ exit !($1 == 13) }'
           hdfs dfs -ls -R /user/test | grep -q moved.txt
-          hdfs dfs -setrep 3 /user/test/a/moved.txt
+          hdfs dfs -setrep 2 /user/test/a/moved.txt
+          [ "$(hdfs dfs -stat %r /user/test/a/moved.txt)" = 2 ]
+          hdfs dfs -chmod 640 /user/test/a/moved.txt
+          hdfs dfs -chown bob:eng /user/test/a/moved.txt
+          hdfs dfs -ls /user/test/a/moved.txt | tee /dev/stderr | grep -q -- '-rw-r-----   2 bob eng'
+          [ "$(hdfs dfs -stat %u:%g /user/test/a)" = hdfs:supergroup ]
           hdfs dfs -df / | tail -1
           hdfs dfs -rm -r -skipTrash /user/test/a
           fails hdfs dfs -test -e /user/test/a/b

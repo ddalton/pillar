@@ -5,6 +5,17 @@ use tracing::{info, warn, error};
 use pillar_proto::hadoop::hdfs::*;
 use crate::grpc::ClientNamenodeService;
 
+/// The user a request runs as: the Hadoop IPC connection's effective user
+/// (SIMPLE auth), or `hdfs` for gRPC callers, which carry none.
+fn caller<T>(request: &Request<T>) -> String {
+    request
+        .extensions()
+        .get::<crate::ipc::CallerUser>()
+        .map(|u| u.0.clone())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "hdfs".to_string())
+}
+
 /// gRPC service implementation for ClientNamenodeProtocol
 /// This implements the actual Hadoop wire protocol
 pub struct ClientNamenodeProtocolServer {
@@ -29,41 +40,8 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         info!("get_file_info: {}", path);
 
-        match self.service.handle_get_file_info(&path).await {
-            Ok(file_info) => {
-                let response = GetFileInfoResponseProto {
-                    fs: Some(HdfsFileStatusProto {
-                        file_type: if file_info.is_dir {
-                            hdfs_file_status_proto::FileType::IsDir as i32
-                        } else {
-                            hdfs_file_status_proto::FileType::IsFile as i32
-                        },
-                        path: path.into(),
-                        length: file_info.length,
-                        permission: FsPermissionProto {
-                            perm: file_info.permissions as u32,
-                        },
-                        owner: file_info.owner,
-                        group: file_info.group,
-                        modification_time: file_info.modification_time,
-                        access_time: file_info.access_time,
-                        symlink: None,
-                        block_replication: Some(file_info.replication as u32),
-                        blocksize: Some(file_info.block_size),
-                        storage_policy: Some(0),
-                        ec_policy: None,
-                        flags: Some(0),
-                        file_id: Some(0),
-                        children_num: Some(0),
-                        file_encryption_info: None,
-                        locations: None,
-                        namespace: None,
-                    }),
-                };
-                Ok(Response::new(response))
-            }
-            Err(e) => Err(e),
-        }
+        let file_info = self.service.handle_get_file_info(&path).await?;
+        Ok(Response::new(GetFileInfoResponseProto { fs: Some(file_status_proto(file_info, path)) }))
     }
 
     /// List directory contents
@@ -125,6 +103,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<MkdirsRequestProto>,
     ) -> Result<Response<MkdirsResponseProto>, Status> {
+        let owner = caller(&request);
         let req = request.into_inner();
         let path = req.src;
         let masked = req.masked;
@@ -134,7 +113,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         match self.service
             .handle_mkdirs(
                 &path,
-                "hdfs".to_string(), // Default owner, should come from auth context
+                owner,
                 "supergroup".to_string(),
                 masked.perm as u16,
                 req.create_parent,
@@ -151,6 +130,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<CreateRequestProto>,
     ) -> Result<Response<CreateResponseProto>, Status> {
+        let owner = caller(&request);
         let req = request.into_inner();
         let path = req.src;
         let masked = req.masked;
@@ -164,7 +144,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         match self.service
             .handle_create_with(
                 &path,
-                "hdfs".to_string(),
+                owner.clone(),
                 "supergroup".to_string(),
                 masked.perm as u16,
                 replication,
@@ -180,7 +160,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                     path: path.into(),
                     length: 0,
                     permission: masked,
-                    owner: "hdfs".to_string(),
+                    owner,
                     group: "supergroup".to_string(),
                     modification_time: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -256,9 +236,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         let located_blocks = LocatedBlocksProto {
             file_length: located.file_length,
-            blocks: located.blocks.into_iter().map(located_block_to_proto).collect(),
+            blocks: located.blocks.into_iter().map(|b| located_block_to_proto(b, self.service.block_pool_id())).collect(),
             under_construction: located.under_construction,
-            last_block: located.last_block.map(located_block_to_proto),
+            last_block: located.last_block.map(|b| located_block_to_proto(b, self.service.block_pool_id())),
             is_last_block_complete: located.is_last_block_complete,
             file_encryption_info: None,
             ec_policy: None,
@@ -288,7 +268,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 let response = AddBlockResponseProto {
                     block: fill_storages(LocatedBlockProto {
                         b: ExtendedBlockProto {
-                            pool_id: "BP-pillar-001".to_string(),
+                            pool_id: self.service.block_pool_id().to_string(),
                             block_id: block.block_id,
                             generation_stamp: block.generation_stamp,
                             num_bytes: Some(block.num_bytes),
@@ -365,27 +345,42 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
     /// Set replication factor for a file
     async fn set_replication(
         &self,
-        _request: Request<SetReplicationRequestProto>,
+        request: Request<SetReplicationRequestProto>,
     ) -> Result<Response<SetReplicationResponseProto>, Status> {
-        // Simplified implementation - would update file metadata
-        Ok(Response::new(SetReplicationResponseProto { result: true }))
+        let req = request.into_inner();
+        let result = self.service.handle_set_replication(&req.src, req.replication).await?;
+        Ok(Response::new(SetReplicationResponseProto { result }))
     }
 
     /// Set permissions
     async fn set_permission(
         &self,
-        _request: Request<SetPermissionRequestProto>,
+        request: Request<SetPermissionRequestProto>,
     ) -> Result<Response<SetPermissionResponseProto>, Status> {
-        // Simplified implementation
+        let req = request.into_inner();
+        let attrs = crate::metadata::edit_log::InodeAttributes {
+            permission: Some(req.permission.perm as u16),
+            ..Default::default()
+        };
+        self.service.handle_set_attributes(&req.src, attrs).await?;
         Ok(Response::new(SetPermissionResponseProto {}))
     }
 
     /// Set owner
     async fn set_owner(
         &self,
-        _request: Request<SetOwnerRequestProto>,
+        request: Request<SetOwnerRequestProto>,
     ) -> Result<Response<SetOwnerResponseProto>, Status> {
-        // Simplified implementation
+        let req = request.into_inner();
+        if req.username.is_none() && req.groupname.is_none() {
+            return Err(Status::invalid_argument("setOwner: neither user nor group given"));
+        }
+        let attrs = crate::metadata::edit_log::InodeAttributes {
+            owner: req.username,
+            group: req.groupname,
+            ..Default::default()
+        };
+        self.service.handle_set_attributes(&req.src, attrs).await?;
         Ok(Response::new(SetOwnerResponseProto {}))
     }
 
@@ -408,14 +403,15 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
     ) -> Result<Response<GetServerDefaultsResponseProto>, Status> {
         Ok(Response::new(GetServerDefaultsResponseProto {
             server_defaults: FsServerDefaultsProto {
-                block_size: 128 * 1024 * 1024, // 128 MB
+                block_size: self.service.default_block_size(),
                 bytes_per_checksum: 512,
                 write_packet_size: 64 * 1024,
-                replication: 3,
+                replication: self.service.default_replication() as u32,
                 file_buffer_size: 4096,
                 encrypt_data_transfer: Some(false),
                 trash_interval: Some(0),
-                checksum_type: Some(ChecksumTypeProto::ChecksumCrc32 as i32),
+                // HDFS's default (dfs.checksum.type); DataNodes accept CRC32 too.
+                checksum_type: Some(ChecksumTypeProto::ChecksumCrc32c as i32),
                 key_provider_uri: None,
                 policy_id: None,
                 snapshot_trash_root_enabled: Some(false),
@@ -447,11 +443,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn get_preferred_block_size(
         &self,
-        _request: Request<GetPreferredBlockSizeRequestProto>,
+        request: Request<GetPreferredBlockSizeRequestProto>,
     ) -> Result<Response<GetPreferredBlockSizeResponseProto>, Status> {
-        Ok(Response::new(GetPreferredBlockSizeResponseProto {
-            bsize: 128 * 1024 * 1024, // 128 MB
-        }))
+        let bsize = self.service.handle_preferred_block_size(&request.into_inner().filename).await?;
+        Ok(Response::new(GetPreferredBlockSizeResponseProto { bsize }))
     }
 
     async fn fsync(
@@ -463,8 +458,17 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn set_times(
         &self,
-        _request: Request<SetTimesRequestProto>,
+        request: Request<SetTimesRequestProto>,
     ) -> Result<Response<SetTimesResponseProto>, Status> {
+        let req = request.into_inner();
+        // -1 (all bits set on the wire) leaves a time unchanged.
+        let time = |t: u64| (t != u64::MAX).then_some(t);
+        let attrs = crate::metadata::edit_log::InodeAttributes {
+            mtime: time(req.mtime),
+            atime: time(req.atime),
+            ..Default::default()
+        };
+        self.service.handle_set_attributes(&req.src, attrs).await?;
         Ok(Response::new(SetTimesResponseProto {}))
     }
 
@@ -506,68 +510,14 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         request: Request<AppendRequestProto>,
     ) -> Result<Response<AppendResponseProto>, Status> {
         let req = request.into_inner();
-        let path = req.src;
-
-        info!("append: {}", path);
-
-        match self.service.handle_append(&path).await {
-            Ok(block) => {
-                let response = AppendResponseProto {
-                    block: Some(fill_storages(LocatedBlockProto {
-                        b: ExtendedBlockProto {
-                            pool_id: "BP-pillar-001".to_string(),
-                            block_id: block.block_id,
-                            generation_stamp: block.generation_stamp,
-                            num_bytes: Some(block.num_bytes),
-                        },
-                        offset: block.offset,
-                        locs: block.locations
-                            .into_iter()
-                            .map(|loc| DatanodeInfoProto {
-                                id: DatanodeIdProto {
-                                    ip_addr: loc.hostname.clone(),
-                                    host_name: loc.hostname,
-                                    datanode_uuid: loc.uuid,
-                                    xfer_port: loc.data_port as u32,
-                                    info_port: loc.http_port as u32,
-                                    ipc_port: loc.rpc_port as u32,
-                                    info_secure_port: Some(0),
-                                    supported_transports: loc.supported_transports,
-                                    rdma_port: Some(loc.rdma_port as u32),
-                                },
-                                capacity: Some(0),
-                                dfs_used: Some(0),
-                                remaining: Some(0),
-                                block_pool_used: Some(0),
-                                cache_capacity: Some(0),
-                                cache_used: Some(0),
-                                last_update: Some(0),
-                                last_update_monotonic: Some(0),
-                                xceiver_count: Some(0),
-                                location: None,
-                                non_dfs_used: Some(0),
-                                admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
-                                upgrade_domain: None,
-                                last_block_report_time: Some(0),
-                                last_block_report_monotonic: Some(0),
-                                num_blocks: Some(0),
-                                software_version: None,
-                            })
-                            .collect(),
-                        corrupt: false,
-                        block_token: Default::default(),
-                        is_cached: vec![],
-                        storage_types: vec![],
-                        storage_i_ds: vec![],
-                        block_indices: None,
-                        block_tokens: vec![],
-                    })),
-                    stat: None,
-                };
-                Ok(Response::new(response))
-            }
-            Err(e) => Err(e),
-        }
+        // CreateFlagProto NEW_BLOCK = 0x20.
+        let new_block = req.flag.unwrap_or(0) & 0x20 != 0;
+        info!("append: {} (new_block={})", req.src, new_block);
+        // Always a new block: no last block to extend, so the client's next
+        // call is addBlock.
+        self.service.handle_append(&req.src, new_block).await?;
+        let stat = file_status_proto(self.service.handle_get_file_info(&req.src).await?, req.src);
+        Ok(Response::new(AppendResponseProto { block: None, stat: Some(stat) }))
     }
 
     async fn abandon_block(
@@ -657,7 +607,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let response = GetAdditionalDatanodeResponseProto {
             block: fill_storages(LocatedBlockProto {
                 b: ExtendedBlockProto {
-                    pool_id: "BP-pillar-001".to_string(),
+                    pool_id: self.service.block_pool_id().to_string(),
                     block_id: located_block.block_id,
                     generation_stamp: located_block.generation_stamp,
                     num_bytes: Some(located_block.num_bytes),
@@ -733,7 +683,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let response = UpdateBlockForPipelineResponseProto {
             block: fill_storages(LocatedBlockProto {
                 b: ExtendedBlockProto {
-                    pool_id: "BP-pillar-001".to_string(),
+                    pool_id: self.service.block_pool_id().to_string(),
                     block_id: located_block.block_id,
                     generation_stamp: located_block.generation_stamp,
                     num_bytes: Some(located_block.num_bytes),
@@ -801,8 +751,18 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn report_bad_blocks(
         &self,
-        _request: Request<ReportBadBlocksRequestProto>,
+        request: Request<ReportBadBlocksRequestProto>,
     ) -> Result<Response<ReportBadBlocksResponseProto>, Status> {
+        let replicas: Vec<_> = request
+            .into_inner()
+            .blocks
+            .into_iter()
+            .flat_map(|lb| {
+                let block = crate::metadata::block_manager::BlockId::new(lb.b.block_id, lb.b.generation_stamp);
+                lb.locs.into_iter().map(move |dn| (block, dn.id.datanode_uuid))
+            })
+            .collect();
+        self.service.handle_report_bad_replicas(&replicas);
         Ok(Response::new(ReportBadBlocksResponseProto {}))
     }
 
@@ -891,61 +851,41 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         _request: Request<GetDatanodeReportRequestProto>,
     ) -> Result<Response<GetDatanodeReportResponseProto>, Status> {
-        info!("get_datanode_report called");
-
-        match self.service.handle_get_datanode_report().await {
-            Ok(report) => {
-                let datanode_infos = report
-                    .into_iter()
-                    .map(|dn| DatanodeInfoProto {
-                        id: DatanodeIdProto {
-                            ip_addr: dn.hostname.clone(),
-                            host_name: dn.hostname.clone(),
-                            datanode_uuid: dn.uuid,
-                            xfer_port: 9867,  // Default datanode port
-                            info_port: 50075, // Default http port
-                            ipc_port: 9867,
-                            info_secure_port: Some(0),
-                            supported_transports: dn.supported_transports,
-                            rdma_port: Some(dn.rdma_port as u32),
-                        },
-                        capacity: Some(dn.capacity),
-                        dfs_used: Some(dn.used),
-                        remaining: Some(dn.remaining),
-                        block_pool_used: Some(0),
-                        cache_capacity: Some(0),
-                        cache_used: Some(0),
-                        last_update: Some(dn.last_update),
-                        last_update_monotonic: Some(0),
-                        xceiver_count: Some(0),
-                        location: None,
-                        non_dfs_used: Some(0),
-                        admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
-                        upgrade_domain: None,
-                        last_block_report_time: Some(0),
-                        last_block_report_monotonic: Some(0),
-                        num_blocks: Some(dn.num_blocks),
-                        software_version: None,
-                    })
-                    .collect();
-
-                Ok(Response::new(GetDatanodeReportResponseProto {
-                    di: datanode_infos,
-                }))
-            }
-            Err(e) => Err(e),
-        }
+        let di = self.service.handle_get_datanode_report().await?.into_iter().map(datanode_report_proto).collect();
+        Ok(Response::new(GetDatanodeReportResponseProto { di }))
     }
 
     async fn get_datanode_storage_report(
         &self,
         _request: Request<GetDatanodeStorageReportRequestProto>,
     ) -> Result<Response<GetDatanodeStorageReportResponseProto>, Status> {
-        // Similar to get_datanode_report but with storage details
-        // For now, return empty - can be implemented similarly to get_datanode_report
-        Ok(Response::new(GetDatanodeStorageReportResponseProto {
-            datanode_storage_reports: vec![],
-        }))
+        // One storage per DataNode (its volume), keyed by the DataNode uuid.
+        let reports = self
+            .service
+            .handle_get_datanode_report()
+            .await?
+            .into_iter()
+            .map(|dn| {
+                let storage = StorageReportProto {
+                    #[allow(deprecated)]
+                    storage_uuid: dn.uuid.clone(),
+                    failed: Some(false),
+                    capacity: Some(dn.capacity),
+                    dfs_used: Some(dn.block_pool_used),
+                    remaining: Some(dn.remaining),
+                    block_pool_used: Some(dn.block_pool_used),
+                    storage: Some(DatanodeStorageProto {
+                        storage_uuid: dn.uuid.clone(),
+                        state: Some(0),        // NORMAL
+                        storage_type: Some(1), // DISK
+                    }),
+                    non_dfs_used: Some(dn.used.saturating_sub(dn.block_pool_used)),
+                    mount: None,
+                };
+                DatanodeStorageReportProto { datanode_info: datanode_report_proto(dn), storage_reports: vec![storage] }
+            })
+            .collect();
+        Ok(Response::new(GetDatanodeStorageReportResponseProto { datanode_storage_reports: reports }))
     }
 
     async fn set_safe_mode(
@@ -1365,8 +1305,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn check_access(
         &self,
-        _request: Request<CheckAccessRequestProto>,
+        request: Request<CheckAccessRequestProto>,
     ) -> Result<Response<CheckAccessResponseProto>, Status> {
+        self.service.handle_check_access(&request.into_inner().path).await?;
         Ok(Response::new(CheckAccessResponseProto {}))
     }
 
@@ -1512,9 +1453,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         _request: Request<GetCurrentEditLogTxidRequestProto>,
     ) -> Result<Response<GetCurrentEditLogTxidResponseProto>, Status> {
-        Ok(Response::new(GetCurrentEditLogTxidResponseProto {
-            txid: 0,
-        }))
+        Ok(Response::new(GetCurrentEditLogTxidResponseProto { txid: self.service.last_txid() as i64 }))
     }
 
     async fn get_edits_from_txid(
@@ -1525,11 +1464,74 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
     }
 }
 
+/// A file or directory's status as getFileInfo (and append) return it.
+fn file_status_proto(info: crate::grpc::client_namenode_service::FileInfo, path: String) -> HdfsFileStatusProto {
+    HdfsFileStatusProto {
+        file_type: if info.is_dir {
+            hdfs_file_status_proto::FileType::IsDir as i32
+        } else {
+            hdfs_file_status_proto::FileType::IsFile as i32
+        },
+        path: path.into(),
+        length: info.length,
+        permission: FsPermissionProto { perm: info.permissions as u32 },
+        owner: info.owner,
+        group: info.group,
+        modification_time: info.modification_time,
+        access_time: info.access_time,
+        symlink: None,
+        block_replication: Some(info.replication as u32),
+        blocksize: Some(info.block_size),
+        storage_policy: Some(0),
+        ec_policy: None,
+        flags: Some(0),
+        file_id: Some(0),
+        children_num: Some(0),
+        file_encryption_info: None,
+        locations: None,
+        namespace: None,
+    }
+}
+
+/// A live DataNode as getDatanodeReport describes it.
+fn datanode_report_proto(dn: crate::grpc::client_namenode_service::DatanodeReportInfo) -> DatanodeInfoProto {
+    DatanodeInfoProto {
+        id: DatanodeIdProto {
+            ip_addr: dn.hostname.clone(),
+            host_name: dn.hostname,
+            datanode_uuid: dn.uuid,
+            xfer_port: dn.data_port as u32,
+            info_port: dn.http_port as u32,
+            ipc_port: dn.rpc_port as u32,
+            info_secure_port: Some(0),
+            supported_transports: dn.supported_transports,
+            rdma_port: Some(dn.rdma_port as u32),
+        },
+        capacity: Some(dn.capacity),
+        dfs_used: Some(dn.block_pool_used),
+        remaining: Some(dn.remaining),
+        block_pool_used: Some(dn.block_pool_used),
+        cache_capacity: Some(0),
+        cache_used: Some(0),
+        last_update: Some(dn.last_update),
+        last_update_monotonic: Some(0),
+        xceiver_count: Some(0),
+        location: None,
+        non_dfs_used: Some(dn.used.saturating_sub(dn.block_pool_used)),
+        admin_state: Some(datanode_info_proto::AdminState::Normal as i32),
+        upgrade_domain: None,
+        last_block_report_time: Some(0),
+        last_block_report_monotonic: Some(0),
+        num_blocks: Some(dn.num_blocks),
+        software_version: None,
+    }
+}
+
 /// Convert a service-level LocatedBlock into the wire LocatedBlockProto.
-fn located_block_to_proto(b: crate::grpc::client_namenode_service::LocatedBlock) -> LocatedBlockProto {
+fn located_block_to_proto(b: crate::grpc::client_namenode_service::LocatedBlock, pool_id: &str) -> LocatedBlockProto {
     fill_storages(LocatedBlockProto {
         b: ExtendedBlockProto {
-            pool_id: "BP-pillar-001".to_string(),
+            pool_id: pool_id.to_string(),
             block_id: b.block_id,
             generation_stamp: b.generation_stamp,
             num_bytes: Some(b.num_bytes),

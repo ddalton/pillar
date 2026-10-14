@@ -294,3 +294,74 @@ async fn a_lost_replica_is_re_replicated_and_deleted_files_are_cleaned_up() {
     let (a, b) = (c._dns[holders[1]].1.clone(), spare_storage.clone());
     eventually("live replicas are invalidated", || a.get_block_count() == 0 && b.get_block_count() == 0).await;
 }
+
+/// Metadata calls that used to answer success and change nothing:
+/// setReplication (now adds and deletes replicas), setPermission, setOwner,
+/// setTimes, getContentSummary; and append, which used to leave an empty
+/// block that kept complete() from ever succeeding.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_calls_take_effect_and_append_starts_a_new_block() {
+    let c = start_cluster_with(3, true).await;
+    let fs = client(&c);
+    let replicas = |c: &Cluster| -> Vec<usize> { c._dns.iter().map(|(_, s)| s.get_block_count()).collect() };
+
+    // Replication 1 -> 3 -> 2.
+    let data = pattern(MB + 5, 0x11);
+    let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(1), ..Default::default() };
+    let mut w = fs.create("/r.bin", opts).await.unwrap();
+    w.write_bytes(Bytes::from(data.clone())).await.unwrap();
+    w.close().await.unwrap();
+    eventually("one replica of each block", || replicas(&c).iter().sum::<usize>() == 2).await;
+    assert!(fs.set_replication("/r.bin", 3).await.unwrap());
+    eventually("re-replicated to 3", || replicas(&c) == vec![2, 2, 2]).await;
+    assert!(fs.set_replication("/r.bin", 2).await.unwrap());
+    eventually("excess replicas deleted", || replicas(&c).iter().sum::<usize>() == 4).await;
+    assert_eq!(fs.get_file_info("/r.bin").await.unwrap().replication, Some(2));
+    assert_eq!(fs.read("/r.bin").await.unwrap().read_range(0, data.len()).await.unwrap()[..], data[..]);
+
+    // Permission, owner, times.
+    fs.set_permission("/r.bin", 0o600).await.unwrap();
+    fs.set_owner("/r.bin", Some("alice"), Some("eng")).await.unwrap();
+    fs.set_times("/r.bin", 1_000_000, 2_000_000).await.unwrap();
+    let st = fs.get_file_info("/r.bin").await.unwrap();
+    assert_eq!((st.permission, st.owner.as_str(), st.group.as_str()), (0o600, "alice", "eng"));
+    assert_eq!((st.modification_time, st.access_time), (1_000_000, 2_000_000));
+
+    // Content summary.
+    fs.mkdirs("/sum/d", 0o755, true).await.unwrap();
+    for (p, n) in [("/sum/a", 10usize), ("/sum/d/b", 32)] {
+        let mut w = fs.create(p, WriteOptions { replication: Some(1), ..Default::default() }).await.unwrap();
+        w.write_bytes(Bytes::from(vec![7u8; n])).await.unwrap();
+        w.close().await.unwrap();
+    }
+    let s = fs.get_content_summary("/sum").await.unwrap();
+    assert_eq!((s.length, s.file_count, s.directory_count), (42, 2, 2));
+
+    // Append to a file whose last block is full starts a new block.
+    let head = pattern(MB, 0x21);
+    let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(3), ..Default::default() };
+    let mut w = fs.create("/app.bin", opts).await.unwrap();
+    w.write_bytes(Bytes::from(head.clone())).await.unwrap();
+    w.close().await.unwrap();
+    let tail = pattern(1000, 0x22);
+    let mut w = fs.append("/app.bin").await.unwrap();
+    w.write_bytes(Bytes::from(tail.clone())).await.unwrap();
+    w.close().await.unwrap();
+    let r = fs.read("/app.bin").await.unwrap();
+    assert_eq!(r.file_length(), MB + 1000);
+    let all = r.read_range(0, MB + 1000).await.unwrap();
+    assert!(all[..MB] == head[..] && all[MB..] == tail[..], "appended file differs");
+    // Its last block is now partial. Extending it is refused with a message
+    // naming NEW_BLOCK, and hdfs-native then appends in a new block (as it
+    // does for erasure-coded files): three blocks, contents intact.
+    let more = pattern(500, 0x23);
+    let mut w = fs.append("/app.bin").await.unwrap();
+    w.write_bytes(Bytes::from(more.clone())).await.unwrap();
+    w.close().await.unwrap();
+    let r = fs.read("/app.bin").await.unwrap();
+    assert_eq!(r.file_length(), MB + 1500);
+    let all = r.read_range(0, MB + 1500).await.unwrap();
+    assert!(all[..MB] == head[..] && all[MB..MB + 1000] == tail[..] && all[MB + 1000..] == more[..]);
+    let blocks = fs.get_file_info("/app.bin").await.unwrap();
+    assert_eq!(blocks.length, MB + 1500);
+}

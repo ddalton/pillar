@@ -13,11 +13,14 @@ macro_rules! methods {
     ($($name:literal => $method:ident($req:ty),)*) => {
         /// Decode `body` as the request for `method`, call it, and return
         /// the encoded response (not length-delimited).
-        pub async fn dispatch<T: ClientNamenodeProtocol>(svc: &T, method: &str, body: &[u8]) -> Result<Vec<u8>, RpcError> {
+        /// `user` is the connection's effective user ([`super::CallerUser`]).
+        pub async fn dispatch<T: ClientNamenodeProtocol>(svc: &T, method: &str, body: &[u8], user: &str) -> Result<Vec<u8>, RpcError> {
             match method {
                 $($name => {
                     let req = <$req>::decode(body).map_err(|e| RpcError::bad_request(method, e))?;
-                    let resp = svc.$method(tonic::Request::new(req)).await.map_err(RpcError::from_status)?;
+                    let mut req = tonic::Request::new(req);
+                    req.extensions_mut().insert(super::CallerUser(user.to_string()));
+                    let resp = svc.$method(req).await.map_err(RpcError::from_status)?;
                     Ok(resp.into_inner().encode_to_vec())
                 })*
                 _ => Err(RpcError::no_such_method(method)),

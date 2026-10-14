@@ -3,7 +3,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use crate::metadata::{Namespace, BlockManager, EditLog, EditOp, EditTxn};
-use crate::metadata::edit_log::InodeRecord;
+use crate::metadata::edit_log::{InodeAttributes, InodeRecord};
 use crate::metadata::namespace::{FsPermission, INode};
 use crate::metadata::block_manager::{BlockId, DatanodeId};
 use crate::datanode::{DatanodeManager, BlockPlacementPolicy};
@@ -16,6 +16,11 @@ pub struct ClientNamenodeService {
     placement_policy: Arc<BlockPlacementPolicy>,
     /// Every namespace change is a transaction in this log.
     edits: Arc<EditLog>,
+    /// getServerDefaults: block size and replication (NameNode config).
+    default_block_size: u64,
+    default_replication: u16,
+    /// This namespace's block pool, named in every block handed out.
+    block_pool_id: String,
 }
 
 impl ClientNamenodeService {
@@ -31,6 +36,94 @@ impl ClientNamenodeService {
             datanode_manager,
             placement_policy,
             edits: Arc::new(EditLog::in_memory()),
+            default_block_size: 128 * 1024 * 1024,
+            default_replication: 3,
+            block_pool_id: "BP-pillar-001".to_string(),
+        }
+    }
+
+    /// Server defaults reported to clients (getServerDefaults).
+    pub fn with_defaults(mut self, block_size: u64, replication: u16) -> Self {
+        self.default_block_size = block_size;
+        self.default_replication = replication;
+        self
+    }
+
+    /// The namespace's block pool id (from its identity).
+    pub fn with_block_pool_id(mut self, block_pool_id: String) -> Self {
+        self.block_pool_id = block_pool_id;
+        self
+    }
+
+    pub fn default_block_size(&self) -> u64 {
+        self.default_block_size
+    }
+
+    pub fn default_replication(&self) -> u16 {
+        self.default_replication
+    }
+
+    pub fn block_pool_id(&self) -> &str {
+        &self.block_pool_id
+    }
+
+    /// Last edit-log transaction id (getCurrentEditLogTxid).
+    pub fn last_txid(&self) -> u64 {
+        self.edits.last_txid()
+    }
+
+    /// setPermission / setOwner / setTimes: change the attributes that are
+    /// `Some`, durably.
+    pub async fn handle_set_attributes(&self, path: &str, attrs: InodeAttributes) -> Result<(), Status> {
+        let mut tx = self.begin().await?;
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        attrs.apply(&mut *inode.write().await);
+        tx.log(EditOp::SetAttributes { path: path.to_string(), attrs });
+        tx.commit().await.map_err(edit_status)
+    }
+
+    /// setReplication: false for a directory (as HDFS). The replication
+    /// monitor then adds or deletes replicas.
+    pub async fn handle_set_replication(&self, path: &str, replication: u32) -> Result<bool, Status> {
+        if !(1..=512).contains(&replication) {
+            return Err(Status::invalid_argument(format!(
+                "replication {} is outside 1..=512", replication
+            )));
+        }
+        if self.namespace.lookup(path).await.map_err(namespace_status)?.read().await.is_dir {
+            return Ok(false);
+        }
+        let attrs = InodeAttributes { replication: Some(replication as u16), ..Default::default() };
+        self.handle_set_attributes(path, attrs).await?;
+        info!("Set replication of {} to {}", path, replication);
+        Ok(true)
+    }
+
+    /// getPreferredBlockSize: the file's block size.
+    pub async fn handle_preferred_block_size(&self, path: &str) -> Result<u64, Status> {
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let inode = inode.read().await;
+        if inode.is_dir {
+            return Err(Status::not_found(format!("{} is a directory", path)));
+        }
+        Ok(inode.block_size)
+    }
+
+    /// checkAccess: the path must exist. Permissions are not enforced (as
+    /// HDFS with dfs.permissions.enabled=false).
+    pub async fn handle_check_access(&self, path: &str) -> Result<(), Status> {
+        self.namespace.lookup(path).await.map(|_| ()).map_err(namespace_status)
+    }
+
+    /// reportBadBlocks: drop each named replica (unless it is the block's
+    /// last) so the replication monitor copies a good one in its place.
+    pub fn handle_report_bad_replicas(&self, replicas: &[(BlockId, String)]) {
+        for (block, uuid) in replicas {
+            if self.block_manager.drop_corrupt_replica(block, uuid) {
+                warn!("Replica of block {} on {} reported corrupt; deleting it", block.block_id, uuid);
+            } else {
+                warn!("Replica of block {} on {} reported corrupt; kept (unknown or last replica)", block.block_id, uuid);
+            }
         }
     }
 
@@ -545,8 +638,12 @@ impl ClientNamenodeService {
         Ok(true)
     }
 
-    /// Append to an existing file
-    pub async fn handle_append(&self, path: &str) -> Result<LocatedBlock, Status> {
+    /// HDFS `append`. Appending starts a new block: answering with no last
+    /// block tells the client to addBlock, which is what HDFS answers when
+    /// the last block is full. Writing into a partially filled last block needs the DataNode
+    /// append pipeline, which Pillar lacks, so that is refused unless the
+    /// client asked for a new block (CreateFlag.NEW_BLOCK).
+    pub async fn handle_append(&self, path: &str, new_block: bool) -> Result<(), Status> {
         let inode = self.namespace
             .lookup(path)
             .await
@@ -557,35 +654,20 @@ impl ClientNamenodeService {
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot append to directory"));
         }
-
-        // Get the last block if it exists and isn't full
-        if let Some(blocks) = &inode_guard.blocks {
-            if let Some(last_block) = blocks.last() {
-                if last_block.num_bytes < inode_guard.block_size {
-                    // Return the last block for appending
-                    let block_id = BlockId::new(last_block.block_id, last_block.generation_stamp);
-                    let locations = self.block_manager
-                        .get_block_locations(&block_id)
-                        .unwrap_or_default();
-
-                    info!("Appending to existing block {} for file: {}", last_block.block_id, path);
-
-                    return Ok(LocatedBlock {
-                        block_id: last_block.block_id,
-                        generation_stamp: last_block.generation_stamp,
-                        num_bytes: last_block.num_bytes,
-                        // Real offset: blocks before the last can be partial
-                        // (after append/concat/truncate).
-                        offset: blocks[..blocks.len() - 1].iter().map(|b| b.num_bytes).sum(),
-                        locations,
-                    });
-                }
-            }
+        let partial = inode_guard
+            .blocks
+            .as_ref()
+            .and_then(|b| b.last())
+            .is_some_and(|last| last.num_bytes < inode_guard.block_size);
+        if partial && !new_block {
+            return Err(Status::unimplemented(format!(
+                "append to {}: its last block is partially filled, and Pillar cannot extend a block yet; \
+                 append with CreateFlag.NEW_BLOCK to start a new one",
+                path
+            )));
         }
-
-        // If no partial block exists, allocate a new one (same as add_block)
-        drop(inode_guard);
-        self.handle_add_block(path).await
+        info!("Append to {} starts a new block", path);
+        Ok(())
     }
 
     /// Abandon a block allocation (cleanup failed writes)
@@ -631,11 +713,19 @@ impl ClientNamenodeService {
             report.push(DatanodeReportInfo {
                 hostname: dn.id.hostname.clone(),
                 uuid: dn.id.uuid.clone(),
+                data_port: dn.id.data_port,
+                http_port: dn.id.http_port,
+                rpc_port: dn.id.rpc_port,
                 capacity: dn.storage.capacity,
                 used: dn.storage.used,
                 remaining: dn.storage.remaining,
+                block_pool_used: dn.storage.block_pool_used,
                 num_blocks: dn.num_blocks as u32,
-                last_update: dn.last_update.elapsed().as_secs(),
+                // Milliseconds since the epoch, as HDFS reports it.
+                last_update: (std::time::SystemTime::now() - dn.last_update.elapsed())
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
                 supported_transports: dn.id.supported_transports.clone(),
                 rdma_port: dn.id.rdma_port,
             });
@@ -1056,9 +1146,13 @@ pub struct ContentSummary {
 pub struct DatanodeReportInfo {
     pub hostname: String,
     pub uuid: String,
+    pub data_port: u16,
+    pub http_port: u16,
+    pub rpc_port: u16,
     pub capacity: u64,
     pub used: u64,
     pub remaining: u64,
+    pub block_pool_used: u64,
     pub num_blocks: u32,
     pub last_update: u64,
     pub supported_transports: Vec<String>,
@@ -1239,10 +1333,16 @@ mod tests {
             }
         }
 
-        // Append should return the existing partial block
-        let append_block = service.handle_append("/test.txt").await.unwrap();
-        assert_eq!(append_block.block_id, block1.block_id);
-        assert_eq!(append_block.num_bytes, 64 * 1024 * 1024);
+        let blocks = || async { file_inode.read().await.blocks.as_ref().unwrap().len() };
+
+        // A partially filled last block cannot be extended: refused, unless
+        // the client asks for a new block. Either way append allocates
+        // nothing itself (the client's addBlock does).
+        let err = service.handle_append("/test.txt", false).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        service.handle_append("/test.txt", true).await.unwrap();
+        assert_eq!(blocks().await, 1);
+        let _ = block1;
 
         // Mark block as full
         {
@@ -1254,9 +1354,11 @@ mod tests {
             }
         }
 
-        // Append should allocate a new block since last one is full
-        let append_block2 = service.handle_append("/test.txt").await.unwrap();
-        assert_ne!(append_block2.block_id, block1.block_id);
+        // A full last block: append is fine, and still allocates nothing
+        // (allocating here as well as in the client's addBlock left an empty
+        // block no DataNode ever reported, so complete() never succeeded).
+        service.handle_append("/test.txt", false).await.unwrap();
+        assert_eq!(blocks().await, 1);
     }
 
     #[tokio::test]
@@ -3440,18 +3542,13 @@ mod tests {
             128 * 1024 * 1024,
         ).await.unwrap();
 
-        // First append
-        let result1 = service.handle_append("/test.txt").await;
-        assert!(result1.is_ok());
-        let block_id1 = result1.unwrap().block_id;
-
-        // Retry append - should succeed and return same block (if not full)
-        let result2 = service.handle_append("/test.txt").await;
-        assert!(result2.is_ok());
-        let block_id2 = result2.unwrap().block_id;
-
-        // Should get the same block back since it's not full
-        assert_eq!(block_id1, block_id2);
+        // Appending to an empty file, and retrying, succeeds and changes
+        // nothing: the blocks come from the client's addBlock calls.
+        service.handle_append("/test.txt", false).await.unwrap();
+        service.handle_append("/test.txt", false).await.unwrap();
+        let inode = namespace.lookup("/test.txt").await.unwrap();
+        assert!(inode.read().await.blocks.as_ref().unwrap().is_empty());
+        assert_eq!(block_manager.get_total_blocks(), 0);
     }
 
     #[tokio::test]
@@ -3705,10 +3802,14 @@ mod tests {
         let hit = service.handle_get_located_blocks("/t", 125, 1).await.unwrap();
         assert_eq!(offsets(&hit.blocks), vec![120]);
 
-        // Append returns the partial last block at its real offset.
-        let appended = service.handle_append("/t").await.unwrap();
-        assert_eq!(appended.offset, 120);
-        assert_eq!(appended.num_bytes, 70);
+        // Appending with a new block after the partial one: the new block
+        // starts at the file's real end.
+        service.handle_append("/t", true).await.unwrap();
+        let b = service.handle_add_block("/t").await.unwrap();
+        service.handle_commit_block("/t", b.block_id, 5).await.unwrap();
+        let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
+        assert_eq!(offsets(&located.blocks), vec![0, 100, 120, 190]);
+        assert_eq!(located.file_length, 195);
 
         // Truncate across unequal blocks to the exact boundary.
         service.handle_truncate("/t", 100).await.unwrap();
