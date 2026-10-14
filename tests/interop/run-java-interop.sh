@@ -7,6 +7,8 @@
 #
 #   tests/interop/run-java-interop.sh            # needs a JDK (11+) and curl
 #   BLOCK_TOKENS=1 tests/interop/run-java-interop.sh   # with block access tokens
+#   ENCRYPT=aes tests/interop/run-java-interop.sh       # encrypted data transfer (AES/CTR)
+#   ENCRYPT=rc4 tests/interop/run-java-interop.sh       # encrypted, SASL wrapping only
 #
 # Hadoop's shaded client jars are fetched from Maven Central into
 # ~/.cache/pillar-interop and checked against Maven's SHA-1 files.
@@ -15,6 +17,17 @@ set -euo pipefail
 HADOOP_VERSION=${HADOOP_VERSION:-3.5.0}
 NN_FLAGS=""
 [ -n "${BLOCK_TOKENS:-}" ] && NN_FLAGS="--block-access-tokens"
+DN_FLAGS=""
+# Encrypted data transfer: the NameNode tells clients (getServerDefaults)
+# and hands out data encryption keys; DataNodes refuse anything else. With
+# ENCRYPT=aes the client offers AES/CTR (the fast path).
+if [ -n "${ENCRYPT:-}" ]; then
+    NN_FLAGS="$NN_FLAGS --encrypt-data-transfer"
+    DN_FLAGS="--encrypt-data-transfer"
+    [ "$ENCRYPT" = aes ] && export DATA_CIPHER_SUITES=AES/CTR/NoPadding
+    # The DataNodes log how each connection was secured (checked below).
+    export RUST_LOG="info,krb5=warn,pillar_datanode::transport::sasl=debug"
+fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 CACHE=${PILLAR_INTEROP_CACHE:-$HOME/.cache/pillar-interop}
@@ -51,7 +64,7 @@ for i in 0 1 2; do
     mkdir -p "$WORK/dn$i"
     "$BIN/pillar-datanode" --namenode 127.0.0.1:19000 --uuid "dn$i" --hostname 127.0.0.1 \
         --rpc-addr "127.0.0.1:1986$i" --data-addr "127.0.0.1:5001$i" --http-addr "127.0.0.1:5007$i" \
-        --volume-mount-point "$WORK/dn$i" --transport tcp >"$WORK/dn$i.log" 2>&1 &
+        --volume-mount-point "$WORK/dn$i" --transport tcp $DN_FLAGS >"$WORK/dn$i.log" 2>&1 &
     echo $! >"$WORK/dn$i.pid"
 done
 for _ in $(seq 50); do [ "$(grep -c 'Registered datanode' "$WORK/nn.log")" -ge 3 ] && break; sleep 0.2; done
@@ -69,6 +82,20 @@ fail() {
 }
 
 java_client || fail "before restart"
+if [ -n "${ENCRYPT:-}" ]; then
+    # Every data connection was encrypted, the client's as configured:
+    # AES/CTR when it offers it, else DIGEST-MD5 privacy (RC4). DataNodes
+    # always offer AES to each other (their key names block pool "pillar").
+    aes=$(cat "$WORK"/dn*.log | grep -c "AES/CTR for" || true)
+    rc4=$(cat "$WORK"/dn*.log | grep -c "SASL privacy for" || true)
+    aes_clients=$(cat "$WORK"/dn*.log | grep "AES/CTR for" | grep -vc " pillar " || true)
+    if [ "$ENCRYPT" = aes ]; then
+        [ "$aes_clients" -gt 0 ] && [ "$rc4" -eq 0 ] || fail "expected AES/CTR only (aes=$aes rc4=$rc4)"
+    else
+        [ "$rc4" -gt 0 ] && [ "$aes_clients" -eq 0 ] || fail "expected RC4 for the client (rc4=$rc4 aes from clients=$aes_clients)"
+    fi
+    echo "ok    every data connection encrypted: $aes AES/CTR ($aes_clients from the client), $rc4 SASL RC4"
+fi
 
 # Crash the NameNode and bring it back on the same name directory. The
 # DataNodes keep running; their next heartbeat is answered with a register

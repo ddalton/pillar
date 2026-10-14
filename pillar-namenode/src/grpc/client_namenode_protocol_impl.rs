@@ -571,7 +571,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 write_packet_size: 64 * 1024,
                 replication: self.service.default_replication() as u32,
                 file_buffer_size: 4096,
-                encrypt_data_transfer: Some(false),
+                encrypt_data_transfer: Some(self.service.encrypt_data_transfer()),
                 trash_interval: Some(0),
                 // HDFS's default (dfs.checksum.type); DataNodes accept CRC32 too.
                 checksum_type: Some(ChecksumTypeProto::ChecksumCrc32c as i32),
@@ -1369,7 +1369,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         _request: Request<GetDataEncryptionKeyRequestProto>,
     ) -> Result<Response<GetDataEncryptionKeyResponseProto>, Status> {
-        Err(Status::unimplemented("Data encryption keys not supported"))
+        // HDFS hands out keys only when data transfer is encrypted.
+        let key = self.service.encrypt_data_transfer().then(|| self.service.data_encryption_key()).flatten();
+        Ok(Response::new(GetDataEncryptionKeyResponseProto { data_encryption_key: key }))
     }
 
     // ============================================================================

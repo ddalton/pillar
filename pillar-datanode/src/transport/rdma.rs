@@ -571,7 +571,7 @@ impl DataTransport for RdmaTransport {
     ) -> Result<Bytes> {
         debug!("Reading block {} from peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
         let token = self.block_storage.tokens.mint(block_id, mode::READ);
-        self.tcp_pool.read_block(peer_addr, block_id, gen_stamp, offset, length, token).await
+        self.tcp_pool.read_block(&self.block_storage, peer_addr, block_id, gen_stamp, offset, length, token).await
     }
 
     async fn send_block_to_peer(
@@ -583,7 +583,7 @@ impl DataTransport for RdmaTransport {
     ) -> Result<u64> {
         debug!("Sending block {} to peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
         let token = self.block_storage.tokens.mint(block_id, mode::WRITE);
-        self.tcp_pool.send_block(peer_addr, block_id, gen_stamp, chunks, token).await
+        self.tcp_pool.send_block(&self.block_storage, peer_addr, block_id, gen_stamp, chunks, token).await
     }
 
     fn transport_type(&self) -> TransportType {

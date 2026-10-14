@@ -38,6 +38,10 @@ pub struct DataNodeConfig {
     /// The protection IPC callers may negotiate with SASL
     /// (`hadoop.rpc.protection`).
     pub rpc_protection: pillar_common::sasl::Protection,
+    /// Data transfer: encrypted (dfs.encrypt.data.transfer), or SASL with
+    /// block tokens at these levels (dfs.data.transfer.protection).
+    pub encrypt_data_transfer: bool,
+    pub data_transfer_protection: Option<pillar_common::sasl::Protection>,
 
     /// Data transfer server address (for block I/O)
     pub data_addr: SocketAddr,
@@ -106,6 +110,8 @@ impl Default for DataNodeConfig {
             kerberos_principal: None,
             namenode_principal: None,
             rpc_protection: Default::default(),
+            encrypt_data_transfer: false,
+            data_transfer_protection: None,
             data_addr: "0.0.0.0:50010".parse().unwrap(),
             http_addr: "0.0.0.0:50075".parse().unwrap(),
             volume_mount_point: PathBuf::from("/mnt/pillar-data"),
@@ -157,6 +163,15 @@ impl DataNodeConfig {
         }
         if let Ok(val) = env::var("DATANODE_NAMENODE_PRINCIPAL") {
             config.namenode_principal = Some(val);
+        }
+        if let Ok(val) = env::var("DATANODE_ENCRYPT_DATA_TRANSFER") {
+            config.encrypt_data_transfer = val == "true";
+        }
+        if let Ok(val) = env::var("DATANODE_DATA_TRANSFER_PROTECTION") {
+            match val.parse() {
+                Ok(p) => config.data_transfer_protection = Some(p),
+                Err(e) => warn!("DATANODE_DATA_TRANSFER_PROTECTION: {}", e),
+            }
         }
         if let Ok(val) = env::var("DATANODE_RPC_PROTECTION") {
             match val.parse() {
@@ -302,6 +317,14 @@ impl DataNode {
         )?);
 
         info!("Block storage initialized ({} existing blocks)", block_storage.get_block_count());
+        let security = crate::transport::sasl::DataSecurity {
+            encrypt: config.encrypt_data_transfer,
+            protection: config.data_transfer_protection.clone(),
+        };
+        if security.required() {
+            info!("Data transfer security: {:?} (AES/CTR when the client offers it)", security);
+        }
+        let _ = block_storage.data_security.set(security);
 
         // Create TCP transport
         let tcp_transport = Arc::new(TcpTransport::new(

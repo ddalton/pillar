@@ -8,8 +8,9 @@
 //! transfer, so a client can only read or write blocks the NameNode gave it.
 //!
 //! Keys roll every `key_update_interval` and stay valid until every token
-//! they signed has expired. Tokens are opaque to clients, so the identifier
-//! is Pillar's own compact encoding (only Pillar mints and checks them).
+//! they signed has expired. The identifier is Hadoop's `BlockTokenIdentifier`
+//! (legacy Writable form): Hadoop clients decode it, e.g. before encrypted
+//! data transfer.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use pillar_proto::hadoop::common::TokenProto;
-use pillar_proto::hdfs::{BlockKeyProto, ExportedBlockKeysProto};
+use pillar_proto::hdfs::{BlockKeyProto, DataEncryptionKeyProto, ExportedBlockKeysProto};
 use sha1::Sha1;
 
 /// `TokenProto.kind` of a block token.
@@ -36,8 +37,6 @@ pub mod mode {
     pub const REPLACE: u8 = 8;
 }
 
-const IDENTIFIER_MAGIC: &[u8; 4] = b"PBT1";
-
 /// What a token grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockTokenIdentifier {
@@ -53,38 +52,125 @@ pub struct BlockTokenIdentifier {
 }
 
 impl BlockTokenIdentifier {
+    /// Hadoop's `BlockTokenIdentifier` in its legacy Writable form
+    /// (`writeLegacy`), which Hadoop clients decode: expiry (VLong), key id
+    /// (VInt), user and block pool (`WritableUtils` strings: 4-byte length),
+    /// block id (VLong), the access modes by name (`Text`: VInt length),
+    /// then no storage types, storage ids or handshake secret.
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(32 + self.user.len() + self.block_pool_id.len());
-        v.extend_from_slice(IDENTIFIER_MAGIC);
-        v.extend_from_slice(&self.expiry_ms.to_be_bytes());
-        v.extend_from_slice(&self.key_id.to_be_bytes());
-        v.extend_from_slice(&self.block_id.to_be_bytes());
-        v.push(self.modes);
-        for s in [&self.user, &self.block_pool_id] {
-            let s = &s.as_bytes()[..s.len().min(u16::MAX as usize)];
-            v.extend_from_slice(&(s.len() as u16).to_be_bytes());
-            v.extend_from_slice(s);
+        let mut v = Vec::with_capacity(48 + self.user.len() + self.block_pool_id.len());
+        writable::put_vlong(&mut v, self.expiry_ms as i64);
+        writable::put_vlong(&mut v, self.key_id as i64);
+        writable::put_string(&mut v, &self.user);
+        writable::put_string(&mut v, &self.block_pool_id);
+        writable::put_vlong(&mut v, self.block_id as i64);
+        let names = MODE_NAMES.iter().filter(|(bit, _)| self.modes & bit != 0);
+        writable::put_vlong(&mut v, names.clone().count() as i64);
+        for (_, name) in names {
+            writable::put_text(&mut v, name);
+        }
+        for _ in 0..3 {
+            writable::put_vlong(&mut v, 0); // storage types, storage ids, handshake secret
         }
         v
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
-        let rest = b.strip_prefix(IDENTIFIER_MAGIC)?;
-        let u64_at = |i: usize| Some(u64::from_be_bytes(rest.get(i..i + 8)?.try_into().ok()?));
-        let expiry_ms = u64_at(0)?;
-        let key_id = u32::from_be_bytes(rest.get(8..12)?.try_into().ok()?);
-        let block_id = u64_at(12)?;
-        let modes = *rest.get(20)?;
-        let mut at = 21;
-        let mut text = || {
-            let n = u16::from_be_bytes(rest.get(at..at + 2)?.try_into().ok()?) as usize;
-            let s = String::from_utf8(rest.get(at + 2..at + 2 + n)?.to_vec()).ok()?;
-            at += 2 + n;
-            Some(s)
-        };
-        let user = text()?;
-        let block_pool_id = text()?;
+        let mut r = writable::Reader(b);
+        let expiry_ms = u64::try_from(r.vlong()?).ok()?;
+        let key_id = u32::try_from(r.vlong()?).ok()?;
+        let user = r.string()?;
+        let block_pool_id = r.string()?;
+        let block_id = r.vlong()? as u64;
+        let n = usize::try_from(r.vlong()?).ok().filter(|n| *n <= MODE_NAMES.len())?;
+        let mut modes = 0;
+        for _ in 0..n {
+            let name = r.text()?;
+            modes |= MODE_NAMES.iter().find(|(_, m)| *m == name)?.0;
+        }
+        // Storage types, ids and a handshake secret may follow (or not, from
+        // older writers); access checks do not use them.
         Some(Self { expiry_ms, key_id, user, block_pool_id, block_id, modes })
+    }
+}
+
+/// HDFS `AccessMode` names, in declaration order.
+const MODE_NAMES: [(u8, &str); 4] = [(mode::READ, "READ"), (mode::WRITE, "WRITE"), (mode::COPY, "COPY"), (mode::REPLACE, "REPLACE")];
+
+/// Hadoop `WritableUtils`: zero-compressed VLong/VInt and strings.
+mod writable {
+    pub fn put_vlong(out: &mut Vec<u8>, mut i: i64) {
+        if (-112..=127).contains(&i) {
+            out.push(i as u8);
+            return;
+        }
+        let mut len: i32 = -112;
+        if i < 0 {
+            i ^= -1;
+            len = -120;
+        }
+        let mut tmp = i;
+        while tmp != 0 {
+            tmp >>= 8;
+            len -= 1;
+        }
+        out.push(len as u8);
+        let n = if len < -120 { -(len + 120) } else { -(len + 112) };
+        for idx in (1..=n).rev() {
+            out.push((i >> ((idx - 1) * 8)) as u8);
+        }
+    }
+
+    /// `WritableUtils.writeString`: a 4-byte length, then UTF-8.
+    pub fn put_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// `Text.writeString` (enum names): a VInt length, then UTF-8.
+    pub fn put_text(out: &mut Vec<u8>, s: &str) {
+        put_vlong(out, s.len() as i64);
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    pub struct Reader<'a>(pub &'a [u8]);
+
+    impl Reader<'_> {
+        fn byte(&mut self) -> Option<u8> {
+            let (b, rest) = self.0.split_first()?;
+            self.0 = rest;
+            Some(*b)
+        }
+
+        pub fn vlong(&mut self) -> Option<i64> {
+            let first = self.byte()? as i8 as i32;
+            if first >= -112 {
+                return Some(first as i64);
+            }
+            let (n, negative) = if first < -120 { (-120 - first, true) } else { (-112 - first, false) };
+            let mut i: i64 = 0;
+            for _ in 0..n {
+                i = (i << 8) | self.byte()? as i64;
+            }
+            Some(if negative { i ^ -1 } else { i })
+        }
+
+        fn utf8(&mut self, n: usize) -> Option<String> {
+            let bytes = self.0.get(..n)?;
+            self.0 = &self.0[n..];
+            String::from_utf8(bytes.to_vec()).ok()
+        }
+
+        pub fn string(&mut self) -> Option<String> {
+            let n = i32::from_be_bytes(self.0.get(..4)?.try_into().ok()?);
+            self.0 = &self.0[4..];
+            self.utf8(usize::try_from(n).ok()?)
+        }
+
+        pub fn text(&mut self) -> Option<String> {
+            let n = usize::try_from(self.vlong()?).ok()?;
+            self.utf8(n)
+        }
     }
 }
 
@@ -201,6 +287,23 @@ impl BlockTokenSecretManager {
         token(&id, key)
     }
 
+    /// A data encryption key for a client (HDFS
+    /// `generateDataEncryptionKey`): a random nonce and its HMAC under the
+    /// current block key, which DataNodes recompute from the key id.
+    pub fn data_encryption_key(&self) -> DataEncryptionKeyProto {
+        let k = self.state.read().unwrap();
+        let key = k.keys.last().expect("a current key");
+        let nonce: [u8; 8] = rand::random();
+        DataEncryptionKeyProto {
+            key_id: key.id,
+            block_pool_id: self.block_pool_id.clone(),
+            nonce: nonce.to_vec(),
+            encryption_key: hmac(&key.bytes, &nonce),
+            expiry_date: now_ms() + self.token_lifetime.as_millis() as u64,
+            encryption_algorithm: None,
+        }
+    }
+
     /// Every live key, for DataNodes.
     pub fn export(&self) -> ExportedBlockKeysProto {
         let k = self.state.read().unwrap();
@@ -262,6 +365,23 @@ impl BlockTokenVerifier {
         let s = self.state.read().unwrap();
         let key = s.keys.get(&id.key_id)?;
         (id.expiry_ms > now_ms()).then(|| (id, hmac(&key.bytes, identifier)))
+    }
+
+    /// The data encryption key a client was given for `key_id` and
+    /// `nonce`, if that block key is still known.
+    pub fn encryption_key(&self, key_id: u32, nonce: &[u8]) -> Option<Vec<u8>> {
+        let s = self.state.read().unwrap();
+        let key = s.keys.get(&key_id).filter(|k| k.expiry_ms > now_ms())?;
+        Some(hmac(&key.bytes, nonce))
+    }
+
+    /// A data encryption key under the current block key, for this
+    /// DataNode's own connections: (key id, nonce, key).
+    pub fn new_encryption_key(&self) -> Option<(u32, Vec<u8>, Vec<u8>)> {
+        let s = self.state.read().unwrap();
+        let key = s.keys.get(&s.current?)?;
+        let nonce: [u8; 8] = rand::random();
+        Some((key.id, nonce.to_vec(), hmac(&key.bytes, &nonce)))
     }
 
     /// Check that `token` grants `modes` on `block_id`. Always passes when
@@ -330,6 +450,35 @@ impl crate::ipc::TokenAuthority for BlockTokenVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifiers_are_hadoop_writables() {
+        let mut v = Vec::new();
+        for (n, want) in [(300i64, vec![0x8e, 0x01, 0x2c]), (-1, vec![0xff]), (-113, vec![0x87, 0x70]), (127, vec![0x7f])] {
+            v.clear();
+            writable::put_vlong(&mut v, n);
+            assert_eq!(v, want, "writeVLong({n})");
+            assert_eq!(writable::Reader(&v).vlong(), Some(n));
+        }
+        for n in [0i64, 1 << 40, -(1 << 40), i64::MAX, i64::MIN, 1_792_005_407_048] {
+            v.clear();
+            writable::put_vlong(&mut v, n);
+            assert_eq!(writable::Reader(&v).vlong(), Some(n));
+        }
+        let id = BlockTokenIdentifier { expiry_ms: 1, key_id: 2, user: "u".into(), block_pool_id: "bp".into(), block_id: 3, modes: mode::READ | mode::COPY };
+        // expiry, key, "u" and "bp" (4-byte lengths), block, 2 modes
+        // "READ" "COPY" (VInt lengths), 0, 0, 0.
+        let mut want = vec![1, 2, 0, 0, 0, 1, b'u', 0, 0, 0, 2, b'b', b'p', 3, 2, 4];
+        want.extend_from_slice(b"READ");
+        want.push(4);
+        want.extend_from_slice(b"COPY");
+        want.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(id.encode(), want);
+        assert_eq!(BlockTokenIdentifier::decode(&id.encode()), Some(id.clone()));
+        // An identifier without the optional tail still decodes.
+        assert_eq!(BlockTokenIdentifier::decode(&want[..want.len() - 3]), Some(id));
+        assert_eq!(BlockTokenIdentifier::decode(b"PBT1junk"), None);
+    }
 
     fn pair() -> (BlockTokenSecretManager, BlockTokenVerifier) {
         let m = BlockTokenSecretManager::new("BP-1", DEFAULT_KEY_UPDATE_INTERVAL, DEFAULT_TOKEN_LIFETIME);

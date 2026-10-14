@@ -37,6 +37,8 @@ pub struct DigestOutcome {
     pub rspauth: Vec<u8>,
     /// The security layer, unless the client chose `auth`.
     pub layer: Option<SecurityLayer>,
+    /// The largest message the client takes (its `maxbuf`).
+    pub peer_maxbuf: usize,
 }
 
 impl DigestServer {
@@ -119,7 +121,113 @@ impl DigestServer {
         }
         let rspauth = format!("rspauth={}", digest(&format!(":{}", self.digest_uri)));
         let layer = (qop != Qop::Authentication).then(|| server_layer(&h_a1, qop));
-        Ok(DigestOutcome { username: username.to_string(), rspauth: rspauth.into_bytes(), layer })
+        let peer_maxbuf = f.get("maxbuf").and_then(|m| m.parse().ok()).unwrap_or(65536);
+        Ok(DigestOutcome { username: username.to_string(), rspauth: rspauth.into_bytes(), layer, peer_maxbuf })
+    }
+}
+
+/// The client side: answer a server's challenge, check its `rspauth`.
+pub struct DigestClient {
+    username: String,
+    password: String,
+    digest_uri: String,
+    /// The strongest level the client accepts that the server offers.
+    qop: Option<Qop>,
+    expected_rspauth: Option<String>,
+    h_a1: [u8; 16],
+    peer_maxbuf: usize,
+}
+
+impl DigestClient {
+    /// `digest_uri` is `<protocol>/<server name>`; the client asks for the
+    /// strongest level of `protection` the server offers.
+    pub fn new(username: &str, password: &str, digest_uri: &str) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+            digest_uri: digest_uri.into(),
+            qop: None,
+            expected_rspauth: None,
+            h_a1: [0; 16],
+            peer_maxbuf: 65536,
+        }
+    }
+
+    /// The digest-response to `challenge`, at the strongest level of
+    /// `protection` the server offers. The authorization id is the
+    /// username (as Hadoop's data transfer client sends it).
+    pub fn respond(&mut self, challenge: &[u8], protection: &Protection) -> Result<Vec<u8>, String> {
+        let c = parse(std::str::from_utf8(challenge).map_err(|_| "challenge is not UTF-8")?)?;
+        let nonce = c.get("nonce").ok_or("challenge has no nonce")?;
+        let realm = c.get("realm").map(String::as_str).unwrap_or("");
+        let offered: Vec<Qop> = c.get("qop").map_or("auth", String::as_str).split(',').filter_map(|q| Qop::from_sasl_name(q.trim())).collect();
+        let qop = protection
+            .levels()
+            .iter()
+            .copied()
+            .filter(|q| offered.contains(q))
+            .filter(|q| *q != Qop::Privacy || c.get("cipher").is_some_and(|ciphers| ciphers.split(',').any(|x| x.trim() == "rc4")))
+            .max()
+            .ok_or_else(|| format!("No common protection layer between client and server (server offers {:?})", c.get("qop")))?;
+        self.peer_maxbuf = c.get("maxbuf").and_then(|m| m.parse().ok()).unwrap_or(65536);
+        let mut n = [0u8; 18];
+        rand::thread_rng().fill_bytes(&mut n);
+        let cnonce = base64::engine::general_purpose::STANDARD.encode(n);
+        let authzid = &self.username;
+        let mut a1 = md5(format!("{}:{}:{}", self.username, realm, self.password).as_bytes()).to_vec();
+        a1.extend_from_slice(format!(":{}:{}:{}", nonce, cnonce, authzid).as_bytes());
+        self.h_a1 = md5(&a1);
+        let ha1 = hex(&self.h_a1);
+        let tail = if qop == Qop::Authentication { String::new() } else { ":00000000000000000000000000000000".to_string() };
+        let digest = |a2: &str| {
+            hex(&md5(format!("{}:{}:00000001:{}:{}:{}", ha1, nonce, cnonce, qop.sasl_name(), hex(&md5(format!("{}{}", a2, tail).as_bytes()))).as_bytes()))
+        };
+        let response = digest(&format!("AUTHENTICATE:{}", self.digest_uri));
+        self.expected_rspauth = Some(format!("rspauth={}", digest(&format!(":{}", self.digest_uri))));
+        self.qop = Some(qop);
+        let quote = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut out = format!(
+            r#"charset=utf-8,username="{}",realm="{}",nonce="{}",nc=00000001,cnonce="{}",digest-uri="{}",maxbuf={},response={},qop={},authzid="{}""#,
+            quote(&self.username),
+            quote(realm),
+            nonce,
+            cnonce,
+            self.digest_uri,
+            MAX_BUFFER,
+            response,
+            qop.sasl_name(),
+            quote(authzid)
+        );
+        if qop == Qop::Privacy {
+            out.push_str(",cipher=rc4");
+        }
+        Ok(out.into_bytes())
+    }
+
+    /// Check the server's final message; the client's half of the layer
+    /// (unless only `auth` was negotiated).
+    pub fn finish(&self, rspauth: &[u8]) -> Result<Option<SecurityLayer>, String> {
+        let expected = self.expected_rspauth.as_ref().ok_or("finish before respond")?;
+        if !constant_time_eq(rspauth, expected.as_bytes()) {
+            return Err("the server's rspauth does not verify".into());
+        }
+        let qop = self.qop.unwrap_or(Qop::Authentication);
+        Ok((qop != Qop::Authentication).then(|| client_layer(&self.h_a1, qop)))
+    }
+
+    /// The largest message the server takes (its `maxbuf`).
+    pub fn peer_maxbuf(&self) -> usize {
+        self.peer_maxbuf
+    }
+}
+
+/// The client's half of the layer: the mirror image of the server's.
+fn client_layer(h_a1: &[u8; 16], qop: Qop) -> SecurityLayer {
+    let cipher = |magic| (qop == Qop::Privacy).then(|| Rc4::new(&derive(h_a1, magic)));
+    SecurityLayer {
+        qop,
+        seal: Box::new(Direction { ki: derive(h_a1, SIGN_C2S), cipher: cipher(SEAL_C2S), seq: 0 }),
+        open: Box::new(Direction { ki: derive(h_a1, SIGN_S2C), cipher: cipher(SEAL_S2C), seq: 0 }),
     }
 }
 
@@ -313,13 +421,33 @@ mod tests {
         )
     }
 
-    /// The client's half of the layer: the mirror image of the server's.
-    fn client_layer(h_a1: &[u8; 16], qop: Qop) -> (Direction, Direction) {
-        let cipher = |magic| (qop == Qop::Privacy).then(|| Rc4::new(&derive(h_a1, magic)));
-        (
-            Direction { ki: derive(h_a1, SIGN_C2S), cipher: cipher(SEAL_C2S), seq: 0 },
-            Direction { ki: derive(h_a1, SIGN_S2C), cipher: cipher(SEAL_S2C), seq: 0 },
-        )
+    fn client_halves(h_a1: &[u8; 16], qop: Qop) -> (Box<dyn Seal>, Box<dyn Open>) {
+        let l = client_layer(h_a1, qop);
+        (l.seal, l.open)
+    }
+
+    #[test]
+    fn digest_client_and_server_agree_at_every_level() {
+        for level in [Qop::Authentication, Qop::Integrity, Qop::Privacy] {
+            let p: Protection = format!("{}", level).parse().unwrap();
+            let server = DigestServer::new("0", "hdfs", "0", &p);
+            let mut client = DigestClient::new("key 7 BP-1 bm9uY2U=", "cGFzc3dvcmQ=", "hdfs/0");
+            let resp = client.respond(&server.challenge(), &"authentication,integrity,privacy".parse().unwrap()).unwrap();
+            let done = server.respond(&resp, |u| (u == "key 7 BP-1 bm9uY2U=").then(|| "cGFzc3dvcmQ=".into())).unwrap();
+            let layer = client.finish(&done.rspauth).unwrap();
+            assert_eq!(layer.as_ref().map(|l| l.qop), (level != Qop::Authentication).then_some(level));
+            if let (Some(mut c), Some(mut s)) = (layer, done.layer) {
+                let t = c.seal.seal(b"an AES key").unwrap();
+                assert_eq!(s.open.open(&t).unwrap(), b"an AES key");
+                let t = s.seal.seal(b"another").unwrap();
+                assert_eq!(c.open.open(&t).unwrap(), b"another");
+            }
+            assert!(client.finish(b"rspauth=00000000000000000000000000000000").is_err());
+        }
+        // A client that needs privacy refuses a server offering less.
+        let server = DigestServer::new("0", "hdfs", "0", &Protection::default());
+        let mut client = DigestClient::new("u", "p", "hdfs/0");
+        assert!(client.respond(&server.challenge(), &"privacy".parse().unwrap()).unwrap_err().contains("No common protection layer"));
     }
 
     #[test]
@@ -343,7 +471,7 @@ mod tests {
             let (resp, h_a1) = client_response_with(challenge.as_bytes(), "dG9rZW4=", "c2VjcmV0", "/default", qop);
             let mut server = s.respond(resp.as_bytes(), |_| Some("c2VjcmV0".into())).unwrap().layer.expect("a layer");
             assert_eq!(server.qop, qop);
-            let (mut c_seal, mut c_open) = client_layer(&h_a1, qop);
+            let (mut c_seal, mut c_open) = client_halves(&h_a1, qop);
             for i in 0..3 {
                 let msg = format!("call {i}: some RPC bytes");
                 let sealed = c_seal.seal(msg.as_bytes()).unwrap();
@@ -354,12 +482,12 @@ mod tests {
             }
             // Tampered, or replayed: refused (each on a fresh pair, as a
             // refusal ends the connection).
-            let (mut c_seal, _) = client_layer(&h_a1, qop);
+            let (mut c_seal, _) = client_halves(&h_a1, qop);
             let mut s_open = server_layer(&h_a1, qop).open;
             let mut sealed = c_seal.seal(b"pay alice").unwrap();
             sealed[2] ^= 1;
             assert!(s_open.open(&sealed).is_err(), "tampered");
-            let (mut c_seal, _) = client_layer(&h_a1, qop);
+            let (mut c_seal, _) = client_halves(&h_a1, qop);
             let mut s_open = server_layer(&h_a1, qop).open;
             let sealed = c_seal.seal(b"pay alice").unwrap();
             assert!(s_open.open(&sealed).is_ok());

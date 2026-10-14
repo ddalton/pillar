@@ -101,6 +101,11 @@ struct Args {
     #[clap(long)]
     block_access_tokens: bool,
 
+    /// Clients encrypt data transfer (dfs.encrypt.data.transfer); turns on
+    /// block access tokens. DataNodes need --encrypt-data-transfer too.
+    #[clap(long)]
+    encrypt_data_transfer: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -155,6 +160,7 @@ async fn main() -> Result<()> {
         config.rpc_protection = p;
     }
     config.block_access_tokens |= args.block_access_tokens;
+    config.encrypt_data_transfer |= args.encrypt_data_transfer;
     if args.proxy_users.is_some() {
         config.proxy_users = args.proxy_users;
     }

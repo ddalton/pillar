@@ -121,16 +121,50 @@ pub async fn connect(peer_addr: &str) -> Result<TcpStream> {
 
 // ------------------------------------------------------------------ server
 
-/// Serve requests on one connection until the peer closes it.
+/// Serve requests on one connection until the peer closes it. A
+/// connection that opens with the SASL magic number is authenticated (and
+/// encrypted, if negotiated) first; one that does not is refused when this
+/// DataNode requires data transfer security.
 pub async fn serve_connection<S>(mut socket: S, storage: Arc<BlockStorage>, peer: SocketAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let first = match socket.read_u8().await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if first == (super::sasl::MAGIC >> 24) as u8 {
+        let mut rest = [0u8; 3];
+        socket.read_exact(&mut rest).await?;
+        if u32::from_be_bytes([first, rest[0], rest[1], rest[2]]) != super::sasl::MAGIC {
+            return Err(TransportError::ProtocolError("bad SASL magic number".into()));
+        }
+        let (secured, _) = super::sasl::accept(socket, &storage).await.map_err(|e| {
+            warn!("Data transfer handshake with {} failed: {}", peer, e);
+            e
+        })?;
+        return serve_requests(secured, storage, peer, None).await;
+    }
+    if super::sasl::security_of(&storage).required() {
+        warn!("Refusing an unencrypted data transfer connection from {} (encryption or protection is required)", peer);
+        return Ok(());
+    }
+    serve_requests(socket, storage, peer, Some(first)).await
+}
+
+async fn serve_requests<S>(mut socket: S, storage: Arc<BlockStorage>, peer: SocketAddr, mut first: Option<u8>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     loop {
-        let op = match socket.read_u8().await {
-            Ok(op) => op,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
+        let op = match first.take() {
+            Some(op) => op,
+            None => match socket.read_u8().await {
+                Ok(op) => op,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e.into()),
+            },
         };
         // Hadoop DataTransferProtocol: a 2-byte version whose first octet
         // is 0, never a Pillar op code.
@@ -369,10 +403,18 @@ where
 
 // ------------------------------------------------------------------ client
 
+/// A connection to another DataNode, through the data transfer handshake
+/// when this DataNode requires one (authenticating with a token for
+/// `block_id` it mints).
+pub async fn connect_secure(peer: &str, storage: &BlockStorage, block_id: u64) -> Result<super::sasl::DataStream> {
+    let s = connect(peer).await?;
+    Ok(super::sasl::connect(s, storage, block_id).await?.0)
+}
+
 /// Block recovery: the replica of `block_id` at `peer` as (finalized?,
 /// generation stamp, length), or `None` if it has none.
-pub async fn replica_info(peer: &str, block_id: u64, token: Option<TokenProto>) -> Result<Option<(bool, u64, u64)>> {
-    let mut s = connect(peer).await?;
+pub async fn replica_info(storage: &BlockStorage, peer: &str, block_id: u64, token: Option<TokenProto>) -> Result<Option<(bool, u64, u64)>> {
+    let mut s = connect_secure(peer, storage, block_id).await?;
     let h = Header { op: DataTransferOp::ReplicaInfo.to_u8(), block_id, gen_stamp: 0, offset: 0, length: 0, token };
     s.write_all(&h.encode()).await?;
     s.flush().await?;
@@ -394,8 +436,8 @@ pub async fn replica_info(peer: &str, block_id: u64, token: Option<TokenProto>) 
 
 /// Block recovery: have `peer` cut its replica of `block_id` to `len`,
 /// give it `recovery_gs` and finalize it. Returns the finalized length.
-pub async fn recover_replica(peer: &str, block_id: u64, recovery_gs: u64, len: u64, token: Option<TokenProto>) -> Result<u64> {
-    let mut s = connect(peer).await?;
+pub async fn recover_replica(storage: &BlockStorage, peer: &str, block_id: u64, recovery_gs: u64, len: u64, token: Option<TokenProto>) -> Result<u64> {
+    let mut s = connect_secure(peer, storage, block_id).await?;
     let h = Header { op: DataTransferOp::RecoverReplica.to_u8(), block_id, gen_stamp: recovery_gs, offset: 0, length: len, token };
     s.write_all(&h.encode()).await?;
     s.flush().await?;
@@ -470,17 +512,17 @@ where
 /// Idle connections to peers, reused across requests.
 #[derive(Default)]
 pub struct ConnPool {
-    idle: Mutex<HashMap<String, Vec<TcpStream>>>,
+    idle: Mutex<HashMap<String, Vec<super::sasl::DataStream>>>,
 }
 
 impl ConnPool {
     /// An idle connection to `peer`, if one is pooled.
-    pub fn take(&self, peer: &str) -> Option<TcpStream> {
+    pub fn take(&self, peer: &str) -> Option<super::sasl::DataStream> {
         self.idle.lock().unwrap().get_mut(peer).and_then(Vec::pop)
     }
 
     /// Return a connection after a request that left it clean.
-    pub fn put(&self, peer: &str, socket: TcpStream) {
+    pub fn put(&self, peer: &str, socket: super::sasl::DataStream) {
         let mut idle = self.idle.lock().unwrap();
         let v = idle.entry(peer.to_string()).or_default();
         if v.len() < MAX_IDLE_PER_PEER {
@@ -491,7 +533,16 @@ impl ConnPool {
     /// READ through the pool. A pooled connection may have been closed by
     /// the peer while idle, so a failure on one is retried once on a fresh
     /// connection (READ is idempotent).
-    pub async fn read_block(&self, peer: &str, block_id: u64, gen_stamp: u64, offset: u64, length: u64, token: Option<TokenProto>) -> Result<Bytes> {
+    pub async fn read_block(
+        &self,
+        storage: &BlockStorage,
+        peer: &str,
+        block_id: u64,
+        gen_stamp: u64,
+        offset: u64,
+        length: u64,
+        token: Option<TokenProto>,
+    ) -> Result<Bytes> {
         if let Some(mut s) = self.take(peer) {
             match read_block(&mut s, block_id, gen_stamp, offset, length, token.clone()).await {
                 Ok(data) => {
@@ -508,7 +559,7 @@ impl ConnPool {
                 Err(e) => debug!("pooled connection to {} failed ({}); reconnecting", peer, e),
             }
         }
-        let mut s = connect(peer).await?;
+        let mut s = connect_secure(peer, storage, block_id).await?;
         let r = read_block(&mut s, block_id, gen_stamp, offset, length, token).await;
         if matches!(r, Ok(_) | Err(TransportError::BlockNotFound(_))) {
             self.put(peer, s);
@@ -519,8 +570,16 @@ impl ConnPool {
     /// WRITE session on a fresh connection (a session consumes its chunk
     /// stream, so it cannot be retried on a stale pooled one); the
     /// connection is pooled afterwards for reuse by reads.
-    pub async fn send_block(&self, peer: &str, block_id: u64, gen_stamp: u64, chunks: BlockChunks, token: Option<TokenProto>) -> Result<u64> {
-        let mut s = connect(peer).await?;
+    pub async fn send_block(
+        &self,
+        storage: &BlockStorage,
+        peer: &str,
+        block_id: u64,
+        gen_stamp: u64,
+        chunks: BlockChunks,
+        token: Option<TokenProto>,
+    ) -> Result<u64> {
+        let mut s = connect_secure(peer, storage, block_id).await?;
         let stored = send_block(&mut s, block_id, gen_stamp, chunks, token).await?;
         self.put(peer, s);
         Ok(stored)

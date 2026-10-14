@@ -29,6 +29,12 @@ public class KerberosInterop {
         conf.set("hadoop.security.authentication", auth);
         String protection = System.getenv("RPC_PROTECTION");
         conf.set("hadoop.rpc.protection", protection == null || protection.isEmpty() ? "authentication" : protection);
+        // SASL on the DataNodes' data port with block tokens, offering AES.
+        String dataProtection = System.getenv("DATA_PROTECTION");
+        if (dataProtection != null && !dataProtection.isEmpty()) {
+            conf.set("dfs.data.transfer.protection", dataProtection);
+            conf.set("dfs.encrypt.data.transfer.cipher.suites", "AES/CTR/NoPadding");
+        }
         conf.set("dfs.namenode.kerberos.principal", "nn/_HOST@PILLAR.TEST");
         conf.set("dfs.datanode.kerberos.principal", "dn/_HOST@PILLAR.TEST");
         conf.set("dfs.replication", "3");

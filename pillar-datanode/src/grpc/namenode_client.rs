@@ -569,7 +569,7 @@ impl NamenodeClient {
                     let this = self.clone();
                     tokio::spawn(async move {
                         info!("Recovering block {} (new stamp {})", block.block_id, block.new_generation_stamp);
-                        match crate::recovery::recover(&block, &this.block_storage.tokens).await {
+                        match crate::recovery::recover(&block, &this.block_storage).await {
                             Ok(done) => {
                                 if let Err(e) = this.commit_block_synchronization(&block, &done, &ids).await {
                                     warn!("Reporting the recovery of block {} failed: {}", block.block_id, e);

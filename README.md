@@ -476,8 +476,28 @@ client's unmasked mode, as with `dfs.namenode.posix.acl.inheritance`).
 Permission checks use an inode's access ACL when it has one. ACLs are kept
 in the edit log and images; `ls` shows `+`.
 
-What security does **not** cover yet: data transfer encryption (`dfs.encrypt.data.transfer`,
-`dfs.data.transfer.protection`). Permission checks run before an
+**Data transfer encryption** (HDFS `dfs.encrypt.data.transfer`,
+`dfs.data.transfer.protection`): with `--encrypt-data-transfer` on the
+NameNode (it tells clients through getServerDefaults and hands out data
+encryption keys; block access tokens come on with it) and the DataNodes,
+every connection to a data port must authenticate and encrypt; with
+`--data-transfer-protection authentication|integrity|privacy` on the
+DataNodes, connections authenticate with the block's access token at that
+level (as Kerberized HDFS clusters run). The handshake is Hadoop's
+(`SaslDataTransferServer`: magic number, SASL DIGEST-MD5); a connection
+without it is refused. For performance, privacy uses **AES/CTR** whenever
+the client offers it (`dfs.encrypt.data.transfer.cipher.suites=AES/CTR/NoPadding`;
+DataNodes always offer it to each other): fresh AES keys sent under the
+SASL layer, then a plain AES-CTR stream, with AES-NI where the CPU has it
+and no framing (blocks carry their own checksums). Clients that do not
+offer AES get DIGEST-MD5 wrapping (RC4), much slower. On one loopback
+connection, reads run at about 85% of plaintext speed with AES/CTR, and
+about a sixth of it with per-message SASL (`cargo test --release -p
+pillar-datanode --test data_encryption -- --ignored`). Block token
+identifiers are Hadoop's `BlockTokenIdentifier` (Writable form), which
+Hadoop clients decode for this handshake.
+
+What security does **not** cover yet: permission checks run before an
 operation rather than under one namespace lock, so a concurrent chmod can
 race an operation that already passed its check.
 

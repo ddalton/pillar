@@ -1,3 +1,4 @@
+pub mod crypto_stream;
 pub mod digest_md5;
 pub mod grpc_auth;
 pub mod hdfs;

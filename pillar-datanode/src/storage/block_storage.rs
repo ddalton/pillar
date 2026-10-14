@@ -82,6 +82,10 @@ pub struct BlockStorage {
     /// Block access token keys from the NameNode; every data transfer
     /// checks its token here (a no-op until the NameNode sends keys).
     pub tokens: BlockTokenVerifier,
+
+    /// Data transfer encryption / protection this DataNode requires
+    /// (unset: none); see [`crate::transport::sasl`].
+    pub data_security: std::sync::OnceLock<crate::transport::sasl::DataSecurity>,
 }
 
 /// A change to the set of finalized replicas, for incremental block reports.
@@ -104,6 +108,7 @@ impl BlockStorage {
             events: Mutex::new(None),
             events_notify: tokio::sync::Notify::new(),
             tokens: BlockTokenVerifier::default(),
+            data_security: std::sync::OnceLock::new(),
             visible: DashMap::new(),
         };
 

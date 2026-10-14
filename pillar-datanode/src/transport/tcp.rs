@@ -45,7 +45,7 @@ impl DataTransport for TcpTransport {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        let data = self.pool.read_block(peer_addr, block_id, gen_stamp, offset, length, self.block_storage.tokens.mint(block_id, mode::READ)).await?;
+        let data = self.pool.read_block(&self.block_storage, peer_addr, block_id, gen_stamp, offset, length, self.block_storage.tokens.mint(block_id, mode::READ)).await?;
         debug!("Read {} bytes of block {} from {} via TCP", data.len(), block_id, peer_addr);
         Ok(data)
     }
@@ -57,7 +57,7 @@ impl DataTransport for TcpTransport {
         gen_stamp: u64,
         chunks: BlockChunks,
     ) -> Result<u64> {
-        let stored = self.pool.send_block(peer_addr, block_id, gen_stamp, chunks, self.block_storage.tokens.mint(block_id, mode::WRITE)).await?;
+        let stored = self.pool.send_block(&self.block_storage, peer_addr, block_id, gen_stamp, chunks, self.block_storage.tokens.mint(block_id, mode::WRITE)).await?;
         debug!("Sent block {} ({} bytes) to {} via TCP", block_id, stored, peer_addr);
         Ok(stored)
     }

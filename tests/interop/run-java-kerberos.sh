@@ -7,10 +7,18 @@
 #
 #   tests/interop/run-java-kerberos.sh       # needs a JDK (11+), curl, MIT krb5
 #   RPC_PROTECTION=privacy tests/interop/run-java-kerberos.sh   # hadoop.rpc.protection
+#   DATA_PROTECTION=privacy tests/interop/run-java-kerberos.sh  # dfs.data.transfer.protection
 set -euo pipefail
 
 HADOOP_VERSION=${HADOOP_VERSION:-3.5.0}
 export RPC_PROTECTION=${RPC_PROTECTION:-authentication}
+export DATA_PROTECTION=${DATA_PROTECTION:-}
+DN_DATA_FLAGS=()
+if [ -n "$DATA_PROTECTION" ]; then
+    DN_DATA_FLAGS=(--data-transfer-protection "$DATA_PROTECTION")
+    # The DataNodes log how each connection was secured (checked below).
+    export RUST_LOG="info,krb5=warn,pillar_datanode::transport::sasl=debug"
+fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 CACHE=${PILLAR_INTEROP_CACHE:-$HOME/.cache/pillar-interop}
@@ -51,7 +59,7 @@ datanode() { # index uuid [kerberos flags...]; $DN_PROTECTION overrides the prot
     mkdir -p "$WORK/dn$i"
     "$BIN/pillar-datanode" --namenode 127.0.0.1:19100 --uuid "$uuid" --hostname 127.0.0.1 \
         --rpc-addr "127.0.0.1:1996$i" --data-addr "127.0.0.1:5011$i" --http-addr "127.0.0.1:5017$i" \
-        --volume-mount-point "$WORK/dn$i" --transport tcp --rpc-protection "${DN_PROTECTION:-$RPC_PROTECTION}" "$@" >"$WORK/dn$i.log" 2>&1 &
+        --volume-mount-point "$WORK/dn$i" --transport tcp --rpc-protection "${DN_PROTECTION:-$RPC_PROTECTION}" ${DN_DATA_FLAGS[@]+"${DN_DATA_FLAGS[@]}"} "$@" >"$WORK/dn$i.log" 2>&1 &
     echo $! >"$WORK/dn$i.pid"
 }
 for i in 0 1 2; do
@@ -102,4 +110,18 @@ fi
 # The DataNode-to-NameNode authentication against this KDC: replays, users
 # and forged NameNode replies are refused.
 (cd "$ROOT" && PILLAR_KDC_DIR=$KDC cargo test -q -p pillar-common --lib grpc_auth 2>&1 | tail -3) || fail "grpc_auth tests"
-echo "Kerberos interop passed (Hadoop $HADOOP_VERSION, RPC protection $RPC_PROTECTION)"
+if [ -n "$DATA_PROTECTION" ]; then
+    # The client's data connections used block-token SASL at the level asked
+    # for (AES/CTR for privacy, the client offering it).
+    case "$DATA_PROTECTION" in
+        privacy) want="AES/CTR for" ;;
+        integrity) want="SASL integrity for" ;;
+        *) want="" ;;
+    esac
+    if [ -n "$want" ]; then
+        n=$(cat "$WORK"/dn[0-2].log | grep -c "$want" || true)
+        [ "$n" -gt 0 ] || fail "no data connection negotiated '$want'"
+        echo "ok    data transfer protection $DATA_PROTECTION: $n connections ($want ...)"
+    fi
+fi
+echo "Kerberos interop passed (Hadoop $HADOOP_VERSION, RPC protection $RPC_PROTECTION, data transfer protection ${DATA_PROTECTION:-none})"

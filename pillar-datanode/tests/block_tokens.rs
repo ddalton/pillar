@@ -189,8 +189,8 @@ async fn data_transfers_need_a_valid_token_for_the_block() {
     let token = other.tokens.mint(b.block_id, mode::READ);
     let got = wire::read_block(&mut s, b.block_id, b.generation_stamp, 0, 100, token).await.unwrap();
     assert_eq!(&got[..], &data[..100]);
-    assert!(wire::replica_info(&peer, b.block_id, None).await.is_err());
-    assert!(wire::replica_info(&peer, b.block_id, other.tokens.mint(b.block_id, mode::READ)).await.unwrap().is_some());
+    assert!(wire::replica_info(other, &peer, b.block_id, None).await.is_err());
+    assert!(wire::replica_info(other, &peer, b.block_id, other.tokens.mint(b.block_id, mode::READ)).await.unwrap().is_some());
 
     // Re-replication: DataNodes copy blocks to each other with tokens
     // they mint themselves.
