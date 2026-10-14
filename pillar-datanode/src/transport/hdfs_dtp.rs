@@ -46,9 +46,15 @@
 //! receives it with stage `TRANSFER_RBW` (kept as a replica being written,
 //! for the recovery that follows) or `TRANSFER_FINALIZED`.
 //!
+//! Block access tokens: when the NameNode has sent this DataNode its keys,
+//! every op must carry a token for its block, minted by the NameNode, with
+//! the access the op needs (READ, WRITE, COPY for a transfer); others are
+//! refused with `ERROR_ACCESS_TOKEN`. The DataNode mints its own tokens for
+//! the copies it makes. Data transfer encryption (SASL on this port) is not
+//! supported: a client must have `dfs.encrypt.data.transfer` off.
+//!
 //! Not supported (`ERROR_UNSUPPORTED`): block checksums and short-circuit
-//! reads. There is no SASL / block-token handling: this is
-//! for clusters without Kerberos.
+//! reads.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -63,12 +69,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use pillar_proto::hdfs::{
-    op_write_block_proto::BlockConstructionStage, BlockOpResponseProto, ChecksumProto, ChecksumTypeProto,
+    op_write_block_proto::BlockConstructionStage, BaseHeaderProto, BlockOpResponseProto, ChecksumProto, ChecksumTypeProto,
     ClientReadStatusProto, DatanodeInfoProto, OpReadBlockProto, OpTransferBlockProto, OpWriteBlockProto,
     PacketHeaderProto, PipelineAckProto, ReadOpChecksumInfoProto, Status,
 };
 
 use super::{Result, TransportError};
+use pillar_common::hdfs::block_token::mode;
+
 use crate::storage::block_storage::{BlockId, BlockStorage, BlockStorageError};
 
 /// `DataTransferProtocol.DATA_TRANSFER_VERSION`.
@@ -287,15 +295,24 @@ where
     }
     match socket.read_u8().await? {
         OP_WRITE_BLOCK => {
-            let op = read_delimited(socket).await?;
+            let op: OpWriteBlockProto = read_delimited(socket).await?;
+            if !check_token(socket, storage, &op.header.base_header, mode::WRITE, peer).await? {
+                return Ok(());
+            }
             write_block(socket, storage, op, peer).await
         }
         OP_READ_BLOCK => {
-            let op = read_delimited(socket).await?;
+            let op: OpReadBlockProto = read_delimited(socket).await?;
+            if !check_token(socket, storage, &op.header.base_header, mode::READ, peer).await? {
+                return Ok(());
+            }
             read_block(socket, storage, op, peer).await
         }
         OP_TRANSFER_BLOCK => {
-            let op = read_delimited(socket).await?;
+            let op: OpTransferBlockProto = read_delimited(socket).await?;
+            if !check_token(socket, storage, &op.header.base_header, mode::COPY, peer).await? {
+                return Ok(());
+            }
             transfer_block(socket, storage, op, peer).await
         }
         op => {
@@ -304,6 +321,25 @@ where
             write_delimited(socket, &r).await?;
             socket.flush().await?;
             Ok(())
+        }
+    }
+}
+
+/// Whether the op's block access token grants `access` to its block; if
+/// not, the client is told so (`ERROR_ACCESS_TOKEN`, which makes a Hadoop
+/// client fetch a fresh token from the NameNode and retry).
+async fn check_token<S>(socket: &mut S, storage: &BlockStorage, h: &BaseHeaderProto, access: u8, peer: SocketAddr) -> Result<bool>
+where
+    S: AsyncWrite + Unpin,
+{
+    match storage.tokens.verify(h.token.as_ref(), h.block.block_id, access) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            warn!("Refusing access {} to block {} from {}: {}", access, h.block.block_id, peer, e);
+            let msg = format!("block access token for block {}: {}", h.block.block_id, e);
+            write_delimited(socket, &op_response(Status::ErrorAccessToken, &msg)).await?;
+            socket.flush().await?;
+            Ok(false)
         }
     }
 }
@@ -994,6 +1030,10 @@ async fn send_replica(storage: &Arc<BlockStorage>, op: &OpTransferBlockProto) ->
     let mut header = op.header.clone();
     header.base_header.block.generation_stamp = id.generation_stamp;
     header.base_header.block.num_bytes = Some(len);
+    // The client's token allows the copy; the target wants one to write.
+    if let Some(token) = storage.tokens.mint(b.block_id, mode::WRITE) {
+        header.base_header.token = Some(token);
+    }
     let stage = if rbw { BlockConstructionStage::TransferRbw } else { BlockConstructionStage::TransferFinalized };
     let write = OpWriteBlockProto {
         header,

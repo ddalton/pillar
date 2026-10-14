@@ -1,3 +1,4 @@
+use pillar_common::hdfs::block_token::BlockTokenVerifier;
 use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom};
@@ -77,6 +78,10 @@ pub struct BlockStorage {
     /// (HDFS `bytesAcked`). Readers of a file still being written may read
     /// that far: it is what hflush guarantees.
     visible: DashMap<u64, (BlockId, u64)>,
+
+    /// Block access token keys from the NameNode; every data transfer
+    /// checks its token here (a no-op until the NameNode sends keys).
+    pub tokens: BlockTokenVerifier,
 }
 
 /// A change to the set of finalized replicas, for incremental block reports.
@@ -98,6 +103,7 @@ impl BlockStorage {
             total_bytes: AtomicU64::new(0),
             events: Mutex::new(None),
             events_notify: tokio::sync::Notify::new(),
+            tokens: BlockTokenVerifier::default(),
             visible: DashMap::new(),
         };
 

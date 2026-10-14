@@ -30,6 +30,8 @@ pub struct ClientNamenodeService {
     datanode_commands: std::sync::OnceLock<Arc<crate::grpc::DatanodeProtocolService>>,
     /// Block recoveries under way, by inode.
     recovering: dashmap::DashMap<u64, Recovering>,
+    /// Mints block access tokens, when they are enabled.
+    block_tokens: std::sync::OnceLock<Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>>,
 }
 
 /// A block recovery under way.
@@ -62,7 +64,19 @@ impl ClientNamenodeService {
             leases: Arc::new(LeaseManager::default()),
             datanode_commands: std::sync::OnceLock::new(),
             recovering: dashmap::DashMap::new(),
+            block_tokens: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Issue block access tokens with `manager`.
+    pub fn set_block_tokens(&self, manager: Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>) {
+        let _ = self.block_tokens.set(manager);
+    }
+
+    /// A block access token for `user` to `block_id` with `modes`; empty
+    /// when tokens are off.
+    pub fn block_token(&self, user: &str, block_id: u64, modes: u8) -> pillar_proto::hadoop::common::TokenProto {
+        self.block_tokens.get().map(|m| m.generate(user, block_id, modes)).unwrap_or_default()
     }
 
     /// Send block recovery commands through `commands`.

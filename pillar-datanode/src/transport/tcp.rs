@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
+use pillar_common::hdfs::block_token::mode;
 use crate::storage::block_storage::BlockStorage;
 use super::wire::{self, ConnPool};
 use super::{BlockChunks, DataTransport, Result, TransportType};
@@ -44,7 +45,7 @@ impl DataTransport for TcpTransport {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        let data = self.pool.read_block(peer_addr, block_id, gen_stamp, offset, length).await?;
+        let data = self.pool.read_block(peer_addr, block_id, gen_stamp, offset, length, self.block_storage.tokens.mint(block_id, mode::READ)).await?;
         debug!("Read {} bytes of block {} from {} via TCP", data.len(), block_id, peer_addr);
         Ok(data)
     }
@@ -56,7 +57,7 @@ impl DataTransport for TcpTransport {
         gen_stamp: u64,
         chunks: BlockChunks,
     ) -> Result<u64> {
-        let stored = self.pool.send_block(peer_addr, block_id, gen_stamp, chunks).await?;
+        let stored = self.pool.send_block(peer_addr, block_id, gen_stamp, chunks, self.block_storage.tokens.mint(block_id, mode::WRITE)).await?;
         debug!("Sent block {} ({} bytes) to {} via TCP", block_id, stored, peer_addr);
         Ok(stored)
     }

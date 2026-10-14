@@ -307,10 +307,10 @@ async fn one_connection_serves_many_requests() {
     let mut s = tokio::net::TcpStream::connect(node.addr).await.unwrap();
     use pillar_datanode::transport::wire;
     for i in 0..5u64 {
-        let got = wire::read_block(&mut s, 9, 1, i * 1000, 1000).await.unwrap();
+        let got = wire::read_block(&mut s, 9, 1, i * 1000, 1000, None).await.unwrap();
         assert_eq!(&got[..], &data[(i * 1000) as usize..(i * 1000 + 1000) as usize]);
         assert!(matches!(
-            wire::read_block(&mut s, 12345, 1, 0, 10).await,
+            wire::read_block(&mut s, 12345, 1, 0, 10, None).await,
             Err(pillar_datanode::transport::TransportError::BlockNotFound(12345))
         ));
     }

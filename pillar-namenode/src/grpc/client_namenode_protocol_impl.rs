@@ -4,6 +4,7 @@ use tracing::{info, warn, error};
 
 use pillar_proto::hadoop::hdfs::*;
 use crate::grpc::ClientNamenodeService;
+use pillar_common::hdfs::block_token::mode;
 
 /// The user a request runs as: the Hadoop IPC connection's effective user
 /// (SIMPLE auth), or `hdfs` for gRPC callers, which carry none.
@@ -224,6 +225,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<GetBlockLocationsRequestProto>,
     ) -> Result<Response<GetBlockLocationsResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
         let offset = req.offset;
@@ -237,9 +239,9 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         let located_blocks = LocatedBlocksProto {
             file_length: located.file_length,
-            blocks: located.blocks.into_iter().map(|b| located_block_to_proto(b, self.service.block_pool_id())).collect(),
+            blocks: located.blocks.into_iter().map(|b| self.located_for(b, &user, mode::READ)).collect(),
             under_construction: located.under_construction,
-            last_block: located.last_block.map(|b| located_block_to_proto(b, self.service.block_pool_id())),
+            last_block: located.last_block.map(|b| self.located_for(b, &user, mode::READ)),
             is_last_block_complete: located.is_last_block_complete,
             file_encryption_info: None,
             ec_policy: None,
@@ -255,6 +257,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<AddBlockRequestProto>,
     ) -> Result<Response<AddBlockResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
 
@@ -310,7 +313,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                             })
                             .collect(),
                         corrupt: false,
-                        block_token: Default::default(),
+                        block_token: self.service.block_token(&user, block.block_id, mode::WRITE),
                         is_cached: vec![],
                         storage_types: vec![],
                         storage_i_ds: vec![],
@@ -512,6 +515,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<AppendRequestProto>,
     ) -> Result<Response<AppendResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         // CreateFlagProto NEW_BLOCK = 0x20.
         let new_block = req.flag.unwrap_or(0) & 0x20 != 0;
@@ -520,7 +524,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         // next call is then addBlock.
         let last = self.service.handle_append_as(&req.src, new_block, &req.client_name).await?;
         let stat = file_status_proto(self.service.handle_get_file_info(&req.src).await?, req.src);
-        let block = last.map(|b| located_block_to_proto(b, self.service.block_pool_id()));
+        let block = last.map(|b| self.located_for(b, &user, mode::WRITE));
         Ok(Response::new(AppendResponseProto { block, stat: Some(stat) }))
     }
 
@@ -543,6 +547,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<GetAdditionalDatanodeRequestProto>,
     ) -> Result<Response<GetAdditionalDatanodeResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let path = req.src;
         let block = req.blk;
@@ -619,7 +624,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 offset: located_block.offset,
                 locs,
                 corrupt: false,
-                block_token: Default::default(),
+                block_token: self.service.block_token(&user, located_block.block_id, mode::COPY | mode::WRITE),
                 is_cached: vec![],
                 storage_types: vec![],
                 storage_i_ds: vec![],
@@ -635,6 +640,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         &self,
         request: Request<UpdateBlockForPipelineRequestProto>,
     ) -> Result<Response<UpdateBlockForPipelineResponseProto>, Status> {
+        let user = caller(&request);
         let req = request.into_inner();
         let block = req.block;
 
@@ -696,7 +702,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                 offset: located_block.offset,
                 locs,
                 corrupt: false,
-                block_token: Default::default(),
+                block_token: self.service.block_token(&user, located_block.block_id, mode::WRITE),
                 is_cached: vec![],
                 storage_types: vec![],
                 storage_i_ds: vec![],
@@ -1564,6 +1570,16 @@ fn datanode_report_proto(dn: crate::grpc::client_namenode_service::DatanodeRepor
 }
 
 /// Convert a service-level LocatedBlock into the wire LocatedBlockProto.
+impl ClientNamenodeProtocolServer {
+    /// A located block for a client, with a token for `user` granting `modes`.
+    fn located_for(&self, b: crate::grpc::client_namenode_service::LocatedBlock, user: &str, modes: u8) -> LocatedBlockProto {
+        let token = self.service.block_token(user, b.block_id, modes);
+        let mut proto = located_block_to_proto(b, self.service.block_pool_id());
+        proto.block_token = token;
+        proto
+    }
+}
+
 fn located_block_to_proto(b: crate::grpc::client_namenode_service::LocatedBlock, pool_id: &str) -> LocatedBlockProto {
     fill_storages(LocatedBlockProto {
         b: ExtendedBlockProto {

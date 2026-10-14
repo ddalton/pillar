@@ -57,6 +57,10 @@ struct Args {
     #[clap(long)]
     kerberos_principal: Option<String>,
 
+    /// Require block access tokens on DataNodes (always on with Kerberos).
+    #[clap(long)]
+    block_access_tokens: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -104,6 +108,7 @@ async fn main() -> Result<()> {
     if args.kerberos_principal.is_some() {
         config.kerberos_principal = args.kerberos_principal;
     }
+    config.block_access_tokens |= args.block_access_tokens;
 
     info!("Configuration loaded from environment and CLI arguments");
     info!("Etcd endpoints: {:?}", config.etcd_endpoints);
