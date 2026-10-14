@@ -81,14 +81,16 @@ spec:
           mountPath: /mnt/pillar-data
         resources:
           {{- toYaml .Values.datanode.resources | nindent 10 }}
+        # The data port: the DataNode serves no separate RPC port yet, so a
+        # probe on `rpc` fails forever and the kubelet kills the container.
         livenessProbe:
           tcpSocket:
-            port: rpc
+            port: data
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           tcpSocket:
-            port: rpc
+            port: data
           initialDelaySeconds: 10
           periodSeconds: 5
   volumeClaimTemplates:

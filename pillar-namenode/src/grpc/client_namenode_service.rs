@@ -1005,6 +1005,30 @@ impl ClientNamenodeService {
         Ok(())
     }
 
+    /// HDFS getContentSummary (`hdfs dfs -count`, `-du -s`): totals over
+    /// the subtree at `path`, which counts itself if it is a directory.
+    pub async fn handle_get_content_summary(&self, path: &str) -> Result<ContentSummary, Status> {
+        let root = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let mut summary = ContentSummary::default();
+        let mut stack = vec![root];
+        while let Some(inode) = stack.pop() {
+            let guard = inode.read().await;
+            if guard.is_dir {
+                summary.directory_count += 1;
+                let children: Vec<u64> =
+                    guard.children.iter().flat_map(|c| c.iter().map(|e| *e.value())).collect();
+                drop(guard);
+                stack.extend(children.into_iter().filter_map(|id| self.namespace.get_inode(id)));
+            } else {
+                let length: u64 = guard.blocks.iter().flatten().map(|b| b.num_bytes).sum();
+                summary.file_count += 1;
+                summary.length += length;
+                summary.space_consumed += length * guard.replication as u64;
+            }
+        }
+        Ok(summary)
+    }
+
     /// Get file length
     async fn get_file_length(&self, inode: &INode) -> u64 {
         if inode.is_dir {
@@ -1015,6 +1039,16 @@ impl ClientNamenodeService {
             .map(|blocks| blocks.iter().map(|b| b.num_bytes).sum())
             .unwrap_or(0)
     }
+}
+
+/// Totals over a subtree (HDFS ContentSummary).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentSummary {
+    pub length: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    /// Bytes stored counting every replica.
+    pub space_consumed: u64,
 }
 
 /// DataNode report information
@@ -1101,6 +1135,28 @@ fn namespace_status(e: crate::metadata::namespace::NamespaceError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn content_summary_totals_the_subtree() {
+        let namespace = Arc::new(Namespace::new());
+        let datanodes = Arc::new(DatanodeManager::new());
+        let placement = Arc::new(BlockPlacementPolicy::new(datanodes.clone(), 3));
+        let service = ClientNamenodeService::new(namespace.clone(), Arc::new(BlockManager::new()), datanodes, placement);
+        service.handle_mkdirs("/t/a/b", "u".into(), "g".into(), 0o755, true).await.unwrap();
+        for (path, lens, replication) in [("/t/f", vec![10u64, 3], 3u16), ("/t/a/g", vec![5], 2), ("/t/a/b/empty", vec![], 3)] {
+            service.handle_create(path, "u".into(), "g".into(), 0o644, replication, 1 << 20).await.unwrap();
+            let inode = namespace.lookup(path).await.unwrap();
+            let mut inode = inode.write().await;
+            for (i, len) in lens.into_iter().enumerate() {
+                inode.add_block(crate::metadata::namespace::BlockInfo { block_id: i as u64, generation_stamp: 1, num_bytes: len });
+            }
+        }
+        let s = service.handle_get_content_summary("/t").await.unwrap();
+        assert_eq!(s, ContentSummary { length: 18, file_count: 3, directory_count: 3, space_consumed: 13 * 3 + 5 * 2 });
+        let f = service.handle_get_content_summary("/t/f").await.unwrap();
+        assert_eq!((f.file_count, f.directory_count, f.length), (1, 0, 13));
+        assert_eq!(service.handle_get_content_summary("/nope").await.unwrap_err().code(), tonic::Code::NotFound);
+    }
 
     #[tokio::test]
     async fn test_file_operations() {
