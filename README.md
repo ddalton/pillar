@@ -349,10 +349,16 @@ durable). Unlike HDFS, it also drops a finished last block whose every
 replica holder is offline at the time; DataNode-side block recovery is not
 implemented yet.
 
+**hflush / hsync.** A DataNode acknowledges a packet only once it is on
+its disk (fsynced first for hsync), and the acknowledged length of a block
+being written is what readers may see: another client reading a file that
+is still open gets its complete blocks plus, from the last block's
+DataNodes (`getReplicaVisibleLength` on the DataNode IPC port), everything
+the writer hflushed. `hsync` with `UPDATE_LENGTH` records the length on the
+NameNode, so the file's status shows it.
+
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
-reading hflushed data of a file still being written (the DataNode has no
-`getReplicaVisibleLength` RPC yet) and hsync's length update, NameNode-driven
-block recovery, block checksum (`-checksum`), short-circuit
+NameNode-driven block recovery, block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with
 `UnsupportedOperationException` rather than pretending to succeed.

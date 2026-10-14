@@ -576,13 +576,20 @@ impl ClientNamenodeService {
                 return Err(Status::invalid_argument("Cannot get blocks for directory"));
             }
 
-            // An open file shows its finished blocks; the one being written
-            // has no length a reader could rely on (no hflush yet).
-            let blocks = inode_guard.finished_blocks();
-            let file_length: u64 = blocks.iter().map(|b| b.num_bytes).sum();
-            let last = blocks.last().map(|b| (b.clone(), file_length - b.num_bytes));
+            // As in HDFS, the length excludes a block being written: a reader
+            // asks that block's DataNodes how much of it is visible (what the
+            // writer hflushed) and adds it. That block is the incomplete
+            // last block, at the end of the complete ones.
+            let all = inode_guard.blocks.as_deref().unwrap_or(&[]);
+            let writing = inode_guard.open_block().cloned();
+            let complete = if writing.is_some() { &all[..all.len() - 1] } else { all };
+            let file_length: u64 = complete.iter().map(|b| b.num_bytes).sum();
+            let last = match &writing {
+                Some(b) => Some((b.clone(), file_length)),
+                None => complete.last().map(|b| (b.clone(), file_length - b.num_bytes)),
+            };
             let open = inode_guard.under_construction.is_some();
-            (Self::blocks_in_range(blocks, offset, length), file_length, last, open)
+            (Self::blocks_in_range(complete, offset, length), file_length, last.map(|l| (l, writing.is_none())), open)
         };
 
         let blocks = selected
@@ -590,8 +597,9 @@ impl ClientNamenodeService {
             .map(|(block, block_offset)| self.locate(&block, block_offset))
             .collect();
 
-        let is_last_block_complete = last.is_some();
-        let last_block = last.map(|(block, block_offset)| self.locate(&block, block_offset));
+        // HDFS: false for a file with no blocks, and while one is written.
+        let is_last_block_complete = matches!(last, Some((_, true)));
+        let last_block = last.map(|((block, block_offset), _)| self.locate(&block, block_offset));
 
         Ok(LocatedBlocks {
             file_length,
@@ -636,14 +644,18 @@ impl ClientNamenodeService {
     /// Build a LocatedBlock for a block at a given file offset.
     fn locate(&self, block: &crate::metadata::namespace::BlockInfo, offset: u64) -> LocatedBlock {
         let block_id = BlockId::new(block.block_id, block.generation_stamp);
+        // Finished replicas; for a block being written (none finished yet),
+        // the DataNodes of its pipeline.
+        let mut locations = self.block_manager.get_block_locations(&block_id).unwrap_or_default();
+        if locations.is_empty() {
+            locations = self.block_manager.get_expected_locations(&block_id);
+        }
         LocatedBlock {
             block_id: block.block_id,
             generation_stamp: block.generation_stamp,
             num_bytes: block.num_bytes,
             offset,
-            locations: self.block_manager
-                .get_block_locations(&block_id)
-                .unwrap_or_default(),
+            locations,
         }
     }
 
@@ -704,6 +716,7 @@ impl ClientNamenodeService {
             num_bytes: 0,
         };
         inode_guard.add_block(block.clone());
+        self.block_manager.set_expected_locations(block_id, &targets);
         tx.log(EditOp::AddBlock { inode: inode_guard.id, block });
         drop(inode_guard);
         tx.commit().await.map_err(edit_status)?;
@@ -821,6 +834,9 @@ impl ClientNamenodeService {
 
         let id = inode_guard.id;
         inode_guard.under_construction = None;
+        for b in inode_guard.blocks.iter().flatten() {
+            self.block_manager.clear_expected_locations(&BlockId::new(b.block_id, b.generation_stamp));
+        }
         drop(inode_guard);
         tx.log(EditOp::Close { inode: id });
         tx.commit().await.map_err(edit_status)?;
@@ -883,6 +899,32 @@ impl ClientNamenodeService {
         Ok(last)
     }
 
+    /// fsync (hflush/hsync): with a length (hsync's UPDATE_LENGTH), record
+    /// it as the length of the block being written, durably, so the file's
+    /// status shows it. Without one, nothing to record: the blocks are
+    /// already persisted as they are allocated.
+    pub async fn handle_fsync(&self, path: &str, client: &str, last_block_length: Option<i64>) -> Result<(), Status> {
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let mut tx = self.begin().await?;
+        let mut guard = inode.write().await;
+        check_holder(&guard, path, client)?;
+        let Some(len) = last_block_length.filter(|l| *l >= 0).map(|l| l as u64) else { return Ok(()) };
+        let inode_id = guard.id;
+        let Some(open) = guard.open_block().cloned() else { return Ok(()) };
+        if len <= open.num_bytes {
+            return Ok(());
+        }
+        if let Some(b) = guard.blocks.iter_mut().flatten().find(|b| b.block_id == open.block_id) {
+            b.num_bytes = len;
+        }
+        drop(guard);
+        let _ = self.block_manager.update_block_size(&BlockId::new(open.block_id, open.generation_stamp), len);
+        tx.log(EditOp::CommitBlock { inode: inode_id, block_id: open.block_id, num_bytes: len });
+        tx.commit().await.map_err(edit_status)?;
+        debug!("fsync {}: block {} is {} bytes", path, open.block_id, len);
+        Ok(())
+    }
+
     /// updatePipeline: the client rebuilt the pipeline of a block it is
     /// writing (a DataNode failed). The generation stamp was bumped by
     /// updateBlockForPipeline; replicas outside the new pipeline are stale.
@@ -905,6 +947,9 @@ impl ClientNamenodeService {
                 self.block_manager.drop_replica(&block, &holder.uuid);
             }
         }
+        let pipeline: Vec<DatanodeId> =
+            new_nodes.iter().filter_map(|u| self.datanode_manager.get_datanode(u).map(|d| d.id)).collect();
+        self.block_manager.set_expected_locations(block, &pipeline);
         info!("Pipeline of block {} rebuilt (generation stamp {}) on {:?}", block_id, new_generation_stamp, new_nodes);
         Ok(())
     }
@@ -1626,9 +1671,12 @@ mod tests {
         assert_eq!((last.block_id, last.offset, last.num_bytes), (block1.block_id, 0, 64 * 1024 * 1024));
         assert_eq!(blocks().await, 1);
         assert!(!service.handle_is_file_closed("/test.txt").await.unwrap());
-        // Readers still see it at its old length meanwhile.
+        // Meanwhile it is the block being written: readers get it as the
+        // incomplete last block (its DataNodes report the visible length).
         let located = service.handle_get_located_blocks("/test.txt", 0, u64::MAX).await.unwrap();
-        assert_eq!(located.file_length, 64 * 1024 * 1024);
+        assert_eq!((located.file_length, located.is_last_block_complete), (0, false));
+        let last = located.last_block.unwrap();
+        assert_eq!((last.offset, last.num_bytes), (0, 64 * 1024 * 1024));
         close_file(&service, "/test.txt").await;
         // With CreateFlag.NEW_BLOCK it is left alone: the client adds one.
         assert!(service.handle_append("/test.txt", true).await.unwrap().is_none());
@@ -4253,9 +4301,13 @@ mod tests {
         service.handle_append("/t", true).await.unwrap();
         let b = service.handle_add_block("/t").await.unwrap();
         service.handle_commit_block("/t", b.block_id, 5).await.unwrap();
-        // The block being written is visible once it has a committed length.
+        // The block being written is the incomplete last block, at the end
+        // of the complete ones, and not part of the length (a reader adds
+        // what its DataNodes say is visible).
         let open = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
-        assert_eq!((offsets(&open.blocks), open.under_construction), (vec![0, 100, 120, 190], true));
+        assert_eq!((offsets(&open.blocks), open.under_construction), (vec![0, 100, 120], true));
+        assert_eq!((open.file_length, open.is_last_block_complete), (190, false));
+        assert_eq!(open.last_block.as_ref().map(|b| (b.block_id, b.offset)), Some((b.block_id, 190)));
         close_file(&service, "/t").await;
         let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
         assert_eq!(offsets(&located.blocks), vec![0, 100, 120, 190]);

@@ -259,6 +259,12 @@ async fn a_lost_replica_is_re_replicated_and_deleted_files_are_cleaned_up() {
     let mut w = fs.create("/r.bin", opts).await.unwrap();
     w.write_bytes(Bytes::from(data.clone())).await.unwrap();
     w.close().await.unwrap();
+    // complete() needs one reported replica (HDFS min replication); the
+    // other DataNode's report may land a moment later.
+    eventually("both replicas reported", || {
+        c.blocks.blocks_snapshot().first().is_some_and(|(_, _, _, h)| h.len() == 2)
+    })
+    .await;
 
     let snapshot = c.blocks.blocks_snapshot();
     assert_eq!(snapshot.len(), 1);

@@ -20,10 +20,10 @@ macro_rules! methods {
                     let req = <$req>::decode(body).map_err(|e| RpcError::bad_request(method, e))?;
                     let mut req = tonic::Request::new(req);
                     req.extensions_mut().insert(super::CallerUser(user.to_string()));
-                    let resp = svc.$method(req).await.map_err(RpcError::from_status)?;
+                    let resp = svc.$method(req).await.map_err(super::rpc_error)?;
                     Ok(resp.into_inner().encode_to_vec())
                 })*
-                _ => Err(RpcError::no_such_method(method)),
+                _ => Err(RpcError::no_such_method(method, super::CLIENT_PROTOCOL)),
             }
         }
 

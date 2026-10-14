@@ -173,6 +173,11 @@ pub struct BlockManager {
     /// Replicas of removed blocks still on DataNodes: uuid -> blocks to
     /// delete, handed out with that DataNode's next heartbeat.
     pending_invalidations: DashMap<String, Vec<BlockId>>,
+
+    /// Blocks being written: the DataNodes of their pipeline (HDFS
+    /// "expected locations"). Readers of a file still open ask them how much
+    /// of the block is visible; no replica is reported until it is finished.
+    expected_locations: DashMap<BlockId, Vec<DnIndex>>,
 }
 
 impl BlockManager {
@@ -186,7 +191,25 @@ impl BlockManager {
             next_generation_stamp: AtomicU64::new(1000),
             default_block_size: 128 * 1024 * 1024, // 128 MB
             pending_invalidations: DashMap::new(),
+            expected_locations: DashMap::new(),
         }
+    }
+
+    /// The DataNodes writing `block` (its pipeline).
+    pub fn set_expected_locations(&self, block: BlockId, nodes: &[DatanodeId]) {
+        let idx = nodes.iter().map(|n| self.datanode_table.intern(n)).collect();
+        self.expected_locations.insert(block, idx);
+    }
+
+    /// The DataNodes writing `block`, if it is being written.
+    pub fn get_expected_locations(&self, block: &BlockId) -> Vec<DatanodeId> {
+        let idx = self.expected_locations.get(block).map(|e| e.value().clone()).unwrap_or_default();
+        self.datanode_table.resolve_all(&idx).into_iter().map(|d| (*d).clone()).collect()
+    }
+
+    /// `block` is no longer being written.
+    pub fn clear_expected_locations(&self, block: &BlockId) {
+        self.expected_locations.remove(block);
     }
 
     /// Allocate a new block for a file (lock-free using atomic operations)
@@ -360,6 +383,7 @@ impl BlockManager {
                 self.invalidate_replicas(block_id);
                 self.blocks.remove(block_id);
                 self.block_locations.remove(block_id);
+                self.expected_locations.remove(block_id);
             }
             blocks
         } else {
@@ -370,6 +394,7 @@ impl BlockManager {
     /// Forget a single block (e.g. abandoned, or dropped by truncate).
     pub fn remove_block(&self, block_id: &BlockId) -> Option<BlockInfo> {
         self.invalidate_replicas(block_id);
+        self.expected_locations.remove(block_id);
         let info = self.blocks.remove(block_id).map(|(_, info)| info);
         self.block_locations.remove(block_id);
         if let Some(info) = &info {
@@ -461,6 +486,9 @@ impl BlockManager {
             // Update block locations if they exist
             if let Some(locations) = self.block_locations.remove(&old_block_id) {
                 self.block_locations.insert(new_block_id, locations.1);
+            }
+            if let Some((_, pipeline)) = self.expected_locations.remove(&old_block_id) {
+                self.expected_locations.insert(new_block_id, pipeline);
             }
 
             // Update file blocks mapping

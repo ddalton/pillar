@@ -431,6 +431,13 @@ impl DataNode {
         self.namenode_client.send_block_report().await
             .map_err(|e| anyhow::anyhow!("Failed to send block report: {}", e))?;
 
+        // The IPC port: ClientDatanodeProtocol (getReplicaVisibleLength,
+        // for readers of files still being written).
+        let ipc = crate::ipc::serve(self.config.rpc_addr, self.block_storage.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind the IPC port {}: {}", self.config.rpc_addr, e))?;
+        info!("DataNode IPC (ClientDatanodeProtocol) on {}", ipc);
+
         // Start transport servers (TCP, and RDMA if available)
         self.transport_selector.start_all_servers().await;
 
@@ -440,7 +447,6 @@ impl DataNode {
             namenode_client.start_heartbeat_loop().await;
         });
 
-        info!("DataNode RPC server started on {}", self.config.rpc_addr);
         info!("DataNode data transfer server started on {}", self.config.data_addr);
         info!("DataNode HTTP UI available on {}", self.config.http_addr);
         info!("Supported transports: {}", self.transport_selector.supported_transports().join(", "));

@@ -15,6 +15,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
+import org.apache.hadoop.hdfs.client.HdfsDataOutputStream;
 
 /** Stock Hadoop DFSClient against Pillar: the code path `hadoop fs` uses. */
 public class HdfsInterop {
@@ -144,6 +145,32 @@ public class HdfsInterop {
         try (FSDataInputStream in = fs.open(ap)) { got = in.readAllBytes(); }
         check(got.length == head.length + 9 && Arrays.equals(Arrays.copyOf(got, head.length), head)
               && new String(got, head.length, 9).equals("tailxmore"), "append with NEW_BLOCK; content intact");
+
+        // hflush: another client reads what the writer flushed while the file
+        // is still open (the last block's DataNodes report its visible
+        // length); hsync(UPDATE_LENGTH) makes the NameNode's length catch up.
+        Path hp = new Path("/java/hflush.bin");
+        byte[] hd = new byte[(3 << 19) + 777];
+        new Random(11).nextBytes(hd);
+        int flushed = (1 << 20) + 300000;   // ends inside a checksum chunk
+        FileSystem reader = FileSystem.newInstance(fs.getUri(), conf);
+        try (FSDataOutputStream hout = fs.create(hp)) {
+            hout.write(hd, 0, flushed);
+            hout.hflush();
+            byte[] seen;
+            try (FSDataInputStream in = reader.open(hp)) { seen = in.readAllBytes(); }
+            check(seen.length == flushed && Arrays.equals(seen, Arrays.copyOf(hd, flushed)),
+                  "a reader sees hflushed data of an open file (" + seen.length + " bytes)");
+            hout.write(hd, flushed, hd.length - flushed);
+            ((HdfsDataOutputStream) hout).hsync(EnumSet.of(HdfsDataOutputStream.SyncFlag.UPDATE_LENGTH));
+            check(reader.getFileStatus(hp).getLen() == hd.length, "hsync(UPDATE_LENGTH) updates the length the NameNode reports");
+            try (FSDataInputStream in = reader.open(hp)) { seen = in.readAllBytes(); }
+            check(Arrays.equals(seen, hd), "a reader sees hsynced data, past the flushed partial chunk");
+        }
+        try (FSDataInputStream in = reader.open(hp)) {
+            check(Arrays.equals(in.readAllBytes(), hd), "the closed file has every byte");
+        }
+        reader.close();
 
         // Leases: one writer at a time; recoverLease takes a file from a
         // writer that is gone.
