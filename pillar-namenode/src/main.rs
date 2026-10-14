@@ -3,6 +3,7 @@ mod datanode;
 mod grpc;
 mod ipc;
 mod permission;
+mod proxy_users;
 mod server;
 
 use std::net::SocketAddr;
@@ -86,6 +87,11 @@ struct Args {
     #[clap(long)]
     user_groups: Option<String>,
 
+    /// Proxy users (hadoop.proxyuser.*): who may act as whom, from where,
+    /// "<user>.hosts=<list>;<user>.users=<list>;<user>.groups=<list>".
+    #[clap(long)]
+    proxy_users: Option<String>,
+
     /// Require block access tokens on DataNodes (always on with Kerberos).
     #[clap(long)]
     block_access_tokens: bool,
@@ -144,6 +150,9 @@ async fn main() -> Result<()> {
         config.rpc_protection = p;
     }
     config.block_access_tokens |= args.block_access_tokens;
+    if args.proxy_users.is_some() {
+        config.proxy_users = args.proxy_users;
+    }
     if let Some(on) = args.permissions {
         config.permissions.enabled = on;
     }

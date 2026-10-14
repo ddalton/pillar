@@ -74,6 +74,7 @@ pub struct ClientProtocol<T> {
     svc: Arc<T>,
     auth: Arc<Authentication>,
     protection: Protection,
+    proxy_users: Arc<crate::proxy_users::ProxyUsers>,
 }
 
 #[async_trait]
@@ -90,6 +91,10 @@ impl<T: ClientNamenodeProtocol> RpcHandler for ClientProtocol<T> {
         self.protection.clone()
     }
 
+    fn authorize_proxy(&self, real: &str, real_short: &str, effective: &str, addr: std::net::IpAddr) -> Result<(), String> {
+        self.proxy_users.authorize(real, real_short, effective, addr)
+    }
+
     async fn call(&self, method: &str, body: &[u8], user: &str) -> Result<Vec<u8>, RpcError> {
         dispatch::dispatch(&*self.svc, method, body, user).await
     }
@@ -104,11 +109,12 @@ pub async fn accept_loop<T>(
     svc: Arc<T>,
     auth: Arc<Authentication>,
     protection: Protection,
+    proxy_users: Arc<crate::proxy_users::ProxyUsers>,
     grpc: mpsc::Sender<std::io::Result<TcpStream>>,
 ) where
     T: ClientNamenodeProtocol,
 {
-    let handler = Arc::new(ClientProtocol { svc, auth, protection });
+    let handler = Arc::new(ClientProtocol { svc, auth, protection, proxy_users });
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -144,16 +150,18 @@ pub async fn bind_shared<T: ClientNamenodeProtocol>(
     addr: SocketAddr,
     svc: Arc<T>,
 ) -> std::io::Result<tokio_stream::wrappers::ReceiverStream<std::io::Result<TcpStream>>> {
-    bind_shared_with(addr, svc, Arc::new(Authentication::Simple), Protection::default()).await
+    bind_shared_with(addr, svc, Arc::new(Authentication::Simple), Protection::default(), Default::default()).await
 }
 
-/// [`bind_shared`], with Hadoop IPC callers authenticated by `auth`, and
-/// their calls protected as `protection` allows (SASL callers).
+/// [`bind_shared`], with Hadoop IPC callers authenticated by `auth`, their
+/// calls protected as `protection` allows (SASL callers), and acting as
+/// other users as `proxy_users` allows.
 pub async fn bind_shared_with<T: ClientNamenodeProtocol>(
     addr: SocketAddr,
     svc: Arc<T>,
     auth: Arc<Authentication>,
     protection: Protection,
+    proxy_users: Arc<crate::proxy_users::ProxyUsers>,
 ) -> std::io::Result<tokio_stream::wrappers::ReceiverStream<std::io::Result<TcpStream>>> {
     let listener = TcpListener::bind(addr).await?;
     let mode = match &*auth {
@@ -162,7 +170,7 @@ pub async fn bind_shared_with<T: ClientNamenodeProtocol>(
     };
     info!("Client RPC port {}: Hadoop IPC ({}, protection {}) and gRPC", listener.local_addr()?, mode, protection);
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(accept_loop(listener, svc, auth, protection, tx));
+    tokio::spawn(accept_loop(listener, svc, auth, protection, proxy_users, tx));
     Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 

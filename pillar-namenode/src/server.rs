@@ -67,6 +67,8 @@ pub struct NameNodeConfig {
     /// Permission enforcement (HDFS dfs.permissions.enabled, on by
     /// default), the superuser and supergroup, and users' groups.
     pub permissions: crate::permission::Permissions,
+    /// Proxy-user rules (`<user>.hosts=...;<user>.users=...;<user>.groups=...`).
+    pub proxy_users: Option<String>,
 
     /// Block access tokens (HDFS dfs.block.access.token.enable); always on
     /// with Kerberos.
@@ -104,6 +106,7 @@ impl Default for NameNodeConfig {
             datanode_principal: None,
             rpc_protection: Default::default(),
             permissions: Default::default(),
+            proxy_users: None,
             block_access_tokens: false,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
@@ -178,6 +181,9 @@ impl NameNodeConfig {
                 Ok(g) => config.permissions.groups = g,
                 Err(e) => tracing::warn!("NAMENODE_USER_GROUPS: {}", e),
             }
+        }
+        if let Ok(val) = env::var("NAMENODE_PROXY_USERS") {
+            config.proxy_users = Some(val);
         }
         if let Ok(val) = env::var("NAMENODE_RPC_PROTECTION") {
             match val.parse() {
@@ -429,6 +435,15 @@ impl NameNode {
             _ => anyhow::bail!("Kerberos needs both a keytab and a principal"),
         };
         let kerberos = matches!(auth, crate::ipc::Authentication::Kerberos(_));
+        let proxy_users = crate::proxy_users::ProxyUsers::parse(
+            self.config.proxy_users.as_deref().unwrap_or_default(),
+            self.config.permissions.groups.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("--proxy-users: {}", e))?;
+        if !proxy_users.is_empty() {
+            info!("Proxy users: {}", self.config.proxy_users.as_deref().unwrap_or_default());
+        }
+        let proxy_users = Arc::new(proxy_users);
         // With Kerberos, DataNodes authenticate every DatanodeProtocol call
         // (a Kerberos AP-REQ per call; see pillar_common::grpc_auth).
         let datanode_acceptor = match (&self.config.kerberos_keytab, &self.config.kerberos_principal) {
@@ -443,7 +458,7 @@ impl NameNode {
             }
             _ => None,
         };
-        let incoming = crate::ipc::bind_shared_with(self.config.rpc_addr, ipc_server, Arc::new(auth), self.config.rpc_protection.clone()).await?;
+        let incoming = crate::ipc::bind_shared_with(self.config.rpc_addr, ipc_server, Arc::new(auth), self.config.rpc_protection.clone(), proxy_users).await?;
         // ClientProtocol over gRPC has no authentication: with Kerberos on,
         // clients must come through Hadoop IPC.
         let client_grpc = (!kerberos).then(|| ClientNamenodeProtoServer::new(client_proto_server));

@@ -169,6 +169,13 @@ pub trait RpcHandler: Send + Sync + 'static {
         Protection::default()
     }
 
+    /// Whether `real` (as authenticated, and its short name) may act as
+    /// `effective` from `addr` (Hadoop proxy users). Refused unless the
+    /// protocol allows it; the error is the message the client gets.
+    fn authorize_proxy(&self, real: &str, _real_short: &str, effective: &str, _addr: std::net::IpAddr) -> Result<(), String> {
+        Err(format!("User: {} is not allowed to impersonate {}", real, effective))
+    }
+
     /// Run `method` on the encoded request `body` for `user` (the
     /// connection's effective user); the encoded response.
     async fn call(&self, method: &str, body: &[u8], user: &str) -> Result<Vec<u8>, RpcError>;
@@ -297,6 +304,7 @@ fn error_frame(req: &RpcRequestHeaderProto, e: &RpcError) -> Bytes {
 }
 
 const ACCESS_CONTROL: &str = "org.apache.hadoop.security.AccessControlException";
+const AUTHORIZATION: &str = "org.apache.hadoop.security.authorize.AuthorizationException";
 const SIMPLE_NOT_ENABLED: &str = "SIMPLE authentication is not enabled.  Available:[KERBEROS]";
 
 /// A fatal reply: the client gives up on the connection.
@@ -693,8 +701,9 @@ where
                 CALL_ID_CONNECTION_CONTEXT => {
                     let ctx: IpcConnectionContextProto = take_delimited(&mut buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    let real_user = ctx.user_info.as_ref().and_then(|u| u.real_user.clone()).filter(|r| !r.is_empty());
                     let claimed = ctx.user_info.and_then(|u| u.effective_user).unwrap_or_default();
-                    debug!("{}: connection context user={:?} protocol={:?}", peer, claimed, ctx.protocol);
+                    debug!("{}: connection context user={:?} real={:?} protocol={:?}", peer, claimed, real_user, ctx.protocol);
                     match handler.authentication() {
                         // A token names the caller; Hadoop clients send no
                         // user in this case.
@@ -707,7 +716,19 @@ where
                             }
                             user = caller;
                         }
-                        Authentication::Simple => user = claimed,
+                        // SIMPLE: the client names itself, and the real user
+                        // it acts for another as (a proxy user), if any.
+                        Authentication::Simple => {
+                            if let Some(real) = real_user.filter(|r| *r != claimed) {
+                                if let Err(msg) = handler.authorize_proxy(&real, &real, &claimed, peer.ip()) {
+                                    warn!("{}: {}", peer, msg);
+                                    let _ = out_tx.send(Out::Frame(fatal_frame(&header, AUTHORIZATION, &msg))).await;
+                                    return Ok(());
+                                }
+                                info!("{}: {} acts as {} (proxy user)", peer, real, claimed);
+                            }
+                            user = claimed;
+                        }
                         Authentication::Kerberos(_) => {
                             let Some((principal, short)) = &authenticated else {
                                 let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED))).await;
@@ -719,14 +740,18 @@ where
                                 return Ok(());
                             };
                             // The client names itself (full principal or short
-                            // name); anyone else would be impersonation.
+                            // name), or a user it may act as (proxy users).
                             if !claimed.is_empty() && claimed != *principal && claimed != *short {
-                                let msg = format!("User {} (auth:KERBEROS) is not authorized to impersonate {}", principal, claimed);
-                                warn!("{}: {}", peer, msg);
-                                let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, &msg))).await;
-                                return Ok(());
+                                if let Err(msg) = handler.authorize_proxy(principal, short, &claimed, peer.ip()) {
+                                    warn!("{}: {}", peer, msg);
+                                    let _ = out_tx.send(Out::Frame(fatal_frame(&header, AUTHORIZATION, &msg))).await;
+                                    return Ok(());
+                                }
+                                info!("{}: {} acts as {} (proxy user)", peer, principal, claimed);
+                                user = claimed;
+                            } else {
+                                user = short.clone();
                             }
-                            user = short.clone();
                         }
                     }
                 }

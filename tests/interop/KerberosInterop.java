@@ -136,7 +136,7 @@ public class KerberosInterop {
         });
         check(denied.contains("user=bob, access=READ"), "bob cannot read alice's 600 file (" + denied + ")");
 
-        // alice cannot act as bob: no proxy-user rules.
+        // alice cannot act as bob: she is no proxy user.
         UserGroupInformation proxy = UserGroupInformation.createProxyUser("bob", UserGroupInformation.getLoginUser());
         String err = proxy.doAs((PrivilegedExceptionAction<String>) () -> {
             try (FileSystem pfs = FileSystem.newInstance(conf)) {
@@ -146,7 +146,27 @@ public class KerberosInterop {
                 return e.toString();
             }
         });
-        check(err.contains("not authorized to impersonate"), "alice impersonating bob is refused");
+        check(err.contains("User: alice@PILLAR.TEST is not allowed to impersonate bob"), "alice impersonating bob is refused");
+
+        // oozie (Kerberos) may act as staff members (bob), not as alice.
+        UserGroupInformation oozie = UserGroupInformation.loginUserFromKeytabAndReturnUGI("oozie@PILLAR.TEST", dir + "/oozie.keytab");
+        Path viaOozie = new Path("/secure/oozie-for-bob.txt");
+        String owner = UserGroupInformation.createProxyUser("bob", oozie).doAs((PrivilegedExceptionAction<String>) () -> {
+            try (FileSystem pfs = FileSystem.newInstance(conf)) {
+                try (FSDataOutputStream out = pfs.create(viaOozie)) { out.write("for bob".getBytes()); }
+                return pfs.getFileStatus(viaOozie).getOwner();
+            }
+        });
+        check(owner.equals("bob"), "oozie (Kerberos), a proxy user, writes a file as bob (owner " + owner + ")");
+        err = UserGroupInformation.createProxyUser("alice", oozie).doAs((PrivilegedExceptionAction<String>) () -> {
+            try (FileSystem pfs = FileSystem.newInstance(conf)) {
+                pfs.listStatus(new Path("/"));
+                return "";
+            } catch (Exception e) {
+                return e.toString();
+            }
+        });
+        check(err.contains("User: oozie@PILLAR.TEST is not allowed to impersonate alice"), "oozie acting as alice (not in staff) is refused");
 
         fs.delete(new Path("/secure"), true);
         System.out.println("ALL OK kerberos");
