@@ -13,6 +13,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 
+# Hadoop IPC (shared by the NameNode and DataNode RPC servers)
+pillar-proto = { path = "../pillar-proto" }
+prost = { workspace = true }
+async-trait = { workspace = true }
+
 # Checksums
 sha2 = { workspace = true }
 

@@ -453,8 +453,10 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn fsync(
         &self,
-        _request: Request<FsyncRequestProto>,
+        request: Request<FsyncRequestProto>,
     ) -> Result<Response<FsyncResponseProto>, Status> {
+        let req = request.into_inner();
+        self.service.handle_fsync(&req.src, &req.client, req.last_block_length).await?;
         Ok(Response::new(FsyncResponseProto {}))
     }
 

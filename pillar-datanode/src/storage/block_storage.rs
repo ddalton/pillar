@@ -72,6 +72,11 @@ pub struct BlockStorage {
     /// Woken on every event, so the report goes out at once (as HDFS
     /// DataNodes do): a client's complete() waits for it.
     events_notify: tokio::sync::Notify,
+
+    /// Replicas being written: bytes the whole pipeline has acknowledged
+    /// (HDFS `bytesAcked`). Readers of a file still being written may read
+    /// that far: it is what hflush guarantees.
+    visible: DashMap<u64, (BlockId, u64)>,
 }
 
 /// A change to the set of finalized replicas, for incremental block reports.
@@ -93,6 +98,7 @@ impl BlockStorage {
             total_bytes: AtomicU64::new(0),
             events: Mutex::new(None),
             events_notify: tokio::sync::Notify::new(),
+            visible: DashMap::new(),
         };
 
         // Scan and load existing blocks
@@ -320,6 +326,42 @@ impl BlockStorage {
         Ok((new, len))
     }
 
+    /// The pipeline acknowledged `len` bytes of the replica being written
+    /// `block` (never moves backwards for the same stamp).
+    pub fn set_visible(&self, block: &BlockId, len: u64) {
+        let mut e = self.visible.entry(block.block_id).or_insert((*block, len));
+        if e.0 != *block || e.1 < len {
+            *e = (*block, len);
+        }
+    }
+
+    /// Reset the visible length of a reopened replica (recovery cuts it to
+    /// the acknowledged length; append starts from the finalized length).
+    pub fn reset_visible(&self, block: &BlockId, len: u64) {
+        self.visible.insert(block.block_id, (*block, len));
+    }
+
+    /// The replica of `block_id` here and how much of it a reader may see:
+    /// all of a finalized replica, the acknowledged bytes of one being
+    /// written (HDFS `getReplicaVisibleLength`).
+    pub fn replica_visible_length(&self, block_id: u64) -> Option<(BlockId, u64)> {
+        if let Some(m) = self.blocks.get(&block_id) {
+            return Some((m.block_id, m.num_bytes));
+        }
+        let (id, _) = self.find_rbw(block_id)?;
+        let len = self.visible.get(&block_id).filter(|v| v.0 == id).map_or(0, |v| v.1);
+        Some((id, len))
+    }
+
+    /// Open a replica being written for reading `length` bytes from `offset`.
+    pub fn open_rbw_for_read(&self, block_id: &BlockId, offset: u64, length: u64) -> Result<(File, u64)> {
+        let mut file = File::open(self.get_block_path(block_id, false))?;
+        let size = file.metadata()?.len();
+        let available = length.min(size.saturating_sub(offset));
+        file.seek(SeekFrom::Start(offset.min(size)))?;
+        Ok((file, available))
+    }
+
     /// The `.meta` path of a replica being written.
     pub fn rbw_meta_path(&self, block_id: &BlockId) -> PathBuf {
         self.get_meta_path(block_id, false)
@@ -402,6 +444,7 @@ impl BlockStorage {
 
     /// Discard a partially received block.
     pub fn abort_write(&self, block_id: &BlockId) {
+        self.visible.remove_if(&block_id.block_id, |_, v| v.0 == *block_id);
         for path in [self.get_block_path(block_id, false), self.get_meta_path(block_id, false)] {
             if let Err(e) = fs::remove_file(&path) {
                 if e.kind() != io::ErrorKind::NotFound {
@@ -432,6 +475,8 @@ impl BlockStorage {
         if tmp_meta.exists() {
             fs::rename(&tmp_meta, &finalized_meta)?;
         }
+
+        self.visible.remove(&block_id.block_id);
 
         // Add to blocks cache
         let metadata = BlockMetadata {

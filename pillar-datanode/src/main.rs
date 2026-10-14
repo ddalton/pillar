@@ -3,6 +3,7 @@ mod grpc;
 mod server;
 mod transport;
 mod replication;
+mod ipc;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

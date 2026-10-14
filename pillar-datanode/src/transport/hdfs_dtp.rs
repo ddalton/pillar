@@ -313,14 +313,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let b = &op.header.base_header.block;
-    let block = BlockId::new(b.block_id, b.generation_stamp);
     let checksum = Checksum::CRC32C_512;
     let bpc = checksum.bytes_per_checksum as u64;
 
-    let size = match storage.get_block_metadata(b.block_id) {
-        Some(m) if m.block_id.generation_stamp >= b.generation_stamp => m.num_bytes,
-        Some(m) => {
-            let msg = format!("replica {} has genstamp {} < {}", b.block_id, m.block_id.generation_stamp, b.generation_stamp);
+    // A finalized replica, or one being written (a file still open), of
+    // which readers see what the pipeline acknowledged.
+    let (replica, size) = match storage.replica_visible_length(b.block_id) {
+        Some((id, len)) if id.generation_stamp >= b.generation_stamp => (id, len),
+        Some((id, _)) => {
+            let msg = format!("replica {} has genstamp {} < {}", b.block_id, id.generation_stamp, b.generation_stamp);
             write_delimited(socket, &op_response(Status::ErrorInvalid, &msg)).await?;
             return socket.flush().await.map_err(Into::into);
         }
@@ -349,9 +350,16 @@ where
     };
     write_delimited(socket, &response).await?;
 
+    let finalized = storage.get_block_metadata(b.block_id).is_some_and(|m| m.block_id == replica);
     let (file, len) = {
         let storage = storage.clone();
-        tokio::task::spawn_blocking(move || storage.open_for_read(&block, start, end - start))
+        tokio::task::spawn_blocking(move || {
+            if finalized {
+                storage.open_for_read(&replica, start, end - start)
+            } else {
+                storage.open_rbw_for_read(&replica, start, end - start)
+            }
+        })
             .await
             .map_err(|e| TransportError::ProtocolError(e.to_string()))?
             .map_err(|e| TransportError::ProtocolError(e.to_string()))?
@@ -404,6 +412,11 @@ struct DiskWrite {
     /// completes a partial chunk, after append); the stored checksum must
     /// cover them too.
     prefix: u64,
+    /// Position in the session's write order; the writer publishes the last
+    /// one done, and a packet is acknowledged only once its write is.
+    seq: u64,
+    /// hsync: make it durable (fsync) before it counts as done.
+    sync: bool,
 }
 
 /// The replica a write session writes to.
@@ -456,6 +469,7 @@ fn open_replica(
             let (data, meta) = storage.open_rbw(&block).map_err(st)?;
             check_meta_header(&meta, checksum)?;
             truncate_replica(&data, &meta, op.min_bytes_rcvd, checksum).map_err(io)?;
+            storage.reset_visible(&block, op.min_bytes_rcvd);
             info!("Recovering block {} at {} bytes (generation stamp {})", b.block_id, op.min_bytes_rcvd, new_gs);
             Ok(Replica { block, files: Some((data, meta)), len: op.min_bytes_rcvd })
         }
@@ -472,6 +486,7 @@ fn open_replica(
                 None => return Err((Status::Error, format!("append: no finalized replica of block {}", b.block_id))),
             }
             let (block, len) = storage.unfinalize(&old, new_gs).map_err(st)?;
+            storage.reset_visible(&block, len);
             let (data, meta) = storage.open_rbw(&block).map_err(st)?;
             check_meta_header(&meta, checksum)?;
             info!("Appending to block {} at {} bytes (generation stamp {})", b.block_id, len, new_gs);
@@ -609,6 +624,7 @@ where
     // re-sent chunk (replay after recovery, or after hflush) overwrites.
     let start_len = replica.len;
     let (disk_tx, mut disk_rx) = mpsc::channel::<DiskWrite>(8);
+    let (progress_tx, progress_rx) = tokio::sync::watch::channel(0u64);
     let bpc = checksum.bytes_per_checksum as u64;
     let csize = checksum.size() as u64;
     let files = replica.files;
@@ -616,22 +632,32 @@ where
     let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
         let Some((data_file, meta_file)) = files else {
             // A finalized replica in close recovery: nothing to write.
-            while disk_rx.blocking_recv().is_some() {}
+            while let Some(w) = disk_rx.blocking_recv() {
+                progress_tx.send_replace(w.seq);
+            }
             return Ok(start_len);
         };
         let mut len = start_len;
         while let Some(w) = disk_rx.blocking_recv() {
-            data_file.write_all_at(&w.data, w.offset)?;
-            if w.prefix > 0 {
-                // Completing a partial chunk: checksum the whole chunk.
-                let mut chunk = vec![0u8; w.prefix as usize];
-                data_file.read_exact_at(&mut chunk, w.offset - w.prefix)?;
-                chunk.extend_from_slice(&w.data);
-                meta_file.write_all_at(&checksum.compute(&chunk), META_HEADER_LEN + (w.offset - w.prefix) / bpc * csize)?;
-            } else {
-                meta_file.write_all_at(&w.checksums, META_HEADER_LEN + w.offset / bpc * csize)?;
+            // An empty write is an hsync with no new data.
+            if !w.data.is_empty() {
+                data_file.write_all_at(&w.data, w.offset)?;
+                if w.prefix > 0 {
+                    // Completing a partial chunk: checksum the whole chunk.
+                    let mut chunk = vec![0u8; w.prefix as usize];
+                    data_file.read_exact_at(&mut chunk, w.offset - w.prefix)?;
+                    chunk.extend_from_slice(&w.data);
+                    meta_file.write_all_at(&checksum.compute(&chunk), META_HEADER_LEN + (w.offset - w.prefix) / bpc * csize)?;
+                } else {
+                    meta_file.write_all_at(&w.checksums, META_HEADER_LEN + w.offset / bpc * csize)?;
+                }
+                len = len.max(w.offset + w.data.len() as u64);
             }
-            len = len.max(w.offset + w.data.len() as u64);
+            if w.sync {
+                data_file.sync_data()?;
+                meta_file.sync_data()?;
+            }
+            progress_tx.send_replace(w.seq);
         }
         // No truncation here: writes are positional over a file that was
         // created empty or cut to length when reopened, and the writer of a
@@ -652,8 +678,9 @@ where
     };
     // The next DataNode failed: stop forwarding and say so in the acks.
     let mirror_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // (seqno, last packet?, local status) in arrival order.
-    let (ack_tx, mut ack_rx) = mpsc::channel::<(i64, bool, Status)>(64);
+    // (seqno, last packet?, local status, (write seq, end offset) if the
+    // packet was written) in arrival order.
+    let (ack_tx, mut ack_rx) = mpsc::channel::<(i64, bool, Status, Option<(u64, u64)>)>(64);
 
     // Receiver: upstream packets -> verify -> mirror + disk.
     let mirror_failed_rx = mirror_failed.clone();
@@ -661,6 +688,7 @@ where
         let mut upstream_rx = upstream_rx;
         let mut mirror_tx = mirror_tx;
         let mut written_to = start_len;
+        let mut seq = 0u64;
         loop {
             let (p, raw) = read_packet(&mut upstream_rx).await?;
             let h = &p.header;
@@ -672,7 +700,7 @@ where
                 }
             }
             if h.seqno == HEARTBEAT_SEQNO {
-                ack_tx.send((h.seqno, false, Status::Success)).await.ok();
+                ack_tx.send((h.seqno, false, Status::Success, None)).await.ok();
                 continue;
             }
             let offset = h.offset_in_block as u64;
@@ -699,15 +727,19 @@ where
                     Status::ErrorChecksum
                 }
             };
-            if status == Status::Success && !p.data.is_empty() {
+            let sync = h.sync_block == Some(true);
+            let mut write = None;
+            if status == Status::Success && (!p.data.is_empty() || sync) {
                 written_to = written_to.max(offset + p.data.len() as u64);
+                seq += 1;
                 disk_tx
-                    .send(DiskWrite { offset, data: p.data.clone(), checksums: p.checksums.clone(), prefix: in_chunk })
+                    .send(DiskWrite { offset, data: p.data.clone(), checksums: p.checksums.clone(), prefix: in_chunk, seq, sync })
                     .await
                     .map_err(|_| TransportError::ProtocolError("disk writer stopped".into()))?;
+                write = Some((seq, written_to));
             }
             let last = h.last_packet_in_block;
-            ack_tx.send((h.seqno, last, status)).await.ok();
+            ack_tx.send((h.seqno, last, status, write)).await.ok();
             if status != Status::Success {
                 return Err(TransportError::ProtocolError("checksum error".into()));
             }
@@ -729,7 +761,15 @@ where
     let responder = async move {
         let mut mirror_rx = mirror_rx;
         let mut writer = Some(writer);
-        while let Some((seqno, last, status)) = ack_rx.recv().await {
+        let mut progress_rx = progress_rx;
+        while let Some((seqno, last, mut status, write)) = ack_rx.recv().await {
+            // Acknowledge only what is on this DataNode's disk (and synced,
+            // for hsync): what an ack promises a reader can read here.
+            if let Some((seq, _)) = write {
+                if progress_rx.wait_for(|done| *done >= seq).await.is_err() {
+                    status = Status::Error;
+                }
+            }
             let mut replies = vec![status];
             let mut downstream_failed = mirror_failed.load(std::sync::atomic::Ordering::Acquire);
             if let (Some(m), false, Status::Success) = (mirror_rx.as_mut(), downstream_failed, status) {
@@ -773,6 +813,12 @@ where
             }
             write_delimited(&mut upstream_tx, &ack(seqno, &replies)).await?;
             upstream_tx.flush().await?;
+            // Every DataNode from here down has it: readers may see it.
+            if let (Some((_, end)), false) = (write, last) {
+                if replies.iter().all(|r| *r == Status::Success) {
+                    storage2.set_visible(&block, end);
+                }
+            }
             if last || status != Status::Success {
                 return Ok(());
             }
