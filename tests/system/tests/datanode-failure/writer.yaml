@@ -1,0 +1,34 @@
+# Streams 12 random MiB, one per second, into /survivor.bin, then records
+# put's exit status. The source's md5 is kept for comparison.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+spec:
+  containers:
+  - name: writer
+    image: apache/hadoop:3.3.6
+    command:
+    - bash
+    - -c
+    - |
+      head -c 12582912 /dev/urandom > /tmp/src
+      md5sum < /tmp/src > /tmp/src.md5
+      (for i in $(seq 0 11); do dd if=/tmp/src bs=1M skip=$i count=1 2>/dev/null; sleep 1; done) \
+        | hdfs dfs -put -d - /survivor.bin
+      echo $? > /tmp/rc
+      sleep infinity
+    env:
+    - name: HADOOP_USER_NAME
+      value: hdfs
+    volumeMounts:
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/core-site.xml
+      subPath: core-site.xml
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/hdfs-site.xml
+      subPath: hdfs-site.xml
+  volumes:
+  - name: conf
+    configMap:
+      name: hadoop-client-conf

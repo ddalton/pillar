@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: datanode-failure
+spec:
+  description: >-
+    A DataNode pod is force-deleted while the stock Hadoop client streams a
+    file through it. The client rebuilds the write pipeline from the
+    surviving DataNodes (pipeline recovery) and the file completes with
+    exactly the bytes that were written.
+  steps:
+  - name: cluster
+    try:
+    - apply:
+        file: ../../common/pillar-cluster.yaml
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+  - name: kill-a-datanode-mid-write
+    try:
+    - apply:
+        file: writer.yaml
+    - script:
+        content: |
+          set -eu
+          # Two finished blocks, so the write is well under way.
+          for _ in $(seq 90); do
+            n=$(kubectl -n "$NAMESPACE" exec hadoop-client -- hdfs dfs -stat %b /survivor.bin 2>/dev/null || echo 0)
+            [ "$n" -ge 2097152 ] && break
+            sleep 1
+          done
+          echo "written before the kill: $n"
+          [ "$n" -ge 2097152 ] || { echo "FAIL: the writer made no progress"; exit 1; }
+          kubectl -n "$NAMESPACE" delete pod pillar-datanode-1 --grace-period=0 --force --wait=true
+  - name: the-write-completes
+    try:
+    - script:
+        timeout: 4m
+        content: |
+          set -eu
+          for _ in $(seq 120); do
+            kubectl -n "$NAMESPACE" exec writer -- test -f /tmp/rc && break
+            sleep 2
+          done
+          rc=$(kubectl -n "$NAMESPACE" exec writer -- cat /tmp/rc)
+          echo "put exit status: $rc"
+          [ "$rc" = 0 ] || { echo "FAIL: the write did not survive the DataNode failure"; exit 1; }
+          want=$(kubectl -n "$NAMESPACE" exec writer -- cat /tmp/src.md5)
+          got=$(kubectl -n "$NAMESPACE" exec writer -- bash -c 'hdfs dfs -cat /survivor.bin | md5sum')
+          echo "source $want / HDFS $got"
+          [ "$want" = "$got" ] || { echo "FAIL: content differs"; exit 1; }
+          echo PASS

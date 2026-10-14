@@ -53,6 +53,11 @@ pub struct NameNodeConfig {
     /// `namenode -format -clusterid`); must match an existing one.
     pub cluster_id: Option<String>,
 
+    /// A DataNode silent this long is stale, and this long dead (HDFS
+    /// defaults: 30 s, 10.5 min).
+    pub datanode_stale_interval: std::time::Duration,
+    pub datanode_dead_interval: std::time::Duration,
+
     /// Write leases: another client may take an open file over after the
     /// soft limit; the NameNode recovers it after the hard limit.
     pub lease_soft_limit: std::time::Duration,
@@ -75,6 +80,8 @@ impl Default for NameNodeConfig {
             checkpoint_txns: 1_000_000,
             checkpoint_period: std::time::Duration::from_secs(3600),
             cluster_id: None,
+            datanode_stale_interval: std::time::Duration::from_secs(30),
+            datanode_dead_interval: std::time::Duration::from_secs(630),
             lease_soft_limit: crate::metadata::lease_manager::DEFAULT_SOFT_LIMIT,
             lease_hard_limit: crate::metadata::lease_manager::DEFAULT_HARD_LIMIT,
         }
@@ -213,7 +220,10 @@ impl NameNode {
         info!("Namespace identity: {}", identity);
         let namespace = Arc::new(namespace);
         let edit_log = Arc::new(edit_log);
-        let datanode_manager = Arc::new(DatanodeManager::new());
+        let datanode_manager = Arc::new(DatanodeManager::with_intervals(
+            config.datanode_stale_interval,
+            config.datanode_dead_interval,
+        ));
         let placement_policy = Arc::new(BlockPlacementPolicy::new(
             datanode_manager.clone(),
             config.default_replication,

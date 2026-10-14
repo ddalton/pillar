@@ -317,10 +317,22 @@ Permissions are recorded but not enforced (like HDFS with
 `dfs.permissions.enabled=false`). `reportBadBlocks` replaces corrupt
 replicas.
 
-`append` starts a new block: it works when the file's last block is full,
-or with `CreateFlag.NEW_BLOCK`. Extending a partially filled last block is
-refused with `UnsupportedOperationException` (hdfs-native then retries
-with a new block).
+`append` extends a partially filled last block in place (the DataNodes
+reopen their replicas; the first packet completes a partial checksum
+chunk), or starts a new block when the last one is full or the client asks
+for `CreateFlag.NEW_BLOCK`.
+
+**Pipeline recovery.** When a DataNode in a write pipeline dies, the
+DataNode before it reports the failure in its acknowledgement, and the
+client rebuilds the pipeline the way HDFS does: a new generation stamp
+(`updateBlockForPipeline`), the survivors reopen their replicas being
+written and cut them to the acknowledged length, unacknowledged packets
+are replayed, and `updatePipeline` records the new pipeline. When the
+client's policy asks for a replacement DataNode (`getAdditionalDatanode`),
+a survivor copies its replica to it first (`TRANSFER_BLOCK`). `addBlock`
+honours the client's excluded DataNodes. DataNodes report finished
+replicas to the NameNode at once, so `complete()` does not wait for a
+heartbeat.
 
 **Leases.** A file is open for writing from `create` (or `append`) until
 `complete`, by one client at a time: other writers get
@@ -338,7 +350,9 @@ replica holder is offline at the time; DataNode-side block recovery is not
 implemented yet.
 
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
-hflush/hsync, pipeline recovery after a DataNode fails mid-write, block checksum (`-checksum`), short-circuit
+reading hflushed data of a file still being written (the DataNode has no
+`getReplicaVisibleLength` RPC yet) and hsync's length update, NameNode-driven
+block recovery, block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with
 `UnsupportedOperationException` rather than pretending to succeed.

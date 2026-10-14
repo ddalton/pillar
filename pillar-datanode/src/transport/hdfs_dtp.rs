@@ -18,15 +18,39 @@
 //!           PLEN = 4 + len(checksums) + len(data)
 //! ```
 //!
-//! Writes support the `PIPELINE_SETUP_CREATE` stage (a new block, which is
-//! what `create`/`put` uses), forward the pipeline to the next target, and
-//! verify every chunk's checksum before acknowledging it. The block's
-//! `.meta` file is written in HDFS layout (version 1, checksum header,
-//! one checksum per chunk). Append, pipeline recovery, block checksums and
-//! short-circuit reads are answered with `ERROR_UNSUPPORTED`. There is no
-//! SASL / block-token handling: this is for clusters without Kerberos.
+//! Writes forward the pipeline to the next target and verify every
+//! chunk's checksum before acknowledging it. The block's `.meta` file is
+//! written in HDFS layout (version 1, checksum header, one checksum per
+//! chunk). Construction stages:
+//!
+//! * `PIPELINE_SETUP_CREATE`: a new block (`create`, `put`).
+//! * `PIPELINE_SETUP_APPEND`: reopen a finalized replica to extend it; the
+//!   first packet may complete a partial chunk, whose stored checksum then
+//!   covers the old and the new bytes.
+//! * `PIPELINE_SETUP_STREAMING_RECOVERY` / `..._APPEND_RECOVERY`: after a
+//!   DataNode in the pipeline failed, the client rebuilds it from the
+//!   survivors with a new generation stamp; each reopens its replica being
+//!   written, cuts it back to the bytes the client knows were acknowledged
+//!   (`minBytesRcvd`) and takes the replayed packets.
+//! * `PIPELINE_CLOSE_RECOVERY`: the pipeline broke while closing; the
+//!   replica (finalized or not) takes the new generation stamp.
+//!
+//! When the next DataNode fails mid-stream, the acknowledgement upstream
+//! says so (`ERROR` in its position), so the client drops that node and not
+//! this one. A replica being written survives a broken pipeline for the
+//! recovery; abandoned ones are swept after an hour
+//! ([`BlockStorage::sweep_stale_rbw`]).
+//!
+//! `TRANSFER_BLOCK` (86) adds a replacement DataNode to a pipeline: the
+//! client asks a DataNode in it to copy its replica to the new one, which
+//! receives it with stage `TRANSFER_RBW` (kept as a replica being written,
+//! for the recovery that follows) or `TRANSFER_FINALIZED`.
+//!
+//! Not supported (`ERROR_UNSUPPORTED`): block checksums and short-circuit
+//! reads. There is no SASL / block-token handling: this is
+//! for clusters without Kerberos.
 
-use std::io::{Seek, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
@@ -40,8 +64,8 @@ use tracing::{debug, info, warn};
 
 use pillar_proto::hdfs::{
     op_write_block_proto::BlockConstructionStage, BlockOpResponseProto, ChecksumProto, ChecksumTypeProto,
-    ClientReadStatusProto, DatanodeInfoProto, OpReadBlockProto, OpWriteBlockProto, PacketHeaderProto,
-    PipelineAckProto, ReadOpChecksumInfoProto, Status,
+    ClientReadStatusProto, DatanodeInfoProto, OpReadBlockProto, OpTransferBlockProto, OpWriteBlockProto,
+    PacketHeaderProto, PipelineAckProto, ReadOpChecksumInfoProto, Status,
 };
 
 use super::{Result, TransportError};
@@ -52,6 +76,7 @@ pub const DATA_TRANSFER_VERSION: u16 = 28;
 
 const OP_WRITE_BLOCK: u8 = 80;
 const OP_READ_BLOCK: u8 = 81;
+const OP_TRANSFER_BLOCK: u8 = 86;
 
 /// Data per READ packet (HDFS `dfs.client-write-packet-size` is 64 KiB).
 const READ_PACKET_DATA: usize = 64 * 1024;
@@ -61,6 +86,11 @@ const MAX_PACKET: usize = 16 * 1024 * 1024;
 const HEARTBEAT_SEQNO: i64 = -1;
 /// Server-side checksum for reads of blocks written without one.
 const DEFAULT_BYTES_PER_CHECKSUM: u32 = 512;
+/// `.meta` header: version (u16), checksum type (u8), bytes per checksum (u32).
+const META_HEADER_LEN: u64 = 7;
+/// How long to wait for the next DataNode's acknowledgement (HDFS
+/// `dfs.client.socket-timeout`).
+const MIRROR_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ------------------------------------------------------------- checksums
 
@@ -264,6 +294,10 @@ where
             let op = read_delimited(socket).await?;
             read_block(socket, storage, op, peer).await
         }
+        OP_TRANSFER_BLOCK => {
+            let op = read_delimited(socket).await?;
+            transfer_block(socket, storage, op, peer).await
+        }
         op => {
             // The op's proto has not been read, so the connection is done.
             let r = op_response(Status::ErrorUnsupported, &format!("op {} is not supported by Pillar", op));
@@ -366,6 +400,133 @@ struct DiskWrite {
     data: Bytes,
     /// Checksums for the chunks in `data`, already verified.
     checksums: Bytes,
+    /// Bytes of the chunk already on disk before `offset` (a packet that
+    /// completes a partial chunk, after append); the stored checksum must
+    /// cover them too.
+    prefix: u64,
+}
+
+/// The replica a write session writes to.
+struct Replica {
+    /// Its id now (with the session's generation stamp).
+    block: BlockId,
+    /// Data and `.meta`; `None` for a finalized replica in close recovery,
+    /// which takes no more data.
+    files: Option<(std::fs::File, std::fs::File)>,
+    /// Bytes already in it, after any truncation.
+    len: u64,
+}
+
+/// Open the replica for a WRITE_BLOCK op according to its stage. Errors
+/// are the status and message to answer with.
+fn open_replica(
+    storage: &BlockStorage,
+    op: &OpWriteBlockProto,
+    checksum: Checksum,
+) -> std::result::Result<Replica, (Status, String)> {
+    let b = &op.header.base_header.block;
+    let new_gs = if op.latest_generation_stamp > 0 { op.latest_generation_stamp } else { b.generation_stamp };
+    let io = |e: std::io::Error| (Status::Error, e.to_string());
+    let st = |e: BlockStorageError| match e {
+        BlockStorageError::BlockAlreadyExists(_) => (Status::ErrorExists, e.to_string()),
+        BlockStorageError::BlockNotFound(_) => (Status::Error, format!("replica not found: {}", e)),
+        _ => (Status::Error, e.to_string()),
+    };
+    let stage = BlockConstructionStage::try_from(op.stage)
+        .map_err(|_| (Status::ErrorInvalid, format!("unknown stage {}", op.stage)))?;
+    use BlockConstructionStage as S;
+    match stage {
+        S::PipelineSetupCreate => {
+            let block = BlockId::new(b.block_id, b.generation_stamp);
+            let data = storage.begin_write(&block).map_err(st)?;
+            let mut meta = storage.open_tmp_meta(&block).map_err(st)?;
+            meta.write_all(&checksum.meta_header()).map_err(io)?;
+            Ok(Replica { block, files: Some((data, meta)), len: 0 })
+        }
+        S::PipelineSetupStreamingRecovery | S::PipelineSetupAppendRecovery
+            if storage.find_rbw(b.block_id).is_some() =>
+        {
+            let (block, on_disk) = storage.restamp_rbw(b.block_id, new_gs).map_err(st)?;
+            if on_disk < op.min_bytes_rcvd {
+                return Err((
+                    Status::Error,
+                    format!("replica of block {} has {} bytes, fewer than the {} acknowledged", b.block_id, on_disk, op.min_bytes_rcvd),
+                ));
+            }
+            let (data, meta) = storage.open_rbw(&block).map_err(st)?;
+            check_meta_header(&meta, checksum)?;
+            truncate_replica(&data, &meta, op.min_bytes_rcvd, checksum).map_err(io)?;
+            info!("Recovering block {} at {} bytes (generation stamp {})", b.block_id, op.min_bytes_rcvd, new_gs);
+            Ok(Replica { block, files: Some((data, meta)), len: op.min_bytes_rcvd })
+        }
+        S::PipelineSetupAppend | S::PipelineSetupAppendRecovery => {
+            // The expected length is minBytesRcvd: the Java client puts the
+            // file's block size in the header's numBytes for this stage.
+            let old = BlockId::new(b.block_id, b.generation_stamp);
+            let have = storage.get_block_metadata(b.block_id).map(|m| (m.block_id, m.num_bytes));
+            match have {
+                Some((id, len)) if id == old && len == op.min_bytes_rcvd => {}
+                Some((id, len)) => {
+                    return Err((Status::Error, format!("append to {:?} ({} bytes): this replica is {:?} ({} bytes)", old, op.min_bytes_rcvd, id, len)));
+                }
+                None => return Err((Status::Error, format!("append: no finalized replica of block {}", b.block_id))),
+            }
+            let (block, len) = storage.unfinalize(&old, new_gs).map_err(st)?;
+            let (data, meta) = storage.open_rbw(&block).map_err(st)?;
+            check_meta_header(&meta, checksum)?;
+            info!("Appending to block {} at {} bytes (generation stamp {})", b.block_id, len, new_gs);
+            Ok(Replica { block, files: Some((data, meta)), len })
+        }
+        S::PipelineCloseRecovery => {
+            if storage.find_rbw(b.block_id).is_some() {
+                let (block, len) = storage.restamp_rbw(b.block_id, new_gs).map_err(st)?;
+                let (data, meta) = storage.open_rbw(&block).map_err(st)?;
+                return Ok(Replica { block, files: Some((data, meta)), len });
+            }
+            let len = storage.restamp_finalized(b.block_id, new_gs).map_err(st)?;
+            Ok(Replica { block: BlockId::new(b.block_id, new_gs), files: None, len })
+        }
+        S::TransferRbw | S::TransferFinalized => {
+            // A copy for a pipeline this DataNode is joining: any stale
+            // partial replica of the block here is replaced.
+            if let Some((stale, _)) = storage.find_rbw(b.block_id) {
+                storage.abort_write(&stale);
+            }
+            let block = BlockId::new(b.block_id, b.generation_stamp);
+            let data = storage.begin_write(&block).map_err(st)?;
+            let mut meta = storage.open_tmp_meta(&block).map_err(st)?;
+            meta.write_all(&checksum.meta_header()).map_err(io)?;
+            Ok(Replica { block, files: Some((data, meta)), len: 0 })
+        }
+        other => Err((Status::ErrorUnsupported, format!("block construction stage {:?} is not supported by Pillar", other))),
+    }
+}
+
+/// A reopened replica's `.meta` must use the checksum the writer sends.
+fn check_meta_header(meta: &std::fs::File, checksum: Checksum) -> std::result::Result<(), (Status, String)> {
+    let mut head = [0u8; META_HEADER_LEN as usize];
+    meta.read_exact_at(&mut head, 0).map_err(|e| (Status::Error, e.to_string()))?;
+    if head[..] != checksum.meta_header()[..] {
+        return Err((Status::ErrorInvalid, "the replica was written with another checksum".to_string()));
+    }
+    Ok(())
+}
+
+/// Cut a replica to `len` bytes, its `.meta` to the chunks covering them,
+/// and recompute the checksum of a now partial last chunk.
+fn truncate_replica(data: &std::fs::File, meta: &std::fs::File, len: u64, checksum: Checksum) -> std::io::Result<()> {
+    let bpc = checksum.bytes_per_checksum as u64;
+    let csize = checksum.size() as u64;
+    data.set_len(len)?;
+    meta.set_len(META_HEADER_LEN + len.div_ceil(bpc) * csize)?;
+    let partial = len % bpc;
+    if partial > 0 {
+        let mut tail = vec![0u8; partial as usize];
+        data.read_exact_at(&mut tail, len - partial)?;
+        meta.write_all_at(&checksum.compute(&tail), META_HEADER_LEN + (len / bpc) * csize)?;
+    }
+    data.sync_data()?;
+    meta.sync_data()
 }
 
 async fn write_block<S>(socket: &mut S, storage: &Arc<BlockStorage>, op: OpWriteBlockProto, peer: SocketAddr) -> Result<()>
@@ -373,15 +534,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let b = op.header.base_header.block.clone();
-    let block = BlockId::new(b.block_id, b.generation_stamp);
     let client = op.header.client_name.clone();
 
-    let stage = BlockConstructionStage::try_from(op.stage).ok();
-    if stage != Some(BlockConstructionStage::PipelineSetupCreate) {
-        let msg = format!("block construction stage {:?} is not supported by Pillar", stage);
-        write_delimited(socket, &op_response(Status::ErrorUnsupported, &msg)).await?;
-        return socket.flush().await.map_err(Into::into);
-    }
     let checksum = match Checksum::from_proto(&op.requested_checksum) {
         Ok(c) => c,
         Err(e) => {
@@ -389,26 +543,30 @@ where
             return socket.flush().await.map_err(Into::into);
         }
     };
+    let create = op.stage == BlockConstructionStage::PipelineSetupCreate as i32;
 
     // Open the replica before acknowledging the pipeline.
     let opened = {
         let storage = storage.clone();
-        tokio::task::spawn_blocking(move || {
-            let data = storage.begin_write(&block)?;
-            let meta = storage.open_tmp_meta(&block)?;
-            Ok::<_, BlockStorageError>((data, meta))
-        })
-        .await
-        .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+        let op = op.clone();
+        tokio::task::spawn_blocking(move || open_replica(&storage, &op, checksum))
+            .await
+            .map_err(|e| TransportError::ProtocolError(e.to_string()))?
     };
-    let (data_file, mut meta_file) = match opened {
-        Ok(f) => f,
-        Err(e) => {
-            let status = if matches!(e, BlockStorageError::BlockAlreadyExists(_)) { Status::ErrorExists } else { Status::Error };
-            write_delimited(socket, &op_response(status, &e.to_string())).await?;
+    let replica = match opened {
+        Ok(r) => r,
+        Err((status, msg)) => {
+            warn!("Write of block {} ({:?}) refused: {}", b.block_id, op.stage, msg);
+            write_delimited(socket, &op_response(status, &msg)).await?;
             return socket.flush().await.map_err(Into::into);
         }
     };
+    let block = replica.block;
+    let transfer = op.stage == BlockConstructionStage::TransferRbw as i32
+        || op.stage == BlockConstructionStage::TransferFinalized as i32;
+    if transfer {
+        return receive_transfer(socket, storage, replica, checksum, op.stage, peer).await;
+    }
 
     // Set up the rest of the pipeline before answering the upstream.
     let mut mirror: Option<TcpStream> = None;
@@ -439,26 +597,46 @@ where
         socket.flush().await?;
     }
     if connect_status != Status::Success {
-        storage.abort_write(&block);
+        // A new block the client will abandon; a recovering replica stays
+        // for the client's next attempt.
+        if create {
+            storage.abort_write(&block);
+        }
         return Ok(());
     }
 
     // Disk writer thread: data and checksums at their positions, so a
-    // re-sent partial chunk (after hflush) simply overwrites.
-    meta_file.write_all(&checksum.meta_header())?;
-    let header_len = meta_file.stream_position()?;
+    // re-sent chunk (replay after recovery, or after hflush) overwrites.
+    let start_len = replica.len;
     let (disk_tx, mut disk_rx) = mpsc::channel::<DiskWrite>(8);
     let bpc = checksum.bytes_per_checksum as u64;
     let csize = checksum.size() as u64;
+    let files = replica.files;
+    let has_files = files.is_some();
     let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-        let mut len = 0u64;
+        let Some((data_file, meta_file)) = files else {
+            // A finalized replica in close recovery: nothing to write.
+            while disk_rx.blocking_recv().is_some() {}
+            return Ok(start_len);
+        };
+        let mut len = start_len;
         while let Some(w) = disk_rx.blocking_recv() {
             data_file.write_all_at(&w.data, w.offset)?;
-            meta_file.write_all_at(&w.checksums, header_len + w.offset / bpc * csize)?;
+            if w.prefix > 0 {
+                // Completing a partial chunk: checksum the whole chunk.
+                let mut chunk = vec![0u8; w.prefix as usize];
+                data_file.read_exact_at(&mut chunk, w.offset - w.prefix)?;
+                chunk.extend_from_slice(&w.data);
+                meta_file.write_all_at(&checksum.compute(&chunk), META_HEADER_LEN + (w.offset - w.prefix) / bpc * csize)?;
+            } else {
+                meta_file.write_all_at(&w.checksums, META_HEADER_LEN + w.offset / bpc * csize)?;
+            }
             len = len.max(w.offset + w.data.len() as u64);
         }
-        data_file.set_len(len)?;
-        meta_file.set_len(header_len + len.div_ceil(bpc) * csize)?;
+        // No truncation here: writes are positional over a file that was
+        // created empty or cut to length when reopened, and the writer of a
+        // broken session may still be finishing after a recovery session
+        // reopened the same replica.
         data_file.sync_data()?;
         meta_file.sync_data()?;
         Ok(len)
@@ -472,27 +650,47 @@ where
         }
         None => (None, None),
     };
+    // The next DataNode failed: stop forwarding and say so in the acks.
+    let mirror_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // (seqno, last packet?, local status) in arrival order.
     let (ack_tx, mut ack_rx) = mpsc::channel::<(i64, bool, Status)>(64);
 
     // Receiver: upstream packets -> verify -> mirror + disk.
+    let mirror_failed_rx = mirror_failed.clone();
     let receiver = async move {
         let mut upstream_rx = upstream_rx;
         let mut mirror_tx = mirror_tx;
-        let mut written_to = 0u64;
+        let mut written_to = start_len;
         loop {
             let (p, raw) = read_packet(&mut upstream_rx).await?;
             let h = &p.header;
             if let Some(m) = mirror_tx.as_mut() {
-                m.write_all(&raw).await?;
+                if let Err(e) = m.write_all(&raw).await {
+                    warn!("Next DataNode in the pipeline for block {} failed: {}", b.block_id, e);
+                    mirror_failed_rx.store(true, std::sync::atomic::Ordering::Release);
+                    mirror_tx = None;
+                }
             }
             if h.seqno == HEARTBEAT_SEQNO {
                 ack_tx.send((h.seqno, false, Status::Success)).await.ok();
                 continue;
             }
             let offset = h.offset_in_block as u64;
-            if offset > written_to || h.offset_in_block < 0 || (offset % bpc != 0 && !p.data.is_empty()) {
-                return Err(TransportError::ProtocolError(format!("packet at offset {} after {} bytes", offset, written_to)));
+            let in_chunk = offset % bpc;
+            let bad_offset = h.offset_in_block < 0
+                || offset > written_to
+                || (!has_files && !p.data.is_empty())
+                // Only a packet continuing exactly where the replica ends may
+                // start inside a chunk, and it may only complete that chunk.
+                || (in_chunk != 0 && !p.data.is_empty()
+                    && (offset != written_to || p.data.len() as u64 > bpc - in_chunk));
+            if bad_offset {
+                return Err(TransportError::ProtocolError(format!(
+                    "packet at offset {} ({} bytes) after {} bytes",
+                    offset,
+                    p.data.len(),
+                    written_to
+                )));
             }
             let status = match checksum.verify(&p.data, &p.checksums) {
                 Ok(()) => Status::Success,
@@ -504,7 +702,7 @@ where
             if status == Status::Success && !p.data.is_empty() {
                 written_to = written_to.max(offset + p.data.len() as u64);
                 disk_tx
-                    .send(DiskWrite { offset, data: p.data.clone(), checksums: p.checksums.clone() })
+                    .send(DiskWrite { offset, data: p.data.clone(), checksums: p.checksums.clone(), prefix: in_chunk })
                     .await
                     .map_err(|_| TransportError::ProtocolError("disk writer stopped".into()))?;
             }
@@ -515,7 +713,7 @@ where
             }
             if last {
                 if let Some(mut m) = mirror_tx.take() {
-                    m.flush().await?;
+                    let _ = m.flush().await;
                 }
                 drop(disk_tx);
                 return Ok(written_to);
@@ -525,20 +723,38 @@ where
 
     // Responder: in packet order, wait for the mirror's ack (if any), then
     // acknowledge upstream with our status followed by the downstream ones.
+    // If the next DataNode failed, the ack carries ERROR in its place and
+    // the session ends: the client rebuilds the pipeline without it.
     let storage2 = storage.clone();
     let responder = async move {
         let mut mirror_rx = mirror_rx;
         let mut writer = Some(writer);
         while let Some((seqno, last, status)) = ack_rx.recv().await {
             let mut replies = vec![status];
-            if let Some(m) = mirror_rx.as_mut() {
-                if status == Status::Success {
-                    let down: PipelineAckProto = read_delimited(m).await?;
-                    if down.seqno != seqno {
+            let mut downstream_failed = mirror_failed.load(std::sync::atomic::Ordering::Acquire);
+            if let (Some(m), false, Status::Success) = (mirror_rx.as_mut(), downstream_failed, status) {
+                match tokio::time::timeout(MIRROR_ACK_TIMEOUT, read_delimited::<PipelineAckProto, _>(m)).await {
+                    Ok(Ok(down)) if down.seqno == seqno => {
+                        replies.extend(down.reply.iter().filter_map(|r| Status::try_from(*r).ok()));
+                    }
+                    Ok(Ok(down)) => {
                         return Err(TransportError::ProtocolError(format!("mirror acked {} for {}", down.seqno, seqno)));
                     }
-                    replies.extend(down.reply.iter().filter_map(|r| Status::try_from(*r).ok()));
+                    Ok(Err(e)) => {
+                        warn!("Next DataNode in the pipeline for block {} stopped acknowledging: {}", block.block_id, e);
+                        downstream_failed = true;
+                    }
+                    Err(_) => {
+                        warn!("Next DataNode in the pipeline for block {} timed out", block.block_id);
+                        downstream_failed = true;
+                    }
                 }
+            }
+            if downstream_failed {
+                replies.push(Status::Error);
+                write_delimited(&mut upstream_tx, &ack(seqno, &replies)).await?;
+                upstream_tx.flush().await?;
+                return Ok(());
             }
             if last && status == Status::Success {
                 let len = writer
@@ -546,12 +762,14 @@ where
                     .expect("one last packet")
                     .await
                     .map_err(|e| TransportError::ProtocolError(e.to_string()))??;
-                let s = storage2.clone();
-                tokio::task::spawn_blocking(move || s.finalize_block(&block))
-                    .await
-                    .map_err(|e| TransportError::ProtocolError(e.to_string()))?
-                    .map_err(|e| TransportError::ProtocolError(e.to_string()))?;
-                info!("Received block {} ({} bytes) from {} via HDFS protocol", block.block_id, len, peer);
+                if has_files {
+                    let s = storage2.clone();
+                    tokio::task::spawn_blocking(move || s.finalize_block(&block))
+                        .await
+                        .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+                        .map_err(|e| TransportError::ProtocolError(e.to_string()))?;
+                }
+                info!("Received block {} ({} bytes, generation stamp {}) from {} via HDFS protocol", block.block_id, len, block.generation_stamp, peer);
             }
             write_delimited(&mut upstream_tx, &ack(seqno, &replies)).await?;
             upstream_tx.flush().await?;
@@ -563,11 +781,182 @@ where
     };
 
     let (received, responded) = tokio::join!(receiver, responder);
-    if let Err(e) = received.and(responded) {
-        storage.abort_write(&block);
-        return Err(e);
+    // On failure the replica being written stays, for pipeline recovery
+    // (or the sweep, if nobody recovers it).
+    received.and(responded).map(|_| ())
+}
+
+/// Receive a replica copied from another DataNode (TRANSFER_RBW or
+/// TRANSFER_FINALIZED): no pipeline and no per-packet acks; one response
+/// once the last packet is in (HDFS DataXceiver does the same).
+async fn receive_transfer<S>(
+    socket: &mut S,
+    storage: &Arc<BlockStorage>,
+    replica: Replica,
+    checksum: Checksum,
+    stage: i32,
+    peer: SocketAddr,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let block = replica.block;
+    let (data, meta) = replica.files.expect("a new replica");
+    let bpc = checksum.bytes_per_checksum as u64;
+    let csize = checksum.size() as u64;
+    let mut written = 0u64;
+    let outcome: Result<()> = async {
+        loop {
+            let (p, _) = read_packet(socket).await?;
+            let offset = p.header.offset_in_block as u64;
+            if !p.data.is_empty() {
+                if offset != written || offset % bpc != 0 {
+                    return Err(TransportError::ProtocolError(format!("transfer packet at {} after {}", offset, written)));
+                }
+                checksum
+                    .verify(&p.data, &p.checksums)
+                    .map_err(|c| TransportError::ProtocolError(format!("checksum error in chunk {}", c)))?;
+                data.write_all_at(&p.data, offset)?;
+                meta.write_all_at(&p.checksums, META_HEADER_LEN + offset / bpc * csize)?;
+                written += p.data.len() as u64;
+            }
+            if p.header.last_packet_in_block {
+                data.sync_data()?;
+                meta.sync_data()?;
+                return Ok(());
+            }
+        }
     }
-    Ok(())
+    .await;
+    let response = match outcome {
+        Ok(()) if stage == BlockConstructionStage::TransferFinalized as i32 => {
+            let s = storage.clone();
+            match tokio::task::spawn_blocking(move || s.finalize_block(&block)).await {
+                Ok(Ok(_)) => op_response(Status::Success, ""),
+                Ok(Err(e)) => op_response(Status::Error, &e.to_string()),
+                Err(e) => op_response(Status::Error, &e.to_string()),
+            }
+        }
+        // TRANSFER_RBW: stays a replica being written, for the recovery.
+        Ok(()) => op_response(Status::Success, ""),
+        Err(e) => {
+            storage.abort_write(&block);
+            warn!("Transfer of block {} from {} failed: {}", block.block_id, peer, e);
+            op_response(Status::Error, &e.to_string())
+        }
+    };
+    info!("Received a copy of block {} ({} bytes) from {}", block.block_id, written, peer);
+    write_delimited(socket, &response).await?;
+    socket.flush().await.map_err(Into::into)
+}
+
+/// TRANSFER_BLOCK: copy this DataNode's replica of the block (being
+/// written, or finalized) to the first target, then answer the client.
+async fn transfer_block<S>(socket: &mut S, storage: &Arc<BlockStorage>, op: OpTransferBlockProto, peer: SocketAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let b = op.header.base_header.block.clone();
+    let result = send_replica(storage, &op).await;
+    let response = match &result {
+        Ok(len) => {
+            info!("Copied block {} ({} bytes) to {:?} for {}", b.block_id, len, op.targets.first().map(|t| &t.id.ip_addr), peer);
+            op_response(Status::Success, "")
+        }
+        Err(e) => {
+            warn!("Transfer of block {} requested by {} failed: {}", b.block_id, peer, e);
+            op_response(Status::Error, &e.to_string())
+        }
+    };
+    write_delimited(socket, &response).await?;
+    socket.flush().await.map_err(Into::into)
+}
+
+/// The checksum a replica was written with (its `.meta` header).
+fn replica_checksum(meta: &std::path::Path) -> Checksum {
+    let mut head = [0u8; META_HEADER_LEN as usize];
+    let read = std::fs::File::open(meta).and_then(|f| f.read_exact_at(&mut head, 0));
+    let parsed = read.ok().and_then(|_| {
+        let kind = ChecksumTypeProto::try_from(head[2] as i32).ok()?;
+        let bytes_per_checksum = u32::from_be_bytes(head[3..7].try_into().ok()?);
+        (bytes_per_checksum > 0).then_some(Checksum { kind, bytes_per_checksum })
+    });
+    parsed.unwrap_or(Checksum::CRC32C_512)
+}
+
+async fn send_replica(storage: &Arc<BlockStorage>, op: &OpTransferBlockProto) -> Result<u64> {
+    let b = &op.header.base_header.block;
+    let target = op.targets.first().ok_or_else(|| TransportError::ProtocolError("no target".into()))?;
+    // What this DataNode holds: a replica being written, or a finalized one.
+    let (id, len, rbw) = match storage.find_rbw(b.block_id) {
+        Some((id, len)) => (id, len, true),
+        None => match storage.get_block_metadata(b.block_id) {
+            Some(m) => (m.block_id, m.num_bytes, false),
+            None => return Err(TransportError::BlockNotFound(b.block_id)),
+        },
+    };
+    if id.generation_stamp < b.generation_stamp {
+        return Err(TransportError::ProtocolError(format!(
+            "replica of block {} has generation stamp {} < {}",
+            b.block_id, id.generation_stamp, b.generation_stamp
+        )));
+    }
+    let (file, meta_path) = {
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || -> std::result::Result<_, BlockStorageError> {
+            if rbw {
+                let (data, _) = storage.open_rbw(&id)?;
+                Ok((data, storage.rbw_meta_path(&id)))
+            } else {
+                let m = storage.get_block_metadata(id.block_id).ok_or(BlockStorageError::BlockNotFound(id.block_id))?;
+                Ok((storage.open_for_read(&id, 0, len)?.0, m.meta_path))
+            }
+        })
+        .await
+        .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+        .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+    };
+    let checksum = replica_checksum(&meta_path);
+
+    let mut s = super::wire::connect(&format!("{}:{}", target.id.ip_addr, target.id.xfer_port)).await?;
+    let mut header = op.header.clone();
+    header.base_header.block.generation_stamp = id.generation_stamp;
+    header.base_header.block.num_bytes = Some(len);
+    let stage = if rbw { BlockConstructionStage::TransferRbw } else { BlockConstructionStage::TransferFinalized };
+    let write = OpWriteBlockProto {
+        header,
+        stage: stage as i32,
+        pipeline_size: 1,
+        latest_generation_stamp: id.generation_stamp,
+        requested_checksum: checksum.to_proto(),
+        ..Default::default()
+    };
+    let mut head = Vec::with_capacity(3);
+    head.extend_from_slice(&DATA_TRANSFER_VERSION.to_be_bytes());
+    head.push(OP_WRITE_BLOCK);
+    s.write_all(&head).await?;
+    write_delimited(&mut s, &write).await?;
+
+    // Whole chunks per packet; the last chunk may be partial.
+    let packet = (READ_PACKET_DATA as u64 / checksum.bytes_per_checksum as u64).max(1) * checksum.bytes_per_checksum as u64;
+    let mut chunks = super::wire::spawn_file_reader(file, len, packet as usize);
+    let (mut offset, mut seqno) = (0u64, 0i64);
+    while let Some(data) = chunks.recv().await {
+        let data = data?;
+        let header = PacketHeaderProto { offset_in_block: offset as i64, seqno, last_packet_in_block: false, data_len: data.len() as i32, sync_block: Some(false) };
+        let checksums = Bytes::from(checksum.compute(&data));
+        offset += data.len() as u64;
+        s.write_all(&Packet { header, checksums, data }.encode()).await?;
+        seqno += 1;
+    }
+    let last = PacketHeaderProto { offset_in_block: offset as i64, seqno, last_packet_in_block: true, data_len: 0, sync_block: Some(false) };
+    s.write_all(&Packet { header: last, checksums: Bytes::new(), data: Bytes::new() }.encode()).await?;
+    s.flush().await?;
+    let r: BlockOpResponseProto = read_delimited(&mut s).await?;
+    if r.status != Status::Success as i32 {
+        return Err(TransportError::ProtocolError(format!("target refused the copy: {}", r.message.unwrap_or_default())));
+    }
+    Ok(len)
 }
 
 /// Connect to the next DataNode and forward the WRITE_BLOCK op with the

@@ -42,6 +42,10 @@ public class HdfsInterop {
             verifyAfterRestart(fs);
             return;
         }
+        if (args.length > 3 && args[1].equals("pipeline")) {
+            pipelineAcrossADatanodeFailure(fs, args[2], args[3]);
+            return;
+        }
 
         Path dir = new Path("/java/nested");
         check(fs.mkdirs(dir), "mkdirs -p " + dir);
@@ -119,31 +123,27 @@ public class HdfsInterop {
         check(cs.getLength() == data.length + "replaced\n".length() && cs.getFileCount() == 2 && cs.getDirectoryCount() == 2,
               "getContentSummary: " + cs.getLength() + " bytes, " + cs.getFileCount() + " files, " + cs.getDirectoryCount() + " dirs");
 
-        // append: a full last block starts a new one; a partial last block
-        // cannot be extended (UnsupportedOperationException), except with
-        // CreateFlag.NEW_BLOCK.
+        // append: a full last block starts a new one; a partial last block is
+        // extended, or left alone with CreateFlag.NEW_BLOCK.
         Path ap = new Path("/java/append.bin");
         byte[] head = new byte[1 << 20];
         new Random(5).nextBytes(head);
         try (FSDataOutputStream out = fs.create(ap)) { out.write(head); }
         try (FSDataOutputStream out = fs.append(ap)) { out.write("tail".getBytes()); }
         check(fs.getFileStatus(ap).getLen() == head.length + 4, "append after a full block");
-        boolean refused = false;
-        // DFSClient can only unwrap IOExceptions, so it arrives as a
-        // RemoteException naming the class.
+        // The last block is now partial (1 MiB + 4 bytes): appending extends
+        // it in place (pipeline stage APPEND, new generation stamp), the
+        // first packet completing a partial checksum chunk.
         try (FSDataOutputStream out = fs.append(ap)) { out.write("x".getBytes()); }
-        catch (org.apache.hadoop.ipc.RemoteException e) {
-            refused = e.getClassName().equals("java.lang.UnsupportedOperationException");
-        }
-        check(refused, "append into a partial last block is refused");
+        check(fs.getFileStatus(ap).getLen() == head.length + 5, "append into a partial last block");
         try (FSDataOutputStream out = ((DistributedFileSystem) fs).append(ap,
                 EnumSet.of(CreateFlag.APPEND, CreateFlag.NEW_BLOCK), 4096, null)) {
             out.write("more".getBytes());
         }
         byte[] got;
         try (FSDataInputStream in = fs.open(ap)) { got = in.readAllBytes(); }
-        check(got.length == head.length + 8 && Arrays.equals(Arrays.copyOf(got, head.length), head)
-              && new String(got, head.length, 8).equals("tailmore"), "append with NEW_BLOCK; content intact");
+        check(got.length == head.length + 9 && Arrays.equals(Arrays.copyOf(got, head.length), head)
+              && new String(got, head.length, 9).equals("tailxmore"), "append with NEW_BLOCK; content intact");
 
         // Leases: one writer at a time; recoverLease takes a file from a
         // writer that is gone.
@@ -177,6 +177,32 @@ public class HdfsInterop {
         check(fs.getFileStatus(KEEP).getLen() == keepData().length, "wrote " + KEEP + " for the restart check");
         fs.close();
         System.out.println("ALL OK");
+    }
+
+    /**
+     * Write 1.5 blocks, signal `ready` and wait for `go` while the script
+     * kills a DataNode of the pipeline, then write 2 more blocks and close:
+     * DataStreamer must rebuild the pipeline without it.
+     */
+    static void pipelineAcrossADatanodeFailure(FileSystem fs, String ready, String go) throws Exception {
+        Path p = new Path("/pipeline/f.bin");
+        byte[] data = new byte[7 << 19];
+        new Random(9).nextBytes(data);
+        try (FSDataOutputStream out = fs.create(p)) {
+            out.write(data, 0, 3 << 19);
+            Thread.sleep(1000);   // the packets reach the DataNodes and are acked
+            Files.writeString(java.nio.file.Path.of(ready), "ready");
+            while (!Files.exists(java.nio.file.Path.of(go))) Thread.sleep(100);
+            out.write(data, 3 << 19, data.length - (3 << 19));
+        }
+        check(fs.getFileStatus(p).getLen() == data.length, "write completed across a DataNode failure");
+        byte[] back = new byte[data.length];
+        try (FSDataInputStream in = fs.open(p)) {
+            in.readFully(back);
+        }
+        check(Arrays.equals(back, data), "content is byte-identical after pipeline recovery");
+        fs.close();
+        System.out.println("ALL OK pipeline");
     }
 
     /** After the NameNode was killed and restarted on the same name dir. */

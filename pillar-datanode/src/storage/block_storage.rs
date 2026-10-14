@@ -68,6 +68,10 @@ pub struct BlockStorage {
     /// Finalize/delete events awaiting an incremental block report; `None`
     /// until a NameNode client asks for them.
     events: Mutex<Option<Vec<BlockEvent>>>,
+
+    /// Woken on every event, so the report goes out at once (as HDFS
+    /// DataNodes do): a client's complete() waits for it.
+    events_notify: tokio::sync::Notify,
 }
 
 /// A change to the set of finalized replicas, for incremental block reports.
@@ -88,6 +92,7 @@ impl BlockStorage {
             blocks: DashMap::new(),
             total_bytes: AtomicU64::new(0),
             events: Mutex::new(None),
+            events_notify: tokio::sync::Notify::new(),
         };
 
         // Scan and load existing blocks
@@ -281,6 +286,120 @@ impl BlockStorage {
         Ok(OpenOptions::new().write(true).truncate(true).create(true).open(self.get_meta_path(block_id, false))?)
     }
 
+    /// The replica of `block_id` being written here (in tmp), with whatever
+    /// generation stamp it has, and its length.
+    pub fn find_rbw(&self, block_id: u64) -> Option<(BlockId, u64)> {
+        let prefix = format!("blk_{}_", block_id);
+        fs::read_dir(&self.tmp_dir).ok()?.flatten().find_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if !name.starts_with(&prefix) || name.ends_with(".meta") {
+                return None;
+            }
+            let id = self.parse_block_filename(&name)?;
+            Some((id, e.metadata().ok()?.len()))
+        })
+    }
+
+    /// Give the replica being written of `block_id` the generation stamp
+    /// `new_gs` (pipeline recovery), returning its new id and length. A
+    /// replica with a newer stamp than `new_gs` is refused: it belongs to a
+    /// later pipeline.
+    pub fn restamp_rbw(&self, block_id: u64, new_gs: u64) -> Result<(BlockId, u64)> {
+        let (old, len) = self.find_rbw(block_id).ok_or(BlockStorageError::BlockNotFound(block_id))?;
+        if old.generation_stamp > new_gs {
+            return Err(BlockStorageError::BlockAlreadyExists(block_id));
+        }
+        let new = BlockId::new(block_id, new_gs);
+        if old != new {
+            fs::rename(self.get_block_path(&old, false), self.get_block_path(&new, false))?;
+            let meta = self.get_meta_path(&old, false);
+            if meta.exists() {
+                fs::rename(meta, self.get_meta_path(&new, false))?;
+            }
+        }
+        Ok((new, len))
+    }
+
+    /// The `.meta` path of a replica being written.
+    pub fn rbw_meta_path(&self, block_id: &BlockId) -> PathBuf {
+        self.get_meta_path(block_id, false)
+    }
+
+    /// Open a replica being written, data and `.meta`, for reading and
+    /// writing in place.
+    pub fn open_rbw(&self, block_id: &BlockId) -> Result<(File, File)> {
+        let open = |p: PathBuf| OpenOptions::new().read(true).write(true).open(p);
+        Ok((open(self.get_block_path(block_id, false))?, open(self.get_meta_path(block_id, false))?))
+    }
+
+    /// Reopen a finalized replica for writing (append): it moves back to
+    /// tmp under `new_gs` and leaves the finalized set until finalized
+    /// again. Returns its new id and length.
+    pub fn unfinalize(&self, block_id: &BlockId, new_gs: u64) -> Result<(BlockId, u64)> {
+        // Only this exact replica: a different stamp must leave it in place.
+        let (_, meta) = self
+            .blocks
+            .remove_if(&block_id.block_id, |_, m| m.block_id == *block_id)
+            .ok_or(BlockStorageError::BlockNotFound(block_id.block_id))?;
+        self.total_bytes.fetch_sub(meta.num_bytes, Ordering::Relaxed);
+        let new = BlockId::new(block_id.block_id, new_gs);
+        fs::rename(&meta.file_path, self.get_block_path(&new, false))?;
+        if meta.meta_path.exists() {
+            fs::rename(&meta.meta_path, self.get_meta_path(&new, false))?;
+        }
+        if new != *block_id {
+            self.record(BlockEvent::Deleted { block: *block_id });
+        }
+        Ok((new, meta.num_bytes))
+    }
+
+    /// Give a finalized replica of `block_id` the generation stamp `new_gs`
+    /// (close recovery: the data was complete, the pipeline broke while
+    /// closing). Returns its length.
+    pub fn restamp_finalized(&self, block_id: u64, new_gs: u64) -> Result<u64> {
+        let (_, mut meta) = self.blocks.remove(&block_id).ok_or(BlockStorageError::BlockNotFound(block_id))?;
+        let old = meta.block_id;
+        let new = BlockId::new(block_id, new_gs);
+        if old != new {
+            let file_path = self.get_block_path(&new, true);
+            let meta_path = self.get_meta_path(&new, true);
+            fs::rename(&meta.file_path, &file_path)?;
+            if meta.meta_path.exists() {
+                fs::rename(&meta.meta_path, &meta_path)?;
+            }
+            meta = BlockMetadata { block_id: new, file_path, meta_path, ..meta };
+            self.record(BlockEvent::Deleted { block: old });
+            self.record(BlockEvent::Received { block: new, num_bytes: meta.num_bytes });
+        }
+        let len = meta.num_bytes;
+        self.blocks.insert(block_id, meta);
+        Ok(len)
+    }
+
+    /// Delete replicas being written that nobody has touched for
+    /// `older_than`: their writer is gone and its lease long recovered.
+    /// Returns how many were removed.
+    pub fn sweep_stale_rbw(&self, older_than: std::time::Duration) -> usize {
+        let Ok(entries) = fs::read_dir(&self.tmp_dir) else { return 0 };
+        let mut removed = 0;
+        for e in entries.flatten() {
+            let stale = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().unwrap_or_default() >= older_than)
+                .unwrap_or(false);
+            if stale && fs::remove_file(e.path()).is_ok() {
+                if !e.file_name().to_string_lossy().ends_with(".meta") {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            info!("Removed {} abandoned replicas being written from {}", removed, self.tmp_dir.display());
+        }
+        removed
+    }
+
     /// Discard a partially received block.
     pub fn abort_write(&self, block_id: &BlockId) {
         for path in [self.get_block_path(block_id, false), self.get_meta_path(block_id, false)] {
@@ -399,7 +518,13 @@ impl BlockStorage {
     fn record(&self, event: BlockEvent) {
         if let Some(ev) = self.events.lock().unwrap().as_mut() {
             ev.push(event);
+            self.events_notify.notify_one();
         }
+    }
+
+    /// Resolves when an event is recorded (one may already be pending).
+    pub async fn event_recorded(&self) {
+        self.events_notify.notified().await
     }
 
     /// Get total number of blocks
@@ -412,6 +537,7 @@ impl BlockStorage {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::os::unix::fs::FileExt;
 
     fn new_storage() -> (TempDir, BlockStorage) {
         let temp_dir = TempDir::new().unwrap();
@@ -421,6 +547,67 @@ mod tests {
         fs::create_dir_all(&tmp_dir).unwrap();
         let storage = BlockStorage::new(&finalized_dir, &tmp_dir).unwrap();
         (temp_dir, storage)
+    }
+
+    fn write_rbw(storage: &BlockStorage, id: BlockId, data: &[u8]) {
+        storage.begin_write(&id).unwrap().write_all(data).unwrap();
+    }
+
+    #[test]
+    fn a_replica_being_written_is_restamped_for_recovery_but_not_backwards() {
+        let (_d, storage) = new_storage();
+        assert!(storage.find_rbw(7).is_none());
+        write_rbw(&storage, BlockId::new(7, 100), b"0123456789");
+        assert_eq!(storage.find_rbw(7), Some((BlockId::new(7, 100), 10)));
+
+        let (id, len) = storage.restamp_rbw(7, 105).unwrap();
+        assert_eq!((id, len), (BlockId::new(7, 105), 10));
+        assert_eq!(storage.find_rbw(7), Some((BlockId::new(7, 105), 10)));
+        // A stale pipeline (older stamp) cannot take it back.
+        assert!(matches!(storage.restamp_rbw(7, 101), Err(BlockStorageError::BlockAlreadyExists(7))));
+        let (data, _) = storage.open_rbw(&id).unwrap();
+        data.write_all_at(b"AB", 10).unwrap();
+        assert_eq!(storage.finalize_block(&id).unwrap(), 12);
+        assert!(storage.find_rbw(7).is_none());
+        assert_eq!(storage.get_block_metadata(7).unwrap().block_id, id);
+    }
+
+    #[test]
+    fn a_finalized_replica_reopens_for_append_and_restamps_for_close_recovery() {
+        let (_d, storage) = new_storage();
+        storage.enable_events();
+        let old = BlockId::new(9, 200);
+        write_rbw(&storage, old, b"hello");
+        storage.finalize_block(&old).unwrap();
+        let _ = storage.take_events();
+
+        // Append: leaves the finalized set (and usage) until finalized again.
+        let (id, len) = storage.unfinalize(&old, 201).unwrap();
+        assert_eq!((id, len), (BlockId::new(9, 201), 5));
+        assert!(storage.get_block_metadata(9).is_none());
+        assert_eq!(storage.total_bytes(), 0);
+        assert_eq!(storage.take_events(), vec![BlockEvent::Deleted { block: old }]);
+        storage.open_rbw(&id).unwrap().0.write_all_at(b" world", 5).unwrap();
+        assert_eq!(storage.finalize_block(&id).unwrap(), 11);
+        // Wrong stamp: not this replica.
+        assert!(storage.unfinalize(&old, 202).is_err());
+
+        // Close recovery of a finalized replica: renamed under the new stamp.
+        assert_eq!(storage.restamp_finalized(9, 210).unwrap(), 11);
+        let m = storage.get_block_metadata(9).unwrap();
+        assert_eq!(m.block_id, BlockId::new(9, 210));
+        assert!(m.file_path.exists() && !storage.get_block_path(&id, true).exists());
+        let ev = storage.take_events();
+        assert!(ev.contains(&BlockEvent::Received { block: BlockId::new(9, 210), num_bytes: 11 }));
+    }
+
+    #[test]
+    fn abandoned_replicas_being_written_are_swept() {
+        let (_d, storage) = new_storage();
+        write_rbw(&storage, BlockId::new(1, 1), b"x");
+        assert_eq!(storage.sweep_stale_rbw(std::time::Duration::from_secs(3600)), 0);
+        assert_eq!(storage.sweep_stale_rbw(std::time::Duration::ZERO), 1);
+        assert!(storage.find_rbw(1).is_none());
     }
 
     #[test]
