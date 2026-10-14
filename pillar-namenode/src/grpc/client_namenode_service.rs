@@ -4,7 +4,8 @@ use tracing::{debug, info, warn};
 
 use crate::metadata::{Namespace, BlockManager, EditLog, EditOp, EditTxn};
 use crate::metadata::edit_log::{InodeAttributes, InodeRecord};
-use crate::metadata::namespace::{FsPermission, INode};
+use crate::metadata::lease_manager::LeaseManager;
+use crate::metadata::namespace::{FsPermission, INode, UnderConstruction};
 use crate::metadata::block_manager::{BlockId, DatanodeId};
 use crate::datanode::{DatanodeManager, BlockPlacementPolicy};
 
@@ -21,6 +22,8 @@ pub struct ClientNamenodeService {
     default_replication: u16,
     /// This namespace's block pool, named in every block handed out.
     block_pool_id: String,
+    /// Who holds which open files.
+    leases: Arc<LeaseManager>,
 }
 
 impl ClientNamenodeService {
@@ -39,7 +42,133 @@ impl ClientNamenodeService {
             default_block_size: 128 * 1024 * 1024,
             default_replication: 3,
             block_pool_id: "BP-pillar-001".to_string(),
+            leases: Arc::new(LeaseManager::default()),
         }
+    }
+
+    /// Use `leases` (e.g. with other soft/hard limits).
+    pub fn with_leases(mut self, leases: Arc<LeaseManager>) -> Self {
+        self.leases = leases;
+        self
+    }
+
+    /// After loading a namespace: every open file's holder gets a fresh
+    /// lease (HDFS does the same), so a live writer carries on and a dead
+    /// one is recovered after the hard limit.
+    pub async fn restore_leases(&self) -> usize {
+        let open = self.namespace.open_files().await;
+        for (id, uc) in &open {
+            self.leases.add(&uc.holder, *id);
+        }
+        open.len()
+    }
+
+    /// renewLease.
+    pub fn handle_renew_lease(&self, client: &str) {
+        self.leases.renew(client);
+    }
+
+    /// isFileClosed.
+    pub async fn handle_is_file_closed(&self, path: &str) -> Result<bool, Status> {
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let closed = inode.read().await.under_construction.is_none();
+        Ok(closed)
+    }
+
+    /// recoverLease: close the file now (see [`Self::recover_file`]).
+    /// True once it is closed, which it always is on return.
+    pub async fn handle_recover_lease(&self, path: &str, client: &str) -> Result<bool, Status> {
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let (id, holder) = {
+            let inode = inode.read().await;
+            if inode.is_dir {
+                return Err(Status::not_found(format!("{} is a directory", path)));
+            }
+            (inode.id, inode.under_construction.as_ref().map(|uc| uc.holder.clone()))
+        };
+        if let Some(holder) = holder {
+            info!("recoverLease({}) by {}: recovering {}'s lease", path, client, holder);
+            self.recover_file(id).await?;
+        }
+        Ok(true)
+    }
+
+    /// listOpenFiles: (inode id, path, holder) of every open file.
+    pub async fn handle_list_open_files(&self) -> Vec<(u64, String, String)> {
+        let mut out = Vec::new();
+        for (id, uc) in self.namespace.open_files().await {
+            if let Some(path) = self.namespace.path_of(id).await {
+                out.push((id, path, uc.holder));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Recover the files of every lease past the hard limit; returns how
+    /// many. Run periodically (HDFS LeaseManager.Monitor).
+    pub async fn check_leases(&self) -> usize {
+        let expired = self.leases.hard_expired();
+        for (holder, id) in &expired {
+            warn!("Lease of {} on inode {} passed the hard limit; recovering the file", holder, id);
+            if let Err(e) = self.recover_file(*id).await {
+                warn!("Recovering inode {}: {}", id, e);
+            }
+        }
+        expired.len()
+    }
+
+    /// Lease recovery: close an open file whose writer is gone. The block
+    /// being written keeps the length a DataNode reported when it finished
+    /// the block; if no DataNode finished it, no data in it was ever
+    /// acknowledged (Pillar has no hflush yet), so it is dropped.
+    async fn recover_file(&self, inode_id: u64) -> Result<(), Status> {
+        let mut tx = self.begin().await?;
+        let Some(inode) = self.namespace.get_inode(inode_id) else { return Ok(()) };
+        let mut guard = inode.write().await;
+        let Some(uc) = guard.under_construction.clone() else { return Ok(()) };
+        if let Some(open) = guard.open_block().cloned() {
+            let id = BlockId::new(open.block_id, open.generation_stamp);
+            let blocks = guard.blocks.as_mut().expect("a file");
+            if self.block_manager.get_replica_count(&id) > 0 {
+                let len = self.block_manager.get_block_info(&id).map_or(open.num_bytes, |b| b.num_bytes);
+                blocks.last_mut().expect("open block").num_bytes = len;
+                info!("Lease recovery of inode {}: block {} kept, {} bytes", inode_id, open.block_id, len);
+            } else {
+                blocks.pop();
+                self.block_manager.remove_block(&id);
+                info!("Lease recovery of inode {}: block {} dropped (no DataNode finished it)", inode_id, open.block_id);
+            }
+            tx.log(EditOp::SetBlocks { inode: inode_id, blocks: blocks.clone() });
+        }
+        guard.under_construction = None;
+        drop(guard);
+        tx.log(EditOp::Close { inode: inode_id });
+        tx.commit().await.map_err(edit_status)?;
+        self.leases.remove(&uc.holder, inode_id);
+        Ok(())
+    }
+
+    /// Before `client` opens an existing file: if another writer has it
+    /// open, take it over once that writer's lease is past the soft limit
+    /// (recovering the file first), else AlreadyBeingCreatedException.
+    async fn take_over_if_open(&self, path: &str, client: &str, op: &str) -> Result<(), Status> {
+        let Ok(inode) = self.namespace.lookup(path).await else { return Ok(()) };
+        let (id, holder) = {
+            let inode = inode.read().await;
+            match &inode.under_construction {
+                Some(uc) => (inode.id, uc.holder.clone()),
+                None => return Ok(()),
+            }
+        };
+        if holder != client && self.leases.soft_expired(&holder) {
+            info!("{} {} by {}: {}'s lease expired; recovering the file", op, path, client, holder);
+            return self.recover_file(id).await;
+        }
+        Err(already_being_created(format!(
+            "Failed to {} {} for {}: the file is open for writing by {}",
+            op, path, client, holder
+        )))
     }
 
     /// Server defaults reported to clients (getServerDefaults).
@@ -155,6 +284,7 @@ impl ClientNamenodeService {
 
         Ok(FileInfo {
             path: path.to_string(),
+            file_id: inode_guard.id,
             is_dir: inode_guard.is_dir,
             length: self.get_file_length(&*inode_guard).await,
             block_size: inode_guard.block_size,
@@ -186,6 +316,7 @@ impl ClientNamenodeService {
 
             result.push(FileInfo {
                 path: child_path,
+                file_id: child_guard.id,
                 is_dir: child_guard.is_dir,
                 length: self.get_file_length(&*child_guard).await,
                 block_size: child_guard.block_size,
@@ -281,7 +412,16 @@ impl ClientNamenodeService {
         replication: u16,
         block_size: u64,
     ) -> Result<(), Status> {
-        self.handle_create_with(path, owner, group, permissions, replication, block_size, false, false).await
+        self.handle_create_with(path, owner, group, permissions, replication, block_size, false, false, "").await.map(|_| ())
+    }
+
+    /// Mark inode `id` open for writing by `client`.
+    async fn open_for(&self, tx: &mut EditTxn<'_>, id: u64, client: &str, blocks_at_open: u32) {
+        let inode = self.namespace.get_inode(id).expect("inode just created or looked up");
+        inode.write().await.under_construction =
+            Some(UnderConstruction { holder: client.to_string(), blocks_at_open });
+        tx.log(EditOp::Open { inode: id, holder: client.to_string(), blocks_at_open });
+        self.leases.add(client, id);
     }
 
     /// HDFS `create`: `create_parent` makes missing ancestors (as
@@ -298,7 +438,9 @@ impl ClientNamenodeService {
         block_size: u64,
         create_parent: bool,
         overwrite: bool,
-    ) -> Result<(), Status> {
+        client: &str,
+    ) -> Result<u64, Status> {
+        self.take_over_if_open(path, client, "create").await?;
         if create_parent {
             if let Some((parent, _)) = path.trim_end_matches('/').rsplit_once('/') {
                 if !parent.is_empty() {
@@ -328,11 +470,12 @@ impl ClientNamenodeService {
             .await
             .map_err(namespace_status)?;
         tx.log(EditOp::AddInode { path: path.to_string(), inode: self.inode_record(id).await });
+        self.open_for(&mut tx, id, client, 0).await;
         tx.commit().await.map_err(edit_status)?;
 
-        info!("Created file: {}", path);
+        info!("Created file: {} (open for {})", path, client);
 
-        Ok(())
+        Ok(id)
     }
 
     /// Delete a file or directory
@@ -351,6 +494,11 @@ impl ClientNamenodeService {
             .map_err(|e| Status::internal(format!("Failed to delete: {}", e)))?;
 
         self.release_blocks(&removed);
+        for r in &removed {
+            if let Some(holder) = &r.holder {
+                self.leases.remove(holder, r.id);
+            }
+        }
 
         tx.log(EditOp::Delete { path: path.to_string() });
         info!("Deleted: {} ({} inodes)", path, removed.len());
@@ -419,18 +567,20 @@ impl ClientNamenodeService {
 
         // Copy out what we need and release the inode lock before resolving
         // locations.
-        let (selected, file_length, last) = {
+        let (selected, file_length, last, open) = {
             let inode_guard = inode.read().await;
 
             if inode_guard.is_dir {
                 return Err(Status::invalid_argument("Cannot get blocks for directory"));
             }
 
-            let blocks: &[crate::metadata::namespace::BlockInfo] =
-                inode_guard.blocks.as_deref().unwrap_or(&[]);
+            // An open file shows its finished blocks; the one being written
+            // has no length a reader could rely on (no hflush yet).
+            let blocks = inode_guard.finished_blocks();
             let file_length: u64 = blocks.iter().map(|b| b.num_bytes).sum();
             let last = blocks.last().map(|b| (b.clone(), file_length - b.num_bytes));
-            (Self::blocks_in_range(blocks, offset, length), file_length, last)
+            let open = inode_guard.under_construction.is_some();
+            (Self::blocks_in_range(blocks, offset, length), file_length, last, open)
         };
 
         let blocks = selected
@@ -446,7 +596,7 @@ impl ClientNamenodeService {
             blocks,
             last_block,
             is_last_block_complete,
-            under_construction: false,
+            under_construction: open,
         })
     }
 
@@ -497,6 +647,11 @@ impl ClientNamenodeService {
 
     /// Add a new block to a file (called by client when writing)
     pub async fn handle_add_block(&self, path: &str) -> Result<LocatedBlock, Status> {
+        self.handle_add_block_as(path, "").await
+    }
+
+    /// addBlock by `client`, which must hold the file's lease.
+    pub async fn handle_add_block_as(&self, path: &str, client: &str) -> Result<LocatedBlock, Status> {
         let inode = self.namespace
             .lookup(path)
             .await
@@ -525,6 +680,7 @@ impl ClientNamenodeService {
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot add block to directory"));
         }
+        check_holder(&inode_guard, path, client)?;
 
         // Allocate new block
         let block_id = self.block_manager
@@ -581,9 +737,19 @@ impl ClientNamenodeService {
     /// (`addBlock`'s `previous`, `complete`'s `last`). The file's length is
     /// the sum of its blocks.
     pub async fn handle_commit_block(&self, path: &str, block_id: u64, num_bytes: u64) -> Result<(), Status> {
+        self.handle_commit_block_as(path, block_id, num_bytes, "").await
+    }
+
+    /// Record a block's final length for `client`, which must hold the
+    /// file's lease (a closed file is left alone: a retried complete).
+    pub async fn handle_commit_block_as(&self, path: &str, block_id: u64, num_bytes: u64, client: &str) -> Result<(), Status> {
         let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
         let mut tx = self.begin().await?;
         let mut guard = inode.write().await;
+        if guard.under_construction.is_none() {
+            return Ok(());
+        }
+        check_holder(&guard, path, client)?;
         let inode_id = guard.id;
         let block = guard
             .blocks
@@ -605,16 +771,27 @@ impl ClientNamenodeService {
 
     /// Complete a file (finalize writes)
     pub async fn handle_complete(&self, path: &str) -> Result<bool, Status> {
+        self.handle_complete_as(path, "").await
+    }
+
+    /// complete(): close the file once every block has a reported replica.
+    /// Completing an already closed file succeeds (a retried complete).
+    pub async fn handle_complete_as(&self, path: &str, client: &str) -> Result<bool, Status> {
         let inode = self.namespace
             .lookup(path)
             .await
             .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
 
-        let inode_guard = inode.read().await;
+        let mut tx = self.begin().await?;
+        let mut inode_guard = inode.write().await;
 
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot complete directory"));
         }
+        if inode_guard.under_construction.is_none() {
+            return Ok(true);
+        }
+        check_holder(&inode_guard, path, client)?;
 
         // HDFS dfs.namenode.replication.min (1): the file is complete only
         // once every block has a replica a DataNode has reported. Until then
@@ -633,6 +810,12 @@ impl ClientNamenodeService {
             return Ok(false);
         }
 
+        let id = inode_guard.id;
+        inode_guard.under_construction = None;
+        drop(inode_guard);
+        tx.log(EditOp::Close { inode: id });
+        tx.commit().await.map_err(edit_status)?;
+        self.leases.remove(client, id);
         info!("Completed file: {}", path);
 
         Ok(true)
@@ -644,12 +827,22 @@ impl ClientNamenodeService {
     /// append pipeline, which Pillar lacks, so that is refused unless the
     /// client asked for a new block (CreateFlag.NEW_BLOCK).
     pub async fn handle_append(&self, path: &str, new_block: bool) -> Result<(), Status> {
+        self.handle_append_as(path, new_block, "").await
+    }
+
+    /// append by `client`: the file becomes open for it (see handle_append).
+    pub async fn handle_append_as(&self, path: &str, new_block: bool, client: &str) -> Result<(), Status> {
+        self.take_over_if_open(path, client, "append").await?;
         let inode = self.namespace
             .lookup(path)
             .await
             .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
 
+        let mut tx = self.begin().await?;
         let inode_guard = inode.read().await;
+        if inode_guard.under_construction.is_some() {
+            return Err(already_being_created(format!("Failed to append {}: it was opened meanwhile", path)));
+        }
 
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot append to directory"));
@@ -666,12 +859,21 @@ impl ClientNamenodeService {
                 path
             )));
         }
-        info!("Append to {} starts a new block", path);
+        let (id, blocks) = (inode_guard.id, inode_guard.blocks.as_ref().map_or(0, |b| b.len()) as u32);
+        drop(inode_guard);
+        self.open_for(&mut tx, id, client, blocks).await;
+        tx.commit().await.map_err(edit_status)?;
+        info!("Append to {} by {} starts a new block", path, client);
         Ok(())
     }
 
     /// Abandon a block allocation (cleanup failed writes)
     pub async fn handle_abandon_block(&self, path: &str, block_id: u64) -> Result<(), Status> {
+        self.handle_abandon_block_as(path, block_id, "").await
+    }
+
+    /// abandonBlock by `client`, which must hold the file's lease.
+    pub async fn handle_abandon_block_as(&self, path: &str, block_id: u64, client: &str) -> Result<(), Status> {
         let inode = self.namespace
             .lookup(path)
             .await
@@ -680,6 +882,7 @@ impl ClientNamenodeService {
         let mut tx = self.begin().await?;
         let mut inode_guard = inode.write().await;
         let inode_id = inode_guard.id;
+        check_holder(&inode_guard, path, client)?;
 
         if let Some(blocks) = &mut inode_guard.blocks {
             let mut abandoned = Vec::new();
@@ -802,6 +1005,17 @@ impl ClientNamenodeService {
         block_id: u64,
         old_generation_stamp: u64,
     ) -> Result<LocatedBlock, Status> {
+        self.handle_update_block_for_pipeline_as(block_id, old_generation_stamp, "").await
+    }
+
+    /// updateBlockForPipeline by `client`, which must hold the lease on the
+    /// block's file.
+    pub async fn handle_update_block_for_pipeline_as(
+        &self,
+        block_id: u64,
+        old_generation_stamp: u64,
+        client: &str,
+    ) -> Result<LocatedBlock, Status> {
         info!(
             "Updating block {} generation stamp from {}",
             block_id, old_generation_stamp
@@ -822,6 +1036,10 @@ impl ClientNamenodeService {
         let block_info = self.block_manager
             .get_block_info(&old_block_id)
             .ok_or_else(|| Status::not_found(format!("Block not found: {}", block_id)))?;
+        if let Some(inode) = self.namespace.get_inode(block_info.inode_id) {
+            let inode = inode.read().await;
+            check_holder(&inode, &format!("inode {}", block_info.inode_id), client)?;
+        }
 
         // Get current locations
         let locations = self.block_manager
@@ -859,48 +1077,6 @@ impl ClientNamenodeService {
         })
     }
 
-    /// Recover lease (force close file when client crashes)
-    pub async fn handle_recover_lease(
-        &self,
-        path: &str,
-        _client_name: &str,
-    ) -> Result<bool, Status> {
-        info!("Recovering lease for file: {}", path);
-
-        let inode = self.namespace
-            .lookup(path)
-            .await
-            .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
-
-        let inode_guard = inode.read().await;
-
-        if inode_guard.is_dir {
-            return Err(Status::invalid_argument("Cannot recover lease for directory"));
-        }
-
-        // In a full implementation, this would:
-        // 1. Check if the file has an active lease
-        // 2. Contact DataNodes to finalize any under-construction blocks
-        // 3. Update block sizes in metadata
-        // 4. Close the file and release the lease
-        //
-        // For MVP, we simply mark the file as closed by ensuring all blocks are finalized
-        if let Some(blocks) = &inode_guard.blocks {
-            for block in blocks {
-                let block_id = BlockId::new(block.block_id, block.generation_stamp);
-
-                // Update block size if needed (would normally get this from DataNodes)
-                if block.num_bytes == 0 {
-                    // In production, query the DataNodes for actual block size
-                    warn!("Block {} has zero size during lease recovery", block.block_id);
-                }
-            }
-        }
-
-        info!("Successfully recovered lease for file: {}", path);
-        Ok(true)
-    }
-
     /// Truncate a file to a new length
     pub async fn handle_truncate(
         &self,
@@ -919,6 +1095,9 @@ impl ClientNamenodeService {
 
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot truncate directory"));
+        }
+        if inode_guard.under_construction.is_some() {
+            return Err(file_is_open("truncate", path));
         }
 
         // Calculate current file length
@@ -1012,6 +1191,9 @@ impl ClientNamenodeService {
         if target_guard.is_dir {
             return Err(Status::invalid_argument("Target cannot be a directory"));
         }
+        if target_guard.under_construction.is_some() {
+            return Err(file_is_open("concat", target));
+        }
 
         // Validate and collect all source files
         let mut source_blocks = Vec::new();
@@ -1044,6 +1226,9 @@ impl ClientNamenodeService {
                     "Source {} is a directory",
                     source_path
                 )));
+            }
+            if source_guard.under_construction.is_some() {
+                return Err(file_is_open("concat", source_path));
             }
 
             // Check block size compatibility
@@ -1174,6 +1359,8 @@ pub struct FsStats {
 #[derive(Debug, Clone)]
 pub struct FileInfo {
     pub path: String,
+    /// The inode id: HDFS clients key their open files (and leases) by it.
+    pub file_id: u64,
     pub is_dir: bool,
     pub length: u64,
     pub block_size: u64,
@@ -1208,6 +1395,42 @@ pub struct LocatedBlock {
     pub locations: Vec<DatanodeId>,
 }
 
+/// `client` must hold the lease on `inode` (open for writing by it); else
+/// LeaseExpiredException, as HDFS answers a writer that lost its lease.
+fn check_holder(inode: &INode, path: &str, client: &str) -> Result<(), Status> {
+    match &inode.under_construction {
+        Some(uc) if uc.holder == client => Ok(()),
+        Some(uc) => Err(lease_expired(format!(
+            "No lease on {} (inode {}): held by {}, not {}", path, inode.id, uc.holder, client
+        ))),
+        None => Err(lease_expired(format!(
+            "No lease on {} (inode {}): File is not open for writing. Holder {} does not have any open files.",
+            path, inode.id, client
+        ))),
+    }
+}
+
+fn lease_expired(message: String) -> Status {
+    crate::ipc::hadoop_status(
+        tonic::Code::FailedPrecondition,
+        "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException",
+        message,
+    )
+}
+
+fn already_being_created(message: String) -> Status {
+    crate::ipc::hadoop_status(
+        tonic::Code::AlreadyExists,
+        "org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException",
+        message,
+    )
+}
+
+/// The file is open for writing, and the operation needs it closed.
+fn file_is_open(op: &str, path: &str) -> Status {
+    Status::failed_precondition(format!("{}: {} is open for writing", op, path))
+}
+
 /// The edit log could not make a change durable.
 fn edit_status(e: std::io::Error) -> Status {
     Status::unavailable(format!("edit log: {}", e))
@@ -1229,6 +1452,21 @@ fn namespace_status(e: crate::metadata::namespace::NamespaceError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finish writing `path` as a client does: the DataNodes report each
+    /// block (as they would on finishing it), then complete() closes it.
+    async fn close_file(service: &ClientNamenodeService, path: &str) {
+        let inode = service.namespace.lookup(path).await.unwrap();
+        let blocks = inode.read().await.blocks.clone().unwrap_or_default();
+        for b in blocks {
+            service.block_manager.report_block(
+                DatanodeId::new("dn-test".to_string(), "h".to_string(), 1),
+                BlockId::new(b.block_id, b.generation_stamp),
+                b.num_bytes,
+            );
+        }
+        assert!(service.handle_complete(path).await.unwrap(), "complete({path})");
+    }
 
     #[tokio::test]
     async fn content_summary_totals_the_subtree() {
@@ -1335,14 +1573,21 @@ mod tests {
 
         let blocks = || async { file_inode.read().await.blocks.as_ref().unwrap().len() };
 
+        // An open file cannot be appended to, even by its writer.
+        let err = service.handle_append("/test.txt", true).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        close_file(&service, "/test.txt").await;
+
         // A partially filled last block cannot be extended: refused, unless
         // the client asks for a new block. Either way append allocates
-        // nothing itself (the client's addBlock does).
+        // nothing itself (the client's addBlock does), and opens the file.
         let err = service.handle_append("/test.txt", false).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
         service.handle_append("/test.txt", true).await.unwrap();
         assert_eq!(blocks().await, 1);
+        assert!(!service.handle_is_file_closed("/test.txt").await.unwrap());
         let _ = block1;
+        close_file(&service, "/test.txt").await;
 
         // Mark block as full
         {
@@ -2729,6 +2974,7 @@ mod tests {
 
         // Truncate to half the block size
         let new_length = block_size / 2;
+        close_file(&service, "/test.txt").await;
         let result = service.handle_truncate("/test.txt", new_length).await.unwrap();
         assert!(result);
 
@@ -2794,6 +3040,7 @@ mod tests {
         }
 
         // Truncate to same length (no-op)
+        close_file(&service, "/test.txt").await;
         let result = service.handle_truncate("/test.txt", current_length).await.unwrap();
         assert!(result);
 
@@ -2921,6 +3168,7 @@ mod tests {
 
         // Truncate to 1.5 blocks
         let new_length = block_size + (block_size / 2);
+        close_file(&service, "/test.txt").await;
         let result = service.handle_truncate("/test.txt", new_length).await.unwrap();
         assert!(result);
 
@@ -2987,6 +3235,7 @@ mod tests {
         }
 
         // Truncate to zero
+        close_file(&service, "/test.txt").await;
         let result = service.handle_truncate("/test.txt", 0).await.unwrap();
         assert!(result);
 
@@ -3106,6 +3355,9 @@ mod tests {
             "/source3.txt".to_string(),
         ];
 
+        for p in ["/target.txt"].iter().copied().chain(sources.iter().map(|s| s.as_str())) {
+            close_file(&service, p).await;
+        }
         let result = service.handle_concat("/target.txt", &sources).await;
         assert!(result.is_ok());
 
@@ -3465,6 +3717,7 @@ mod tests {
 
         // Truncate the file
         let new_length = block_size / 2;
+        close_file(&service, "/test.txt").await;
         let result1 = service.handle_truncate("/test.txt", new_length).await;
         assert!(result1.is_ok());
 
@@ -3542,9 +3795,14 @@ mod tests {
             128 * 1024 * 1024,
         ).await.unwrap();
 
-        // Appending to an empty file, and retrying, succeeds and changes
-        // nothing: the blocks come from the client's addBlock calls.
+        // Appending to an empty file allocates nothing (the blocks come from
+        // the client's addBlock calls) and opens it; a second append while
+        // it is open is refused, as in HDFS, and works again once closed.
+        close_file(&service, "/test.txt").await;
         service.handle_append("/test.txt", false).await.unwrap();
+        let err = service.handle_append("/test.txt", false).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        close_file(&service, "/test.txt").await;
         service.handle_append("/test.txt", false).await.unwrap();
         let inode = namespace.lookup("/test.txt").await.unwrap();
         assert!(inode.read().await.blocks.as_ref().unwrap().is_empty());
@@ -3627,6 +3885,134 @@ mod tests {
         (service, namespace, block_manager)
     }
 
+    /// A service whose leases expire after `soft` / `hard`.
+    fn service_with_leases(soft_ms: u64, hard_ms: u64) -> (ClientNamenodeService, Arc<BlockManager>) {
+        let (service, _, blocks) = service_with_datanodes(1);
+        let leases = LeaseManager::new(
+            std::time::Duration::from_millis(soft_ms),
+            std::time::Duration::from_millis(hard_ms),
+        );
+        (service.with_leases(Arc::new(leases)), blocks)
+    }
+
+    async fn open_as(service: &ClientNamenodeService, path: &str, client: &str) {
+        service
+            .handle_create_with(path, "u".into(), "g".into(), 0o644, 1, 1024, false, false, client)
+            .await
+            .unwrap();
+    }
+
+    fn hadoop_class(status: &Status) -> &str {
+        status.metadata().get("x-hadoop-exception").and_then(|v| v.to_str().ok()).unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn only_the_lease_holder_may_write() {
+        let (service, blocks) = service_with_leases(60_000, 1_200_000);
+        open_as(&service, "/f", "alice").await;
+        assert!(!service.handle_is_file_closed("/f").await.unwrap());
+
+        let e = service.handle_add_block_as("/f", "bob").await.unwrap_err();
+        assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
+        let e = service.handle_complete_as("/f", "bob").await.unwrap_err();
+        assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
+        // Another writer cannot create it (overwrite or not) or append to it.
+        let e = service
+            .handle_create_with("/f", "u".into(), "g".into(), 0o644, 1, 1024, false, true, "bob")
+            .await
+            .unwrap_err();
+        assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException");
+        assert!(service.handle_append_as("/f", true, "bob").await.is_err());
+
+        let b = service.handle_add_block_as("/f", "alice").await.unwrap();
+        service.handle_commit_block_as("/f", b.block_id, 10, "alice").await.unwrap();
+        blocks.report_block(DatanodeId::new("dn0".into(), "h".into(), 1), BlockId::new(b.block_id, b.generation_stamp), 10);
+        assert!(service.handle_complete_as("/f", "alice").await.unwrap());
+        assert!(service.handle_is_file_closed("/f").await.unwrap());
+        // A retried complete succeeds; writing to a closed file does not.
+        assert!(service.handle_complete_as("/f", "alice").await.unwrap());
+        let e = service.handle_add_block_as("/f", "alice").await.unwrap_err();
+        assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
+        assert_eq!(service.leases.open_file_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn after_the_soft_limit_another_client_takes_over() {
+        let (service, _) = service_with_leases(100, 60_000);
+        open_as(&service, "/f", "alice").await;
+        service.handle_add_block_as("/f", "alice").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Alice stopped renewing: Bob's create (overwrite) recovers the file
+        // first. The unfinished block is dropped, and Bob gets a new file.
+        service
+            .handle_create_with("/f", "u".into(), "g".into(), 0o644, 1, 1024, false, true, "bob")
+            .await
+            .unwrap();
+        let st = service.handle_list_open_files().await;
+        assert_eq!(st.len(), 1);
+        assert_eq!((st[0].1.as_str(), st[0].2.as_str()), ("/f", "bob"));
+        let e = service.handle_add_block_as("/f", "alice").await.unwrap_err();
+        assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
+    }
+
+    #[tokio::test]
+    async fn renewals_keep_the_lease() {
+        let (service, _) = service_with_leases(100, 60_000);
+        open_as(&service, "/f", "alice").await;
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            service.handle_renew_lease("alice");
+        }
+        let e = service.handle_append_as("/f", true, "bob").await.unwrap_err();
+        assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException");
+    }
+
+    #[tokio::test]
+    async fn the_hard_limit_recovers_files_keeping_only_finished_blocks() {
+        let (service, blocks) = service_with_leases(50, 100);
+        let dn = DatanodeId::new("dn0".into(), "h".into(), 1);
+        // /done: its last block was finished by a DataNode (reported, 700
+        // bytes) but the writer died before complete().
+        open_as(&service, "/done", "alice").await;
+        let b1 = service.handle_add_block_as("/done", "alice").await.unwrap();
+        service.handle_commit_block_as("/done", b1.block_id, 1024, "alice").await.unwrap();
+        blocks.report_block(dn.clone(), BlockId::new(b1.block_id, b1.generation_stamp), 1024);
+        let b2 = service.handle_add_block_as("/done", "alice").await.unwrap();
+        blocks.report_block(dn.clone(), BlockId::new(b2.block_id, b2.generation_stamp), 700);
+        // /torn: the writer died mid-block; no DataNode finished it.
+        open_as(&service, "/torn", "alice").await;
+        let t1 = service.handle_add_block_as("/torn", "alice").await.unwrap();
+        // Readers see only finished blocks meanwhile.
+        assert_eq!(service.handle_get_located_blocks("/done", 0, u64::MAX).await.unwrap().file_length, 1024);
+
+        assert_eq!(service.check_leases().await, 0, "not yet past the hard limit");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(service.check_leases().await, 2);
+
+        assert!(service.handle_is_file_closed("/done").await.unwrap());
+        let done = service.handle_get_located_blocks("/done", 0, u64::MAX).await.unwrap();
+        assert_eq!((done.file_length, done.blocks.len(), done.under_construction), (1724, 2, false));
+        assert!(service.handle_is_file_closed("/torn").await.unwrap());
+        assert_eq!(service.handle_get_file_info("/torn").await.unwrap().length, 0);
+        assert!(blocks.get_block_info(&BlockId::new(t1.block_id, t1.generation_stamp)).is_none());
+        assert_eq!(service.leases.open_file_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn recover_lease_closes_now_and_delete_releases_the_lease() {
+        let (service, _) = service_with_leases(60_000, 1_200_000);
+        open_as(&service, "/r", "alice").await;
+        assert!(service.handle_recover_lease("/r", "bob").await.unwrap());
+        assert!(service.handle_is_file_closed("/r").await.unwrap());
+        assert!(service.handle_recover_lease("/r", "bob").await.unwrap(), "already closed");
+
+        open_as(&service, "/d", "alice").await;
+        assert_eq!(service.leases.open_file_count(), 1);
+        service.handle_delete("/d", false).await.unwrap();
+        assert_eq!(service.leases.open_file_count(), 0);
+        assert!(service.handle_recover_lease("/missing", "bob").await.is_err());
+    }
+
     async fn create(service: &ClientNamenodeService, path: &str, block_size: u64) {
         service
             .handle_create(path, "u".to_string(), "g".to_string(), 0o644, 1, block_size)
@@ -3672,6 +4058,10 @@ mod tests {
         create(&service, "/s", 1024).await;
         service.handle_add_block("/t").await.unwrap();
         service.handle_add_block("/s").await.unwrap();
+        // Open files cannot be concatenated.
+        assert!(service.handle_concat("/t", &["/s".to_string()]).await.is_err());
+        close_file(&service, "/t").await;
+        close_file(&service, "/s").await;
 
         // Concatenating a file onto itself must fail, not deadlock or delete it.
         let res = tokio::time::timeout(
@@ -3715,6 +4105,8 @@ mod tests {
         for (block, size) in guard.blocks.as_mut().unwrap().iter_mut().zip(sizes) {
             block.num_bytes = *size;
         }
+        drop(guard);
+        close_file(service, path).await;
     }
 
     fn offsets(blocks: &[LocatedBlock]) -> Vec<u64> {
@@ -3734,8 +4126,9 @@ mod tests {
         let second = BlockId::new(all.blocks[1].block_id, all.blocks[1].generation_stamp);
         block_manager.add_block_location(second, DatanodeId::new("dn0".to_string(), "host0".to_string(), 9867));
         let span = service.handle_get_located_blocks("/f", 100, 1).await.unwrap();
-        assert_eq!(span.blocks[0].locations.len(), 1);
-        assert_eq!(span.blocks[0].locations[0].uuid, "dn0");
+        // dn-test (the replica close_file reported) and dn0.
+        let uuids: Vec<_> = span.blocks[0].locations.iter().map(|l| l.uuid.as_str()).collect();
+        assert_eq!(uuids, ["dn-test", "dn0"]);
 
         // Only blocks overlapping [offset, offset+length) are returned.
         let mid = service.handle_get_located_blocks("/f", 120, 10).await.unwrap();
@@ -3807,6 +4200,10 @@ mod tests {
         service.handle_append("/t", true).await.unwrap();
         let b = service.handle_add_block("/t").await.unwrap();
         service.handle_commit_block("/t", b.block_id, 5).await.unwrap();
+        // The block being written stays hidden until the file is closed.
+        let open = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
+        assert_eq!((offsets(&open.blocks), open.under_construction), (vec![0, 100, 120], true));
+        close_file(&service, "/t").await;
         let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
         assert_eq!(offsets(&located.blocks), vec![0, 100, 120, 190]);
         assert_eq!(located.file_length, 195);

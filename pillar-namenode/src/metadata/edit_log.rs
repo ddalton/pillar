@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
 
 use super::block_manager::BlockManager;
-use super::namespace::{BlockInfo, FsPermission, INode, Namespace};
+use super::namespace::{BlockInfo, FsPermission, INode, Namespace, UnderConstruction};
 
 const EDITS_MAGIC: &[u8; 8] = b"PLRNEDT1";
 const IMAGE_MAGIC: &[u8; 8] = b"PLRNIMG1";
@@ -122,7 +122,15 @@ pub enum EditOp {
     /// that are `Some` change. (Appended last: postcard encodes the variant
     /// index, so existing logs keep decoding.)
     SetAttributes { path: String, attrs: InodeAttributes },
+    /// The file is open for writing by `holder` (create, append).
+    Open { inode: u64, holder: String, blocks_at_open: u32 },
+    /// The file is closed: complete(), or lease recovery.
+    Close { inode: u64 },
 }
+
+/// Open files, after the inode records in an image (absent in images
+/// written before files had an open state).
+type OpenFiles = Vec<(u64, UnderConstruction)>;
 
 /// Attribute changes carried by [`EditOp::SetAttributes`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -370,7 +378,7 @@ impl EditLog {
     pub async fn checkpoint(&self, namespace: &Namespace, blocks: &BlockManager) -> io::Result<()> {
         let Some(disk) = &self.disk else { return Ok(()) };
         let _one = disk.checkpointing.lock().await;
-        let (txid, records, counters) = {
+        let (txid, records, open, counters) = {
             let _writer = self.writer.lock().await;
             let txid = self.last_txid();
             if txid == disk.last_checkpoint_txid.load(Ordering::Acquire) {
@@ -379,11 +387,11 @@ impl EditLog {
             self.sync(txid).await?;
             let next = open_segment(&disk.dir, txid + 1)?;
             *disk.segment.lock().await = Arc::new(next);
-            (txid, namespace.records().await, Counters::of(namespace, blocks))
+            (txid, namespace.records().await, namespace.open_files().await, Counters::of(namespace, blocks))
         };
         let dir = disk.dir.clone();
         tokio::task::spawn_blocking(move || {
-            write_image(&dir, txid, counters, &records)?;
+            write_image(&dir, txid, counters, &records, &open)?;
             purge(&dir)
         })
         .await
@@ -424,7 +432,7 @@ impl EditLog {
             info!("Formatting empty name directory {} ({})", name_dir.display(), id);
             identity = Some(id);
             let ns = Namespace::new();
-            write_image(&dir, 0, Counters::of(&ns, &BlockManager::new()), &ns.records().await)?;
+            write_image(&dir, 0, Counters::of(&ns, &BlockManager::new()), &ns.records().await, &[])?;
             images = list(&dir, "fsimage_")?;
         }
         let identity = match identity {
@@ -457,8 +465,8 @@ impl EditLog {
                 Err(e) => warn!("Skipping unreadable image {} (txid {}): {}", path.display(), txid, e),
             }
         }
-        let (header, records) = loaded.ok_or_else(|| invalid(format!("{}: no readable fsimage", dir.display())))?;
-        let namespace = Namespace::from_records(records, header.counters.next_inode_id).map_err(invalid)?;
+        let (header, records, open) = loaded.ok_or_else(|| invalid(format!("{}: no readable fsimage", dir.display())))?;
+        let namespace = Namespace::from_records(records, open, header.counters.next_inode_id).map_err(invalid)?;
         let mut counters = header.counters;
         let mut txid = header.txid;
         let image_txid = txid;
@@ -494,7 +502,7 @@ impl EditLog {
         info!("Replayed {} edits; namespace at transaction {}", replayed, txid);
 
         if txid != image_txid {
-            write_image(&dir, txid, counters, &namespace.records().await)?;
+            write_image(&dir, txid, counters, &namespace.records().await, &namespace.open_files().await)?;
             purge(&dir)?;
         }
         let segment = open_segment(&dir, txid + 1)?;
@@ -555,6 +563,13 @@ async fn apply(ns: &Namespace, op: &EditOp, counters: &mut Counters) -> Result<(
         EditOp::SetAttributes { path, attrs } => {
             let inode = ns.lookup(path).await.map_err(|e| e.to_string())?;
             attrs.apply(&mut *inode.write().await);
+        }
+        EditOp::Open { inode, holder, blocks_at_open } => {
+            file(*inode)?.write().await.under_construction =
+                Some(UnderConstruction { holder: holder.clone(), blocks_at_open: *blocks_at_open });
+        }
+        EditOp::Close { inode } => {
+            file(*inode)?.write().await.under_construction = None;
         }
         EditOp::Concat { target, sources } => {
             let t = ns.lookup(target).await.map_err(|e| e.to_string())?;
@@ -675,7 +690,7 @@ fn open_segment(dir: &Path, first_txid: u64) -> io::Result<File> {
     Ok(f)
 }
 
-fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord]) -> io::Result<()> {
+fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord], open: &[(u64, UnderConstruction)]) -> io::Result<()> {
     let path = dir.join(image_name(txid));
     let tmp = dir.join(format!("{}.tmp", image_name(txid)));
     let mut w = BufWriter::new(File::create(&tmp)?);
@@ -690,6 +705,7 @@ fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord
             frame.clear();
         }
     }
+    put_frame(&mut frame, &postcard::to_stdvec(open).map_err(io::Error::other)?);
     w.write_all(&frame)?;
     let f = w.into_inner().map_err(|e| e.into_error())?;
     f.sync_all()?;
@@ -697,19 +713,24 @@ fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord
     sync_dir(dir)
 }
 
-fn read_image(path: &Path) -> io::Result<(ImageHeader, Vec<InodeRecord>)> {
+fn read_image(path: &Path) -> io::Result<(ImageHeader, Vec<InodeRecord>, OpenFiles)> {
     let mut frames = read_frames(path, IMAGE_MAGIC)?.into_iter();
     let bad = || invalid(format!("{}: truncated or corrupt", path.display()));
     let head = frames.next().and_then(|(_, f)| f).ok_or_else(bad)?;
     let header: ImageHeader = postcard::from_bytes(&head).map_err(|_| bad())?;
     let mut records = Vec::with_capacity(header.inodes as usize);
-    for (_, f) in frames {
+    for _ in 0..header.inodes {
+        let (_, f) = frames.next().ok_or_else(bad)?;
         records.push(postcard::from_bytes(&f.ok_or_else(bad)?).map_err(|_| bad())?);
     }
-    if records.len() as u64 != header.inodes {
+    let open = match frames.next() {
+        None => Vec::new(),
+        Some((_, f)) => postcard::from_bytes(&f.ok_or_else(bad)?).map_err(|_| bad())?,
+    };
+    if frames.next().is_some() {
         return Err(bad());
     }
-    Ok((header, records))
+    Ok((header, records, open))
 }
 
 /// Keep the newest [`KEEP_IMAGES`] images and the edits needed on top of
@@ -776,12 +797,17 @@ mod tests {
         Nn { svc, ns, blocks, log, replayed }
     }
 
+    /// Write a closed file: each block committed and reported by a
+    /// DataNode, then complete().
     async fn file(nn: &Nn, path: &str, block_lens: &[u64]) {
         nn.svc.handle_create(path, "u".into(), "g".into(), 0o640, 3, 1 << 20).await.unwrap();
         for &len in block_lens {
             let b = nn.svc.handle_add_block(path).await.unwrap();
             nn.svc.handle_commit_block(path, b.block_id, len).await.unwrap();
+            let id = BlockId::new(b.block_id, b.generation_stamp);
+            nn.blocks.report_block(DatanodeId::new("dn0".into(), "h".into(), 1), id, len);
         }
+        assert!(nn.svc.handle_complete(path).await.unwrap());
     }
 
     /// Everything persisted: the tree, attributes, block lists, and the
@@ -813,10 +839,19 @@ mod tests {
         svc.handle_rename2("/a/s1", "/a/old", true).await.unwrap();
         svc.handle_truncate("/a/t", 150).await.unwrap();
         svc.handle_concat("/a/f", &["/a/old".to_string(), "/a/s2".to_string()]).await.unwrap();
+        // Reopen /a/f: abandon a block, then write one through a pipeline
+        // update (new generation stamp), and close it.
+        svc.handle_append("/a/f", true).await.unwrap();
         let b = svc.handle_add_block("/a/f").await.unwrap();
         svc.handle_abandon_block("/a/f", b.block_id).await.unwrap();
-        let last = nn.ns.lookup("/a/t").await.unwrap().read().await.blocks.clone().unwrap()[1].clone();
-        let bumped = svc.handle_update_block_for_pipeline(last.block_id, last.generation_stamp).await.unwrap();
+        let w = svc.handle_add_block("/a/f").await.unwrap();
+        let bumped = svc.handle_update_block_for_pipeline(w.block_id, w.generation_stamp).await.unwrap();
+        svc.handle_commit_block("/a/f", w.block_id, 6).await.unwrap();
+        nn.blocks.report_block(DatanodeId::new("dn0".into(), "h".into(), 1), BlockId::new(w.block_id, bumped.generation_stamp), 6);
+        assert!(svc.handle_complete("/a/f").await.unwrap());
+        // And one file left open across the restart, mid-block.
+        svc.handle_create("/a/open", "u".into(), "g".into(), 0o644, 3, 1 << 20).await.unwrap();
+        let o = svc.handle_add_block("/a/open").await.unwrap();
         svc.handle_delete("/a/b", true).await.unwrap();
         let attrs = InodeAttributes {
             permission: Some(0o600),
@@ -831,7 +866,7 @@ mod tests {
         assert!(!svc.handle_set_replication("/a", 2).await.unwrap(), "a directory has no replication");
         // complete() retries re-commit the same length; that logs nothing.
         let txid = nn.log.last_txid();
-        svc.handle_commit_block("/a/t", last.block_id, 50).await.unwrap();
+        svc.handle_commit_block("/a/f", w.block_id, 6).await.unwrap();
         assert_eq!(nn.log.last_txid(), txid);
 
         let before = state(&nn).await;
@@ -841,11 +876,18 @@ mod tests {
         let nn = open(dir.path()).await;
         assert!(nn.replayed > 10);
         assert_eq!(state(&nn).await, before);
-        let t = nn.ns.lookup("/a/t").await.unwrap();
-        assert_eq!(t.read().await.blocks.as_ref().unwrap()[1].generation_stamp, bumped.generation_stamp);
         let f = nn.ns.lookup("/a/f").await.unwrap();
+        assert_eq!(f.read().await.blocks.as_ref().unwrap()[5].generation_stamp, bumped.generation_stamp);
         let lens: Vec<u64> = f.read().await.blocks.as_ref().unwrap().iter().map(|b| b.num_bytes).collect();
-        assert_eq!(lens, vec![100, 50, 7, 9, 4]);
+        assert_eq!(lens, vec![100, 50, 7, 9, 4, 6]);
+        assert!(f.read().await.under_construction.is_none());
+        // The open file is still open, by the same holder, its block still
+        // the one being written.
+        let open = nn.ns.lookup("/a/open").await.unwrap();
+        let open = open.read().await;
+        assert_eq!(open.under_construction, Some(UnderConstruction { holder: String::new(), blocks_at_open: 0 }));
+        assert_eq!(open.open_block().map(|b| b.block_id), Some(o.block_id));
+        drop(open);
         assert!(nn.ns.lookup("/a/s1").await.is_err() && nn.ns.lookup("/a/b").await.is_err());
         {
             let f = f.read().await;
@@ -868,6 +910,8 @@ mod tests {
         for i in 0..20 {
             file(&nn, &format!("/f{i}"), &[i]).await;
         }
+        // An open file goes into the image with its holder.
+        nn.svc.handle_create_with("/open", "u".into(), "g".into(), 0o644, 3, 1 << 20, false, false, "w1").await.unwrap();
         nn.log.checkpoint(&nn.ns, &nn.blocks).await.unwrap();
         assert_eq!(nn.log.txns_since_checkpoint(), 0);
         nn.svc.handle_delete("/f3", false).await.unwrap();
@@ -878,6 +922,8 @@ mod tests {
         let nn = open(dir.path()).await;
         assert_eq!(nn.replayed, 2);
         assert_eq!(state(&nn).await, before);
+        assert_eq!(nn.ns.open_files().await.into_iter().map(|(_, uc)| uc.holder).collect::<Vec<_>>(), ["w1"]);
+        assert_eq!(nn.svc.restore_leases().await, 1);
         drop(nn);
 
         // Opening wrote a new image; the oldest images and covered edits go.

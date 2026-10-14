@@ -271,8 +271,10 @@ async fn an_aborted_transfer_leaves_no_block_behind() {
     let r = node.transport.send_block_to_peer(&node.addr.to_string(), 77, 1, rx).await;
     assert!(r.is_err(), "an aborted session must not report success");
 
-    // The receiver notices the dropped connection asynchronously.
-    for _ in 0..100 {
+    // The receiver notices the dropped connection asynchronously, then
+    // joins its disk writer and unlinks the file: on a loaded CI runner
+    // that has taken over a second, so allow ten.
+    for _ in 0..1000 {
         if std::fs::read_dir(node._dir.path().join("tmp")).unwrap().next().is_none() {
             break;
         }

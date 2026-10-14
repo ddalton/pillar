@@ -56,6 +56,16 @@ pub struct BlockInfo {
     pub num_bytes: u64,
 }
 
+/// A file open for writing (HDFS INodeFile under construction): the client
+/// holding its lease, and how many blocks it had when opened. Blocks from
+/// that index on were allocated by this writer; the last of them is the one
+/// being written until the next addBlock or complete commits it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnderConstruction {
+    pub holder: String,
+    pub blocks_at_open: u32,
+}
+
 /// INode (Index Node) - represents a file or directory in HDFS
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct INode {
@@ -72,6 +82,9 @@ pub struct INode {
     #[serde(skip)]
     pub children: Option<DashMap<String, u64>>,  // For directories: name -> inode_id
     pub blocks: Option<Vec<BlockInfo>>,          // For files: ordered list of blocks
+    /// Set while the file is open for writing.
+    #[serde(default)]
+    pub under_construction: Option<UnderConstruction>,
 }
 
 impl INode {
@@ -94,6 +107,7 @@ impl INode {
             block_size: 0,
             children: Some(DashMap::new()),
             blocks: None,
+            under_construction: None,
         }
     }
 
@@ -116,12 +130,30 @@ impl INode {
             block_size,
             children: None,
             blocks: Some(Vec::new()),
+            under_construction: None,
         }
     }
 
     pub fn add_block(&mut self, block: BlockInfo) {
         if let Some(blocks) = &mut self.blocks {
             blocks.push(block);
+        }
+    }
+
+    /// The block being written, if the file is open and its writer has
+    /// allocated one since opening it.
+    pub fn open_block(&self) -> Option<&BlockInfo> {
+        let uc = self.under_construction.as_ref()?;
+        let blocks = self.blocks.as_ref()?;
+        (blocks.len() > uc.blocks_at_open as usize).then(|| blocks.last()).flatten()
+    }
+
+    /// Blocks a reader may see: all of them, except the one being written.
+    pub fn finished_blocks(&self) -> &[BlockInfo] {
+        let blocks = self.blocks.as_deref().unwrap_or(&[]);
+        match self.open_block() {
+            Some(_) => &blocks[..blocks.len() - 1],
+            None => blocks,
         }
     }
 }
@@ -135,6 +167,8 @@ pub struct RemovedInode {
     /// Blocks of a removed file (empty for directories); callers use these to
     /// release block-manager state.
     pub blocks: Vec<BlockInfo>,
+    /// The lease holder, if the file was open for writing.
+    pub holder: Option<String>,
 }
 
 /// The HDFS namespace - manages the entire filesystem tree
@@ -411,6 +445,7 @@ impl Namespace {
             id: inode_id,
             is_dir: inode.is_dir,
             blocks: inode.blocks.as_ref().cloned().unwrap_or_default(),
+            holder: inode.under_construction.as_ref().map(|uc| uc.holder.clone()),
         }
     }
 
@@ -532,6 +567,38 @@ impl Namespace {
         self.inodes.len()
     }
 
+    /// Every open file: (inode id, its under-construction record).
+    pub async fn open_files(&self) -> Vec<(u64, UnderConstruction)> {
+        let handles: Vec<_> = self.inodes.iter().map(|e| e.value().clone()).collect();
+        let mut out = Vec::new();
+        for h in handles {
+            let inode = h.read().await;
+            if let Some(uc) = &inode.under_construction {
+                out.push((inode.id, uc.clone()));
+            }
+        }
+        out
+    }
+
+    /// The path of inode `id` (walking parents is not possible: inodes do
+    /// not record them), found by searching from the root. For the few
+    /// open files listOpenFiles reports.
+    pub async fn path_of(&self, id: u64) -> Option<String> {
+        let mut stack = vec![(self.root_id, String::new())];
+        while let Some((dir, prefix)) = stack.pop() {
+            let inode = self.inode_arc(dir)?;
+            let inode = inode.read().await;
+            for e in inode.children.iter().flatten() {
+                let path = format!("{}/{}", prefix, e.key());
+                if *e.value() == id {
+                    return Some(path);
+                }
+                stack.push((*e.value(), path));
+            }
+        }
+        None
+    }
+
     /// The id the next new inode will get.
     pub fn next_inode_id(&self) -> u64 {
         self.next_inode_id.load(Ordering::SeqCst)
@@ -557,6 +624,7 @@ impl Namespace {
     /// Rebuild a namespace from [`Namespace::records`] output.
     pub fn from_records(
         records: Vec<crate::metadata::edit_log::InodeRecord>,
+        open: Vec<(u64, UnderConstruction)>,
         next_inode_id: u64,
     ) -> std::result::Result<Self, String> {
         let mut records = records.into_iter();
@@ -579,6 +647,13 @@ impl Namespace {
                 return Err(format!("duplicate inode {}", id));
             }
             max_id = max_id.max(id);
+        }
+        for (id, uc) in open {
+            let inode = inodes.get_mut(&id).ok_or_else(|| format!("open file {} is not in the image", id))?;
+            if inode.is_dir {
+                return Err(format!("open file {} is a directory", id));
+            }
+            inode.under_construction = Some(uc);
         }
         Ok(Self {
             inodes: inodes.into_iter().map(|(id, inode)| (id, Arc::new(RwLock::new(inode)))).collect(),

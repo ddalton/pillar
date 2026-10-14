@@ -126,22 +126,30 @@ impl ReplicationMonitor {
         let live: HashSet<String> =
             self.datanode_manager.get_live_datanodes().into_iter().map(|d| d.id.uuid).collect();
         let now = Instant::now();
-        let mut replication_of: HashMap<u64, Option<u16>> = HashMap::new();
+        // Per inode: its replication factor, and the block its writer is
+        // filling (replicas of that one are still arriving; leave it alone).
+        let mut replication_of: HashMap<u64, Option<(u16, Option<u64>)>> = HashMap::new();
         let mut seen_now = HashSet::new();
 
         for (block, inode_id, num_bytes, holders) in self.block_manager.blocks_snapshot() {
-            let expected = match replication_of.get(&inode_id) {
+            let file = match replication_of.get(&inode_id) {
                 Some(r) => *r,
                 None => {
                     let r = match self.namespace.get_inode(inode_id) {
-                        Some(inode) => Some(inode.read().await.replication),
+                        Some(inode) => {
+                            let inode = inode.read().await;
+                            Some((inode.replication, inode.open_block().map(|b| b.block_id)))
+                        }
                         None => None,
                     };
                     replication_of.insert(inode_id, r);
                     r
                 }
             };
-            let Some(expected) = expected.filter(|r| *r > 0) else { continue };
+            let Some((expected, open_block)) = file.filter(|(r, _)| *r > 0) else { continue };
+            if open_block == Some(block.block_id) {
+                continue;
+            }
             let have = holders.len();
             if have > expected as usize {
                 for extra in &holders[expected as usize..] {
