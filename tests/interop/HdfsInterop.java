@@ -195,6 +195,30 @@ public class HdfsInterop {
         check(lost, "the first writer has lost its lease (LeaseExpiredException on close)");
         other.close();
 
+        // Block recovery: a writer hflushes 1.5 blocks and walks away; another
+        // client's recoverLease starts recovery on the DataNodes (false),
+        // then reports the file closed (true) with every hflushed byte.
+        Path rp = new Path("/java/recover.bin");
+        byte[] rd = new byte[3 << 19];
+        new Random(13).nextBytes(rd);
+        FSDataOutputStream abandoned = fs.create(rp);
+        abandoned.write(rd);
+        abandoned.hflush();
+        FileSystem rescuer = FileSystem.newInstance(fs.getUri(), conf);
+        DistributedFileSystem rdfs = (DistributedFileSystem) rescuer;
+        boolean first = rdfs.recoverLease(rp);
+        boolean closed = first;
+        for (int i = 0; !closed && i < 60; i++) {
+            Thread.sleep(500);
+            closed = rdfs.recoverLease(rp);
+        }
+        check(!first && closed, "recoverLease runs block recovery (false), then the file is closed (true)");
+        byte[] recovered;
+        try (FSDataInputStream in = rescuer.open(rp)) { recovered = in.readAllBytes(); }
+        check(Arrays.equals(recovered, rd), "block recovery kept every hflushed byte (" + recovered.length + ")");
+        try { abandoned.close(); } catch (java.io.IOException expected) { }
+        rescuer.close();
+
         check(fs.delete(new Path("/java"), true), "recursive delete");
         check(!fs.exists(new Path("/java")), "gone after delete");
 

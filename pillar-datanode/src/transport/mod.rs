@@ -149,6 +149,11 @@ pub enum DataTransferOp {
     ReplaceBlock = 82,
     CopyBlock = 83,
     BlockChecksum = 84,
+    /// Block recovery (Pillar DataNode to DataNode, in place of HDFS's
+    /// InterDatanodeProtocol): a replica's state, stamp and length...
+    ReplicaInfo = 90,
+    /// ...and cut it to a length, give it a stamp, finalize it.
+    RecoverReplica = 91,
 }
 
 impl DataTransferOp {
@@ -159,6 +164,8 @@ impl DataTransferOp {
             82 => Some(Self::ReplaceBlock),
             83 => Some(Self::CopyBlock),
             84 => Some(Self::BlockChecksum),
+            90 => Some(Self::ReplicaInfo),
+            91 => Some(Self::RecoverReplica),
             _ => None,
         }
     }

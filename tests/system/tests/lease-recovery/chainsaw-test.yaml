@@ -7,8 +7,8 @@ spec:
   description: >-
     A writer pod streaming into a file is force-killed mid-file. The file
     stays open (listOpenFiles shows it, another client cannot overwrite
-    it) until hdfs debug recoverLease closes it, keeping exactly the blocks
-    the DataNodes finished.
+    it) until hdfs debug recoverLease closes it: block recovery on the
+    DataNodes settles the half-written last block at what they all hold.
   steps:
   - name: cluster
     try:
@@ -46,11 +46,12 @@ spec:
           hdfs dfsadmin -listOpenFiles | tee /dev/stderr | grep -q /stream.bin
           # Another client cannot overwrite a file someone holds open.
           echo x | fails hdfs dfs -put -f -d - /stream.bin
-          hdfs debug recoverLease -path /stream.bin -retries 3 | tee /dev/stderr | grep -q SUCCEEDED
+          hdfs debug recoverLease -path /stream.bin -retries 6 | tee /dev/stderr | grep -q SUCCEEDED
           fails bash -c 'hdfs dfsadmin -listOpenFiles | grep -q /stream.bin'
-          # Whole finished blocks only, every byte readable.
+          # At least the finished blocks, plus what of the last one reached
+          # every DataNode; every byte readable.
           len=$(hdfs dfs -stat %b /stream.bin)
-          [ $((len % 1048576)) -eq 0 ] && [ "$len" -ge 3145728 ]
+          [ "$len" -ge 3145728 ]
           [ "$(hdfs dfs -cat /stream.bin | wc -c)" -eq "$len" ]
           # Closed: it can be written again.
           echo again | hdfs dfs -appendToFile - /stream.bin

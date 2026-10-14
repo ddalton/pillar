@@ -62,6 +62,33 @@ pub(crate) fn encode_command(command: &DatanodeCommand, block_pool_id: &str) -> 
                 ..Default::default()
             };
         }
+        DatanodeCommand::RecoverBlocks { blocks } => {
+            let blocks = blocks
+                .iter()
+                .map(|(b, new_gs, pipeline)| pillar_proto::hdfs::RecoveringBlockProto {
+                    new_gen_stamp: *new_gs,
+                    block: pillar_proto::hdfs::LocatedBlockProto {
+                        b: pillar_proto::hdfs::ExtendedBlockProto {
+                            pool_id: block_pool_id.to_string(),
+                            block_id: b.block_id,
+                            generation_stamp: b.generation_stamp,
+                            num_bytes: Some(0),
+                        },
+                        offset: 0,
+                        locs: pipeline.iter().map(datanode_info).collect(),
+                        corrupt: false,
+                        block_token: Default::default(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect();
+            return DatanodeCommandProto {
+                cmd_type: datanode_command_proto::Type::BlockRecoveryCommand as i32,
+                recovery_cmd: Some(BlockRecoveryCommandProto { blocks }),
+                ..Default::default()
+            };
+        }
     };
     DatanodeCommandProto {
         cmd_type: datanode_command_proto::Type::BlockCommand as i32,
@@ -199,7 +226,7 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
         for report in &req.reports {
             let decoded = decode_block_list(&report.blocks)
                 .map_err(|e| Status::invalid_argument(format!("bad block report from {}: {}", uuid, e)))?;
-            blocks.extend(decoded.into_iter().map(|b| (b.block_id, b.generation_stamp, b.num_bytes)));
+            blocks.extend(decoded.into_iter().map(|b| (b.block_id, b.generation_stamp, b.num_bytes, b.under_construction)));
         }
 
         match self.service.handle_block_report(uuid.clone(), blocks).await {
@@ -292,9 +319,18 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
     /// Commit block synchronization
     async fn commit_block_synchronization(
         &self,
-        _request: Request<CommitBlockSynchronizationRequestProto>,
+        request: Request<CommitBlockSynchronizationRequestProto>,
     ) -> Result<Response<CommitBlockSynchronizationResponseProto>, Status> {
-        // Simplified implementation for block recovery
+        let req = request.into_inner();
+        let block = BlockId::new(req.block.block_id, req.block.generation_stamp);
+        let holders: Vec<String> = req.new_taragets.iter().map(|t| t.datanode_uuid.clone()).collect();
+        info!(
+            "commitBlockSynchronization: block {} -> stamp {}, {} bytes, on {:?}{}",
+            block.block_id, req.new_gen_stamp, req.new_length, holders, if req.delete_block { " (delete)" } else { "" }
+        );
+        self.service
+            .handle_commit_block_synchronization(block, req.new_gen_stamp, req.new_length, req.close_file, req.delete_block, &holders)
+            .await?;
         Ok(Response::new(CommitBlockSynchronizationResponseProto {}))
     }
 

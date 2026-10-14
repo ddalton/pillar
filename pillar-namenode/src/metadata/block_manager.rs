@@ -207,6 +207,15 @@ impl BlockManager {
         self.datanode_table.resolve_all(&idx).into_iter().map(|d| (*d).clone()).collect()
     }
 
+    /// One more DataNode writing `block` (it reported a replica being written).
+    pub fn add_expected_location(&self, block: BlockId, node: &DatanodeId) {
+        let idx = self.datanode_table.intern(node);
+        let mut nodes = self.expected_locations.entry(block).or_default();
+        if !nodes.contains(&idx) {
+            nodes.push(idx);
+        }
+    }
+
     /// `block` is no longer being written.
     pub fn clear_expected_locations(&self, block: &BlockId) {
         self.expected_locations.remove(block);
@@ -418,6 +427,11 @@ impl BlockManager {
             }
             self.file_blocks.entry(to_inode).or_default().extend(moved);
         }
+    }
+
+    /// The block with id `block_id`, whatever its generation stamp.
+    pub fn find_block(&self, block_id: u64) -> Option<BlockId> {
+        self.blocks.iter().find(|e| e.key().block_id == block_id).map(|e| *e.key())
     }
 
     /// Get block info

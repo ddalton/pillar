@@ -250,8 +250,9 @@ async fn datanodes_refuse_a_namenode_with_another_identity() {
 
 /// A writer that dies without closing leaves its file open. The open state
 /// survives a NameNode crash (the holder's lease is restored), and once the
-/// hard limit passes without renewals the NameNode recovers the file: the
-/// blocks DataNodes finished are kept, the half-written last one dropped.
+/// hard limit passes without renewals the NameNode recovers the file: block
+/// recovery settles the half-written last block at what its DataNodes all
+/// hold, and the file closes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dead_writers_file_is_recovered_even_across_a_restart() {
     let leases = || NameNodeConfig {
@@ -303,12 +304,71 @@ async fn a_dead_writers_file_is_recovered_even_across_a_restart() {
     eventually("DataNodes re-register", || nn.datanodes.get_live_datanodes().len() == 3).await;
     let fs = client(nn_addr);
     let back = read(&fs, "/open.bin").await;
-    assert_eq!(back.len(), 2 * MB, "the two finished blocks, without the unfinished one");
-    assert!(back[..] == data[..2 * MB]);
+    // Block recovery: the DataNodes' block reports (replicas being written)
+    // gave the restarted NameNode the last block's pipeline; the primary
+    // agreed with the others on what all of them hold, so the file keeps
+    // the two finished blocks and whatever of the third reached every
+    // DataNode, every byte the writer's.
+    assert!(back.len() > 2 * MB && back.len() <= data.len(), "recovered {} bytes", back.len());
+    assert!(back[..] == data[..back.len()], "recovered bytes differ from what was written");
+    let inode = nn.namespace.lookup("/open.bin").await.unwrap();
+    let blocks = inode.read().await.blocks.clone().unwrap();
+    assert_eq!(blocks.len(), 3);
+    assert!(blocks[2].generation_stamp > blocks[1].generation_stamp + 1, "the last block got a recovery stamp");
     // Closed: anyone may append now.
     let mut w = fs.append("/open.bin").await.unwrap();
     w.write_bytes(Bytes::from_static(b"after recovery")).await.unwrap();
     w.close().await.unwrap();
-    assert_eq!(read(&fs, "/open.bin").await.len(), 2 * MB + 14);
+    assert_eq!(read(&fs, "/open.bin").await.len(), back.len() + 14);
+    nn.crash().await;
+}
+
+/// Block recovery without a restart: the NameNode knows the last block's
+/// pipeline from addBlock, and when the dead writer's lease passes the hard
+/// limit it has one of those DataNodes settle the block instead of dropping
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_writers_last_block_is_recovered_by_its_datanodes() {
+    let config = NameNodeConfig {
+        lease_soft_limit: Duration::from_millis(300),
+        lease_hard_limit: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let name_dir = TempDir::new().unwrap();
+    let nn_addr = free_addr();
+    let nn = start_namenode_with(nn_addr, name_dir.path(), config).await;
+    let _dns = start_datanodes(nn_addr, 3).await;
+    eventually("three live DataNodes", || nn.datanodes.get_live_datanodes().len() == 3).await;
+
+    let data = pattern(MB + MB / 2, 0x41);
+    {
+        let writer = client(nn_addr);
+        let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(3), ..Default::default() };
+        let mut w = writer.create("/half.bin", opts).await.unwrap();
+        w.write_bytes(Bytes::from(data.clone())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(w);
+        drop(writer);
+    }
+    let open = || async {
+        nn.namespace.lookup("/half.bin").await.unwrap().read().await.under_construction.is_some()
+    };
+    assert!(open().await);
+    let mut closed = false;
+    for _ in 0..100 {
+        if !open().await {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(closed, "the file was never recovered");
+    let fs = client(nn_addr);
+    let back = read(&fs, "/half.bin").await;
+    assert!(back.len() > MB, "the half-written block is kept, not dropped ({} bytes)", back.len());
+    assert!(back[..] == data[..back.len()]);
+    let inode = nn.namespace.lookup("/half.bin").await.unwrap();
+    let blocks = inode.read().await.blocks.clone().unwrap();
+    assert!(blocks[1].generation_stamp > blocks[0].generation_stamp + 1, "a recovery stamp: {blocks:?}");
     nn.crash().await;
 }

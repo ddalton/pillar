@@ -342,12 +342,17 @@ blocks. Clients renew their lease (`renewLease`); after the soft limit
 (60 s) another client may take the file over, and after the hard limit
 (20 min) the NameNode recovers it. `recoverLease`, `isFileClosed` and
 `listOpenFiles` work. Open files survive a NameNode restart, and their
-writers get a fresh lease. Recovery keeps the blocks DataNodes finished and
-drops a last block none of them finished, whose data was never
-acknowledged (without hflush, a writer's partial last block is not
-durable). Unlike HDFS, it also drops a finished last block whose every
-replica holder is offline at the time; DataNode-side block recovery is not
-implemented yet.
+writers get a fresh lease. A last block no DataNode finished goes through
+**block recovery**: the NameNode has one DataNode of its pipeline ask the
+others what they hold, agree on a length (a finished replica's, else the
+shortest replica being written), cut, re-stamp and finalize every replica
+at it, and report back (`commitBlockSynchronization`), which closes the
+file; `recoverLease` answers false until then. If the whole pipeline is
+down the file stays open until a DataNode returns. DataNodes report their
+replicas being written in block reports, so a restarted NameNode can
+recover a block too. Recovery stamps are logged before use, and a
+finished replica with a newer stamp than the NameNode knows (a recovery
+cut short by a NameNode crash) is kept for the next recovery.
 
 **hflush / hsync.** A DataNode acknowledges a packet only once it is on
 its disk (fsynced first for hsync), and the acknowledged length of a block
@@ -358,7 +363,7 @@ the writer hflushed. `hsync` with `UPDATE_LENGTH` records the length on the
 NameNode, so the file's status shows it.
 
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
-NameNode-driven block recovery, block checksum (`-checksum`), short-circuit
+block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with
 `UnsupportedOperationException` rather than pretending to succeed.
