@@ -369,8 +369,8 @@ make the Hadoop IPC ports require SASL GSSAPI, as HDFS with
 `hadoop.security.authentication=kerberos`: SIMPLE clients are refused, a
 caller is its authenticated principal mapped by Hadoop's DEFAULT
 `auth_to_local` rule (`alice@REALM` and `alice/host@REALM` are `alice`),
-and naming another user (impersonation; there are no proxy-user rules) is
-refused. The NameNode then serves its client protocol over Hadoop IPC
+and naming another user is refused unless proxy-user rules allow it
+(below). The NameNode then serves its client protocol over Hadoop IPC
 only, not gRPC. `tests/interop/run-java-kerberos.sh` runs the stock Java
 client against a throwaway MIT KDC (`tests/kerberos/kdc.sh`).
 
@@ -452,8 +452,20 @@ SIMPLE authentication (no Kerberos) callers name themselves, so
 permissions guard against mistakes, not attackers, as in HDFS; gRPC
 ClientProtocol callers (no Kerberos) act as `hdfs`.
 
-What security does **not** cover yet: ACLs, proxy users (impersonation is
-refused), and data transfer encryption (`dfs.encrypt.data.transfer`,
+**Proxy users** (Hadoop `hadoop.proxyuser.*`): a service that authenticates
+as itself (Oozie, Livy, a gateway) may act as the users it serves if
+`--proxy-users` allows it, e.g.
+`"oozie.hosts=10.0.0.0/8,gw.example.com;oozie.groups=staff;livy.hosts=*;livy.users=alice,bob"`:
+`users` and `groups` (of the effective user, from `--user-groups`) say whom,
+`*` for anyone, and `hosts` (addresses, CIDR ranges, host names, `*`) from
+where. Rules are keyed by the real user's short name. Under Kerberos the
+real user is the authenticated principal; under SIMPLE, the real user the
+client names. Anything else is refused with Hadoop's
+`AuthorizationException` ("User: alice@REALM is not allowed to impersonate
+bob", "Unauthorized connection for super-user: oozie from IP ..."), and
+the effective user is who permission checks and file ownership see.
+
+What security does **not** cover yet: ACLs and data transfer encryption (`dfs.encrypt.data.transfer`,
 `dfs.data.transfer.protection`). Permission checks run before an
 operation rather than under one namespace lock, so a concurrent chmod can
 race an operation that already passed its check.

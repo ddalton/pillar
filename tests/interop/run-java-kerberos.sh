@@ -40,7 +40,8 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
 "$BIN/pillar-namenode" --rpc-addr 127.0.0.1:19100 --http-addr 127.0.0.1:19170 \
     --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" \
     --kerberos-keytab "$KDC/nn.keytab" --kerberos-principal nn/localhost@PILLAR.TEST \
-    --rpc-protection "$RPC_PROTECTION" >"$WORK/nn.log" 2>&1 &
+    --rpc-protection "$RPC_PROTECTION" --user-groups "bob=staff" \
+    --proxy-users "oozie.hosts=127.0.0.1;oozie.groups=staff" >"$WORK/nn.log" 2>&1 &
 echo $! >"$WORK/nn.pid"
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19100) 2>/dev/null && break; sleep 0.2; done
 # DataNodes log in from their keytab (KDCs from krb5.conf) to call the NameNode.

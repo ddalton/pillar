@@ -22,7 +22,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 /**
  * Stock Hadoop DFSClient against Pillar: the code path `hadoop fs` uses.
  * Runs as alice; the NameNode enforces permissions (superuser hdfs, groups
- * alice=staff and bob=staff).
+ * alice=staff and bob=staff), and oozie may act as bob from 127.0.0.1.
  */
 public class HdfsInterop {
     interface Action { void run(FileSystem fs) throws Exception; }
@@ -317,6 +317,32 @@ public class HdfsInterop {
         });
         why = refused("bob", conf, b -> b.delete(new Path("/java"), true));
         check(why != null && (why.contains("sticky bit") || why.contains("access=")), "bob deleting alice's /java is refused (" + why + ")");
+
+        // Proxy users: oozie acts as bob (only bob); others act as nobody.
+        UserGroupInformation oozie = UserGroupInformation.createRemoteUser("oozie");
+        Path viaOozie = new Path("/oozie-for-bob.txt");
+        String owner = UserGroupInformation.createProxyUser("bob", oozie).doAs((java.security.PrivilegedExceptionAction<String>) () -> {
+            try (FileSystem p = FileSystem.newInstance(conf)) {
+                p.create(viaOozie).close();
+                String o = p.getFileStatus(viaOozie).getOwner();
+                p.delete(viaOozie, false);
+                return o;
+            }
+        });
+        check(owner.equals("bob"), "oozie, a proxy user, creates a file as bob (owner " + owner + ")");
+        for (String[] pair : new String[][] {{"oozie", "alice"}, {"eve", "bob"}}) {
+            String err = UserGroupInformation.createProxyUser(pair[1], UserGroupInformation.createRemoteUser(pair[0]))
+                .doAs((java.security.PrivilegedExceptionAction<String>) () -> {
+                    try (FileSystem p = FileSystem.newInstance(conf)) {
+                        p.listStatus(new Path("/"));
+                        return "";
+                    } catch (Exception e) {
+                        return e.getMessage() == null ? e.toString() : e.getMessage().split("\n")[0];
+                    }
+                });
+            check(err.contains("User: " + pair[0] + " is not allowed to impersonate " + pair[1]),
+                  pair[0] + " acting as " + pair[1] + " is refused (" + err + ")");
+        }
 
         // The superuser may do anything.
         as("hdfs", conf, su -> {
