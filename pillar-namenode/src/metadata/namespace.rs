@@ -78,11 +78,18 @@ pub struct InodeAttrs {
     pub group: String,
     pub mode: u16,
     pub is_dir: bool,
+    pub acl: Vec<crate::acl::AclEntry>,
 }
 
 impl InodeAttrs {
     fn of(inode: &INode) -> Self {
-        Self { owner: inode.owner.clone(), group: inode.group.clone(), mode: inode.permissions.mode, is_dir: inode.is_dir }
+        Self {
+            owner: inode.owner.clone(),
+            group: inode.group.clone(),
+            mode: inode.permissions.mode,
+            is_dir: inode.is_dir,
+            acl: inode.acl.clone(),
+        }
     }
 }
 
@@ -105,6 +112,10 @@ pub struct INode {
     /// Set while the file is open for writing.
     #[serde(default)]
     pub under_construction: Option<UnderConstruction>,
+    /// The ACL entries the permission bits cannot hold (empty: no ACL);
+    /// see [`crate::acl`].
+    #[serde(default)]
+    pub acl: Vec<crate::acl::AclEntry>,
 }
 
 impl INode {
@@ -128,6 +139,7 @@ impl INode {
             children: Some(DashMap::new()),
             blocks: None,
             under_construction: None,
+            acl: Vec::new(),
         }
     }
 
@@ -151,6 +163,7 @@ impl INode {
             children: None,
             blocks: Some(Vec::new()),
             under_construction: None,
+            acl: Vec::new(),
         }
     }
 
@@ -633,6 +646,37 @@ impl Namespace {
     }
 
     /// Every open file: (inode id, its under-construction record).
+    /// Set an inode's mode and ACL entries together (setfacl).
+    pub async fn set_acl(&self, path: &str, mode: u16, entries: Vec<crate::acl::AclEntry>) -> Result<()> {
+        let inode = self.lookup(path).await?;
+        let mut inode = inode.write().await;
+        inode.permissions = FsPermission::new(mode);
+        inode.acl = entries;
+        Ok(())
+    }
+
+    /// Every inode with an ACL, for the image.
+    pub async fn acls(&self) -> Vec<(u64, Vec<crate::acl::AclEntry>)> {
+        let handles: Vec<_> = self.inodes.iter().map(|e| e.value().clone()).collect();
+        let mut out = Vec::new();
+        for h in handles {
+            let inode = h.read().await;
+            if !inode.acl.is_empty() {
+                out.push((inode.id, inode.acl.clone()));
+            }
+        }
+        out
+    }
+
+    /// Restore ACLs read from an image.
+    pub async fn restore_acls(&self, acls: Vec<(u64, Vec<crate::acl::AclEntry>)>) {
+        for (id, entries) in acls {
+            if let Some(inode) = self.inode_arc(id) {
+                inode.write().await.acl = entries;
+            }
+        }
+    }
+
     pub async fn open_files(&self) -> Vec<(u64, UnderConstruction)> {
         let handles: Vec<_> = self.inodes.iter().map(|e| e.value().clone()).collect();
         let mut out = Vec::new();

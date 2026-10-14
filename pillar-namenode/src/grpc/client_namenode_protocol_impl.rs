@@ -24,6 +24,57 @@ fn caller<T>(request: &Request<T>) -> String {
         .unwrap_or_else(|| "hdfs".to_string())
 }
 
+fn acl_exception(message: String) -> Status {
+    crate::ipc::hadoop_status(tonic::Code::InvalidArgument, "org.apache.hadoop.hdfs.protocol.AclException", message)
+}
+
+/// A client's ACL spec.
+fn acl_spec(spec: &[AclEntryProto]) -> Result<Vec<crate::acl::AclEntry>, Status> {
+    use crate::acl::{AclEntry, Kind, Scope};
+    use acl_entry_proto::{AclEntryScopeProto, AclEntryTypeProto};
+    spec.iter()
+        .map(|e| {
+            let scope = match AclEntryScopeProto::try_from(e.scope) {
+                Ok(AclEntryScopeProto::Access) => Scope::Access,
+                Ok(AclEntryScopeProto::Default) => Scope::Default,
+                Err(_) => return Err(acl_exception(format!("unknown ACL scope {}", e.scope))),
+            };
+            let kind = match AclEntryTypeProto::try_from(e.r#type) {
+                Ok(AclEntryTypeProto::User) => Kind::User,
+                Ok(AclEntryTypeProto::Group) => Kind::Group,
+                Ok(AclEntryTypeProto::Mask) => Kind::Mask,
+                Ok(AclEntryTypeProto::Other) => Kind::Other,
+                Err(_) => return Err(acl_exception(format!("unknown ACL entry type {}", e.r#type))),
+            };
+            Ok(AclEntry::new(scope, kind, e.name.as_deref().filter(|n| !n.is_empty()), e.permissions as u8))
+        })
+        .collect()
+}
+
+fn acl_entry_proto(e: &crate::acl::AclEntry) -> AclEntryProto {
+    use crate::acl::{Kind, Scope};
+    use acl_entry_proto::{AclEntryScopeProto, AclEntryTypeProto};
+    AclEntryProto {
+        r#type: match e.kind {
+            Kind::User => AclEntryTypeProto::User,
+            Kind::Group => AclEntryTypeProto::Group,
+            Kind::Mask => AclEntryTypeProto::Mask,
+            Kind::Other => AclEntryTypeProto::Other,
+        } as i32,
+        scope: match e.scope {
+            Scope::Access => AclEntryScopeProto::Access,
+            Scope::Default => AclEntryScopeProto::Default,
+        } as i32,
+        permissions: e.perm as i32,
+        name: e.name.clone(),
+    }
+}
+
+/// HdfsFileStatusProto flags: HAS_ACL.
+fn status_flags(has_acl: bool) -> u32 {
+    has_acl as u32
+}
+
 fn access_denied(message: String) -> Status {
     crate::ipc::hadoop_status(tonic::Code::PermissionDenied, "org.apache.hadoop.security.AccessControlException", message)
 }
@@ -37,6 +88,42 @@ pub struct ClientNamenodeProtocolServer {
 impl ClientNamenodeProtocolServer {
     pub fn new(service: Arc<ClientNamenodeService>) -> Self {
         Self { service }
+    }
+
+    fn acls_enabled(&self) -> Result<(), Status> {
+        if self.service.permissions().acls {
+            return Ok(());
+        }
+        Err(acl_exception(
+            "The ACL operation has been rejected.  Support for ACLs has been disabled by setting dfs.namenode.acls.enabled to false.".into(),
+        ))
+    }
+
+    /// An ACL change (HDFS `FSDirAclOp`): only the owner (or the superuser)
+    /// changes an inode's ACL; `change` turns its whole ACL into the new one.
+    async fn update_acl(
+        &self,
+        user: &str,
+        src: &str,
+        change: impl FnOnce(&[crate::acl::AclEntry]) -> Result<Vec<crate::acl::AclEntry>, crate::acl::AclError>,
+    ) -> Result<(), Status> {
+        self.acls_enabled()?;
+        self.service.permit(user, src, Check { owner: true, ..Default::default() }).await?;
+        let (_, _, mode, is_dir, entries) = self.service.acl_of(src).await?;
+        let new = change(&crate::acl::logical_acl(mode, &entries)).map_err(|e| acl_exception(format!("{} Path: {}", e, src)))?;
+        let (mode, entries) = crate::acl::store(mode, is_dir, &new).map_err(|e| acl_exception(format!("{} Path: {}", e, src)))?;
+        self.service.handle_set_acl(src, mode, entries).await
+    }
+
+    /// removeAcl: the group bits go back to the `group::` entry's.
+    async fn remove_whole_acl(&self, user: &str, src: &str) -> Result<(), Status> {
+        self.acls_enabled()?;
+        self.service.permit(user, src, Check { owner: true, ..Default::default() }).await?;
+        let (_, _, mode, _, entries) = self.service.acl_of(src).await?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.service.handle_set_acl(src, crate::acl::removed_mode(mode, &entries), Vec::new()).await
     }
 
     /// Renaming `src` to `target`: WRITE on the source's parent (and its
@@ -104,7 +191,7 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
                             blocksize: Some(file_info.block_size),
                             storage_policy: Some(0),
                             ec_policy: None,
-                            flags: Some(0),
+                            flags: Some(status_flags(file_info.has_acl)),
                             file_id: Some(file_info.file_id),
                             children_num: Some(0),
                             file_encryption_info: None,
@@ -139,13 +226,18 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let ancestor = (!self.service.exists(&path).await).then_some(action::WRITE);
         self.service.permit(&owner, &path, Check { ancestor, ..Default::default() }).await?;
         let group = self.service.inherited_group(&path).await;
+        // Under a default ACL the client's mode is used without its umask.
+        let mode = match req.unmasked {
+            Some(u) if self.service.parent_has_default_acl(&path).await => u.perm,
+            _ => masked.perm,
+        };
 
         match self.service
             .handle_mkdirs(
                 &path,
                 owner,
                 group,
-                masked.perm as u16,
+                mode as u16,
                 req.create_parent,
             )
             .await
@@ -176,12 +268,17 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         let access = (overwrite && self.service.exists(&path).await).then_some(action::WRITE);
         self.service.permit(&owner, &path, Check { ancestor: Some(action::WRITE), access, ..Default::default() }).await?;
         let group = self.service.inherited_group(&path).await;
+        // Under a default ACL the client's mode is used without its umask.
+        let mode = match req.unmasked {
+            Some(u) if self.service.parent_has_default_acl(&path).await => u.perm,
+            _ => masked.perm,
+        };
         match self.service
             .handle_create_with(
                 &path,
                 owner.clone(),
                 group.clone(),
-                masked.perm as u16,
+                mode as u16,
                 replication,
                 block_size,
                 req.create_parent,
@@ -1351,49 +1448,84 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
     }
 
     // ============================================================================
-    // ACLs (Stubbed)
+    // ACLs
     // ============================================================================
 
     async fn modify_acl_entries(
         &self,
-        _request: Request<ModifyAclEntriesRequestProto>,
+        request: Request<ModifyAclEntriesRequestProto>,
     ) -> Result<Response<ModifyAclEntriesResponseProto>, Status> {
-        Err(Status::unimplemented("ACLs not supported"))
+        let user = caller(&request);
+        let req = request.into_inner();
+        let spec = acl_spec(&req.acl_spec)?;
+        self.update_acl(&user, &req.src, |acl| crate::acl::merge(acl, spec)).await?;
+        Ok(Response::new(ModifyAclEntriesResponseProto {}))
     }
 
     async fn remove_acl_entries(
         &self,
-        _request: Request<RemoveAclEntriesRequestProto>,
+        request: Request<RemoveAclEntriesRequestProto>,
     ) -> Result<Response<RemoveAclEntriesResponseProto>, Status> {
-        Err(Status::unimplemented("ACLs not supported"))
+        let user = caller(&request);
+        let req = request.into_inner();
+        let spec = acl_spec(&req.acl_spec)?;
+        self.update_acl(&user, &req.src, |acl| crate::acl::filter_by_spec(acl, spec)).await?;
+        Ok(Response::new(RemoveAclEntriesResponseProto {}))
     }
 
     async fn remove_default_acl(
         &self,
-        _request: Request<RemoveDefaultAclRequestProto>,
+        request: Request<RemoveDefaultAclRequestProto>,
     ) -> Result<Response<RemoveDefaultAclResponseProto>, Status> {
-        Err(Status::unimplemented("ACLs not supported"))
+        let user = caller(&request);
+        let req = request.into_inner();
+        self.update_acl(&user, &req.src, crate::acl::filter_default).await?;
+        Ok(Response::new(RemoveDefaultAclResponseProto {}))
     }
 
     async fn remove_acl(
         &self,
-        _request: Request<RemoveAclRequestProto>,
+        request: Request<RemoveAclRequestProto>,
     ) -> Result<Response<RemoveAclResponseProto>, Status> {
-        Err(Status::unimplemented("ACLs not supported"))
+        let user = caller(&request);
+        let req = request.into_inner();
+        self.remove_whole_acl(&user, &req.src).await?;
+        Ok(Response::new(RemoveAclResponseProto {}))
     }
 
     async fn set_acl(
         &self,
-        _request: Request<SetAclRequestProto>,
+        request: Request<SetAclRequestProto>,
     ) -> Result<Response<SetAclResponseProto>, Status> {
-        Err(Status::unimplemented("ACLs not supported"))
+        let user = caller(&request);
+        let req = request.into_inner();
+        if req.acl_spec.is_empty() {
+            self.remove_whole_acl(&user, &req.src).await?;
+        } else {
+            let spec = acl_spec(&req.acl_spec)?;
+            self.update_acl(&user, &req.src, |acl| crate::acl::replace(acl, spec)).await?;
+        }
+        Ok(Response::new(SetAclResponseProto {}))
     }
 
     async fn get_acl_status(
         &self,
-        _request: Request<GetAclStatusRequestProto>,
+        request: Request<GetAclStatusRequestProto>,
     ) -> Result<Response<GetAclStatusResponseProto>, Status> {
-        Err(Status::unimplemented("ACLs not supported"))
+        let user = caller(&request);
+        let req = request.into_inner();
+        self.acls_enabled()?;
+        self.service.permit(&user, &req.src, Check::default()).await?;
+        let (owner, group, mode, _, entries) = self.service.acl_of(&req.src).await?;
+        Ok(Response::new(GetAclStatusResponseProto {
+            result: AclStatusProto {
+                owner,
+                group,
+                sticky: mode & 0o1000 != 0,
+                entries: entries.iter().map(acl_entry_proto).collect(),
+                permission: Some(FsPermissionProto { perm: mode as u32 }),
+            },
+        }))
     }
 
     // ============================================================================
@@ -1617,7 +1749,7 @@ fn file_status_proto(info: crate::grpc::client_namenode_service::FileInfo, path:
         blocksize: Some(info.block_size),
         storage_policy: Some(0),
         ec_policy: None,
-        flags: Some(0),
+        flags: Some(status_flags(info.has_acl)),
         file_id: Some(info.file_id),
         children_num: Some(0),
         file_encryption_info: None,

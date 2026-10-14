@@ -170,6 +170,9 @@ impl NameNodeConfig {
         if let Ok(val) = env::var("NAMENODE_PERMISSIONS_ENABLED") {
             config.permissions.enabled = val != "false";
         }
+        if let Ok(val) = env::var("NAMENODE_ACLS_ENABLED") {
+            config.permissions.acls = val != "false";
+        }
         if let Ok(val) = env::var("NAMENODE_SUPERUSER") {
             config.permissions.superuser = val;
         }

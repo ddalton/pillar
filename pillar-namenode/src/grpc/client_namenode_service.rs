@@ -468,6 +468,48 @@ impl ClientNamenodeService {
         self.edits.begin().await.map_err(edit_status)
     }
 
+    /// Give the inode `id` just created at `path` its parent's default ACL
+    /// (cut down by its mode, as HDFS's `copyINodeDefaultAcl`); the edit
+    /// recording its ACL, if it has one.
+    async fn inherit_acl(&self, path: &str, id: u64) -> Option<EditOp> {
+        let attrs = self.namespace.resolve_attrs(path).await;
+        let parent = attrs.get(attrs.len().checked_sub(2)?)?.as_ref()?;
+        let inode = self.namespace.get_inode(id)?;
+        let mut inode = inode.write().await;
+        let (mode, entries) = crate::acl::inherit(&parent.acl, inode.permissions.mode, inode.is_dir)?;
+        inode.permissions = FsPermission::new(mode);
+        inode.acl = entries.clone();
+        (!entries.is_empty()).then(|| EditOp::SetAcl { path: path.to_string(), mode, entries })
+    }
+
+    /// Whether the nearest existing directory above `path` has a default
+    /// ACL (a creation in it then uses the client's unmasked mode).
+    pub async fn parent_has_default_acl(&self, path: &str) -> bool {
+        let attrs = self.namespace.resolve_attrs(path).await;
+        attrs[..attrs.len() - 1]
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .is_some_and(|a| a.acl.iter().any(|e| e.scope == crate::acl::Scope::Default))
+    }
+
+    /// An inode's owner, group, mode, kind and stored ACL entries.
+    pub async fn acl_of(&self, path: &str) -> Result<(String, String, u16, bool, Vec<crate::acl::AclEntry>), Status> {
+        let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let i = inode.read().await;
+        Ok((i.owner.clone(), i.group.clone(), i.permissions.mode, i.is_dir, i.acl.clone()))
+    }
+
+    /// Set an inode's mode and ACL entries (logged).
+    pub async fn handle_set_acl(&self, path: &str, mode: u16, entries: Vec<crate::acl::AclEntry>) -> Result<(), Status> {
+        let mut tx = self.begin().await?;
+        self.namespace.set_acl(path, mode, entries.clone()).await.map_err(namespace_status)?;
+        tx.log(EditOp::SetAcl { path: path.to_string(), mode, entries });
+        tx.commit().await.map_err(edit_status)?;
+        Ok(())
+    }
+
     /// The record logged for a new inode.
     async fn inode_record(&self, id: u64) -> InodeRecord {
         let inode = self.namespace.get_inode(id).expect("inode just created");
@@ -496,6 +538,7 @@ impl ClientNamenodeService {
             owner: inode_guard.owner.clone(),
             group: inode_guard.group.clone(),
             permissions: inode_guard.permissions.mode,
+            has_acl: !inode_guard.acl.is_empty(),
         })
     }
 
@@ -528,6 +571,7 @@ impl ClientNamenodeService {
                 owner: child_guard.owner.clone(),
                 group: child_guard.group.clone(),
                 permissions: child_guard.permissions.mode,
+                has_acl: !child_guard.acl.is_empty(),
             });
         }
 
@@ -547,7 +591,11 @@ impl ClientNamenodeService {
             .mkdir(path, owner, group, FsPermission::new(permissions))
             .await
             .map_err(namespace_status)?;
+        let acl = self.inherit_acl(path, id).await;
         tx.log(EditOp::AddInode { path: path.to_string(), inode: self.inode_record(id).await });
+        if let Some(op) = acl {
+            tx.log(op);
+        }
         tx.commit().await.map_err(edit_status)?;
 
         info!("Created directory: {}", path);
@@ -671,7 +719,11 @@ impl ClientNamenodeService {
             )
             .await
             .map_err(namespace_status)?;
+        let acl = self.inherit_acl(path, id).await;
         tx.log(EditOp::AddInode { path: path.to_string(), inode: self.inode_record(id).await });
+        if let Some(op) = acl {
+            tx.log(op);
+        }
         self.open_for(&mut tx, id, client, 0).await;
         tx.commit().await.map_err(edit_status)?;
 
@@ -1657,6 +1709,8 @@ pub struct FileInfo {
     pub owner: String,
     pub group: String,
     pub permissions: u16,
+    /// The inode has an ACL (`ls` shows `+`).
+    pub has_acl: bool,
 }
 
 /// Result of getBlockLocations (mirrors HDFS LocatedBlocks)

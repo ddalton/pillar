@@ -129,7 +129,14 @@ pub enum EditOp {
     /// A generation stamp handed out for a block recovery, so it is never
     /// handed out again (HDFS logs every stamp it allocates).
     ReserveGenerationStamp { generation_stamp: u64 },
+    /// setfacl (and an ACL inherited at creation): the inode's mode and
+    /// ACL entries, together.
+    SetAcl { path: String, mode: u16, entries: Vec<crate::acl::AclEntry> },
 }
+
+/// Inodes with ACLs, after the open files in an image (absent in images
+/// written before ACLs).
+type Acls = Vec<(u64, Vec<crate::acl::AclEntry>)>;
 
 /// Open files, after the inode records in an image (absent in images
 /// written before files had an open state).
@@ -390,11 +397,11 @@ impl EditLog {
             self.sync(txid).await?;
             let next = open_segment(&disk.dir, txid + 1)?;
             *disk.segment.lock().await = Arc::new(next);
-            (txid, namespace.records().await, namespace.open_files().await, Counters::of(namespace, blocks))
+            (txid, namespace.records().await, (namespace.open_files().await, namespace.acls().await), Counters::of(namespace, blocks))
         };
         let dir = disk.dir.clone();
         tokio::task::spawn_blocking(move || {
-            write_image(&dir, txid, counters, &records, &open)?;
+            write_image(&dir, txid, counters, &records, &open.0, &open.1)?;
             purge(&dir)
         })
         .await
@@ -435,7 +442,7 @@ impl EditLog {
             info!("Formatting empty name directory {} ({})", name_dir.display(), id);
             identity = Some(id);
             let ns = Namespace::new();
-            write_image(&dir, 0, Counters::of(&ns, &BlockManager::new()), &ns.records().await, &[])?;
+            write_image(&dir, 0, Counters::of(&ns, &BlockManager::new()), &ns.records().await, &[], &[])?;
             images = list(&dir, "fsimage_")?;
         }
         let identity = match identity {
@@ -468,8 +475,9 @@ impl EditLog {
                 Err(e) => warn!("Skipping unreadable image {} (txid {}): {}", path.display(), txid, e),
             }
         }
-        let (header, records, open) = loaded.ok_or_else(|| invalid(format!("{}: no readable fsimage", dir.display())))?;
+        let (header, records, open, acls) = loaded.ok_or_else(|| invalid(format!("{}: no readable fsimage", dir.display())))?;
         let namespace = Namespace::from_records(records, open, header.counters.next_inode_id).map_err(invalid)?;
+        namespace.restore_acls(acls).await;
         let mut counters = header.counters;
         let mut txid = header.txid;
         let image_txid = txid;
@@ -505,7 +513,7 @@ impl EditLog {
         info!("Replayed {} edits; namespace at transaction {}", replayed, txid);
 
         if txid != image_txid {
-            write_image(&dir, txid, counters, &namespace.records().await, &namespace.open_files().await)?;
+            write_image(&dir, txid, counters, &namespace.records().await, &namespace.open_files().await, &namespace.acls().await)?;
             purge(&dir)?;
         }
         let segment = open_segment(&dir, txid + 1)?;
@@ -576,6 +584,9 @@ async fn apply(ns: &Namespace, op: &EditOp, counters: &mut Counters) -> Result<(
         }
         EditOp::ReserveGenerationStamp { generation_stamp } => {
             counters.next_generation_stamp = counters.next_generation_stamp.max(generation_stamp + 1);
+        }
+        EditOp::SetAcl { path, mode, entries } => {
+            ns.set_acl(path, *mode, entries.clone()).await.map_err(|e| e.to_string())?;
         }
         EditOp::Concat { target, sources } => {
             let t = ns.lookup(target).await.map_err(|e| e.to_string())?;
@@ -696,7 +707,14 @@ fn open_segment(dir: &Path, first_txid: u64) -> io::Result<File> {
     Ok(f)
 }
 
-fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord], open: &[(u64, UnderConstruction)]) -> io::Result<()> {
+fn write_image(
+    dir: &Path,
+    txid: u64,
+    counters: Counters,
+    records: &[InodeRecord],
+    open: &[(u64, UnderConstruction)],
+    acls: &[(u64, Vec<crate::acl::AclEntry>)],
+) -> io::Result<()> {
     let path = dir.join(image_name(txid));
     let tmp = dir.join(format!("{}.tmp", image_name(txid)));
     let mut w = BufWriter::new(File::create(&tmp)?);
@@ -712,6 +730,7 @@ fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord
         }
     }
     put_frame(&mut frame, &postcard::to_stdvec(open).map_err(io::Error::other)?);
+    put_frame(&mut frame, &postcard::to_stdvec(acls).map_err(io::Error::other)?);
     w.write_all(&frame)?;
     let f = w.into_inner().map_err(|e| e.into_error())?;
     f.sync_all()?;
@@ -719,7 +738,7 @@ fn write_image(dir: &Path, txid: u64, counters: Counters, records: &[InodeRecord
     sync_dir(dir)
 }
 
-fn read_image(path: &Path) -> io::Result<(ImageHeader, Vec<InodeRecord>, OpenFiles)> {
+fn read_image(path: &Path) -> io::Result<(ImageHeader, Vec<InodeRecord>, OpenFiles, Acls)> {
     let mut frames = read_frames(path, IMAGE_MAGIC)?.into_iter();
     let bad = || invalid(format!("{}: truncated or corrupt", path.display()));
     let head = frames.next().and_then(|(_, f)| f).ok_or_else(bad)?;
@@ -733,10 +752,14 @@ fn read_image(path: &Path) -> io::Result<(ImageHeader, Vec<InodeRecord>, OpenFil
         None => Vec::new(),
         Some((_, f)) => postcard::from_bytes(&f.ok_or_else(bad)?).map_err(|_| bad())?,
     };
+    let acls = match frames.next() {
+        None => Vec::new(),
+        Some((_, f)) => postcard::from_bytes(&f.ok_or_else(bad)?).map_err(|_| bad())?,
+    };
     if frames.next().is_some() {
         return Err(bad());
     }
-    Ok((header, records, open))
+    Ok((header, records, open, acls))
 }
 
 /// Keep the newest [`KEEP_IMAGES`] images and the edits needed on top of
@@ -907,6 +930,48 @@ mod tests {
         file(&nn, "/a/new", &[1]).await;
         let new = nn.ns.lookup("/a/new").await.unwrap();
         assert!(new.read().await.id >= counters.next_inode_id);
+    }
+
+    #[tokio::test]
+    async fn acls_survive_replay_and_checkpoints() {
+        use crate::acl::{AclEntry, Kind, Scope};
+        let dir = TempDir::new().unwrap();
+        let nn = open(dir.path()).await;
+        nn.svc.handle_mkdirs("/shared", "alice".into(), "staff".into(), 0o750, true).await.unwrap();
+        // A default ACL on the directory: bob gets rwx on what is created in it.
+        let named = vec![
+            AclEntry::new(Scope::Access, Kind::User, Some("bob"), 5),
+            AclEntry::new(Scope::Access, Kind::Group, None, 5),
+            AclEntry::new(Scope::Default, Kind::User, None, 7),
+            AclEntry::new(Scope::Default, Kind::User, Some("bob"), 7),
+            AclEntry::new(Scope::Default, Kind::Group, None, 5),
+            AclEntry::new(Scope::Default, Kind::Mask, None, 7),
+            AclEntry::new(Scope::Default, Kind::Other, None, 0),
+        ];
+        nn.svc.handle_set_acl("/shared", 0o750, named.clone()).await.unwrap();
+        // A file created in it inherits the default ACL (as an access ACL).
+        file(&nn, "/shared/f", &[10]).await;
+        let inherited = nn.ns.lookup("/shared/f").await.unwrap().read().await.acl.clone();
+        assert!(inherited.iter().any(|e| e.scope == Scope::Access && e.name.as_deref() == Some("bob")), "{inherited:?}");
+        let acls = |nn: &Nn| {
+            let ns = nn.ns.clone();
+            async move {
+                let mut a = ns.acls().await;
+                a.sort_by_key(|(id, _)| *id);
+                a
+            }
+        };
+        let before = (state(&nn).await, acls(&nn).await);
+        drop(nn);
+        // Replayed from the edit log.
+        let nn = open(dir.path()).await;
+        assert_eq!((state(&nn).await, acls(&nn).await), before);
+        // And from an image.
+        nn.log.checkpoint(&nn.ns, &nn.blocks).await.unwrap();
+        drop(nn);
+        let nn = open(dir.path()).await;
+        assert_eq!(nn.replayed, 0);
+        assert_eq!((state(&nn).await, acls(&nn).await), before);
     }
 
     #[tokio::test]

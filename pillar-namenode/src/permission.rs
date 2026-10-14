@@ -98,6 +98,8 @@ pub struct Check {
 #[derive(Debug, Clone)]
 pub struct Permissions {
     pub enabled: bool,
+    /// ACL operations allowed (HDFS dfs.namenode.acls.enabled).
+    pub acls: bool,
     pub superuser: String,
     pub supergroup: String,
     /// user -> groups.
@@ -106,7 +108,7 @@ pub struct Permissions {
 
 impl Default for Permissions {
     fn default() -> Self {
-        Self { enabled: true, superuser: "hdfs".into(), supergroup: "supergroup".into(), groups: HashMap::new() }
+        Self { enabled: true, acls: true, superuser: "hdfs".into(), supergroup: "supergroup".into(), groups: HashMap::new() }
     }
 }
 
@@ -139,8 +141,13 @@ impl Permissions {
         self.groups_of(user).iter().any(|g| g == group)
     }
 
-    /// Whether `user` has `access` to an inode.
+    /// Whether `user` has `access` to an inode: by its ACL if it has an
+    /// access ACL (a default ACL alone does not count, as in HDFS), else
+    /// by its mode.
     pub fn allows(&self, user: &str, inode: &InodeAttrs, access: u8) -> bool {
+        if inode.acl.iter().any(|e| e.scope == crate::acl::Scope::Access) {
+            return crate::acl::allows(user, |g| self.is_member(user, g), &inode.owner, &inode.group, inode.mode, &inode.acl, access);
+        }
         let bits = if user == inode.owner {
             (inode.mode >> 6) & 7
         } else if self.is_member(user, &inode.group) {

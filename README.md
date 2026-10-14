@@ -465,13 +465,24 @@ client names. Anything else is refused with Hadoop's
 bob", "Unauthorized connection for super-user: oozie from IP ..."), and
 the effective user is who permission checks and file ownership see.
 
-What security does **not** cover yet: ACLs and data transfer encryption (`dfs.encrypt.data.transfer`,
+**ACLs** (HDFS POSIX ACLs, `dfs.namenode.acls.enabled`, on by default;
+`--acls false` refuses ACL operations): `setfacl`/`getfacl`, i.e.
+modifyAclEntries, removeAclEntries, removeDefaultAcl, removeAcl, setAcl and
+getAclStatus, behave as in HDFS. Named user and group entries are limited
+by the mask, which is what the group bits show once an inode has an ACL;
+only the owner (or the superuser) changes an ACL; a directory's default
+ACL is copied to what is created in it, cut down by the creation mode (the
+client's unmasked mode, as with `dfs.namenode.posix.acl.inheritance`).
+Permission checks use an inode's access ACL when it has one. ACLs are kept
+in the edit log and images; `ls` shows `+`.
+
+What security does **not** cover yet: data transfer encryption (`dfs.encrypt.data.transfer`,
 `dfs.data.transfer.protection`). Permission checks run before an
 operation rather than under one namespace lock, so a concurrent chmod can
 race an operation that already passed its check.
 
 Not supported yet: block checksum (`-checksum`), short-circuit
-reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
+reads, snapshots, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with
 `UnsupportedOperationException` rather than pretending to succeed.
 
