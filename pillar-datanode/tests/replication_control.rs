@@ -53,6 +53,7 @@ async fn start_namenode() -> NameNode {
 
 struct DataNode {
     _dir: TempDir,
+    volumes: Arc<VolumeManager>,
     storage: Arc<BlockStorage>,
 }
 
@@ -73,7 +74,7 @@ async fn start_datanode(nn: &NameNode, uuid: &str) -> DataNode {
         supported_transports: vec!["tcp".to_string()],
         rdma_port: 0,
     };
-    let mut client = NamenodeClient::new(nn.addr.to_string(), info, volumes, storage.clone());
+    let mut client = NamenodeClient::new(nn.addr.to_string(), info, volumes.clone(), storage.clone());
     client.set_replication_coordinator(Arc::new(ReplicationCoordinator::new(
         storage.clone(),
         vec![tcp as Arc<dyn DataTransport>],
@@ -82,7 +83,7 @@ async fn start_datanode(nn: &NameNode, uuid: &str) -> DataNode {
     let client = Arc::new(client);
     client.register().await.unwrap();
     tokio::spawn(client.start_heartbeat_loop());
-    DataNode { _dir: dir, storage }
+    DataNode { _dir: dir, volumes, storage }
 }
 
 /// Make `block` part of the namespace (as addBlock would), so replicas of
@@ -171,7 +172,7 @@ async fn a_full_block_report_carries_generation_stamps_and_lengths() {
     }
     // Bypass the incremental path: a fresh client sends only a full report.
     let _ = dn.storage.take_events();
-    let volumes = Arc::new(VolumeManager::new(dn._dir.path(), "BP-test".to_string()).unwrap());
+    let volumes = dn.volumes.clone();
     let info = DatanodeInfo {
         uuid: "dn1".into(),
         hostname: "127.0.0.1".into(),

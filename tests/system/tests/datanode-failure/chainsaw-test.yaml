@@ -50,7 +50,7 @@ spec:
           echo "put exit status: $rc"
           [ "$rc" = 0 ] || { echo "FAIL: the write did not survive the DataNode failure"; exit 1; }
           want=$(kubectl -n "$NAMESPACE" exec writer -- cat /tmp/src.md5)
-          got=$(kubectl -n "$NAMESPACE" exec writer -- bash -c 'hdfs dfs -cat /survivor.bin | md5sum')
+          got=$(kubectl -n "$NAMESPACE" exec writer -- bash -c 'set -o pipefail; hdfs dfs -cat /survivor.bin | md5sum')
           echo "source $want / HDFS $got"
           [ "$want" = "$got" ] || { echo "FAIL: content differs"; exit 1; }
           echo PASS

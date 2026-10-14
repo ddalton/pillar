@@ -63,6 +63,41 @@ fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
 }
 
+/// DataNode `i` (uuid `dn<i>`) on `dir`, which may hold the replicas of an
+/// earlier run, with a fresh data port.
+fn spawn_datanode(i: usize, dir: TempDir, nn_addr: SocketAddr) -> DataNodeProc {
+    let volumes = Arc::new(VolumeManager::new(dir.path(), "BP-test".to_string()).unwrap());
+    let storage = Arc::new(BlockStorage::new(volumes.get_finalized_dir(), volumes.get_tmp_dir()).unwrap());
+    let rt = runtime();
+    let data_addr = free_addr();
+    let info = DatanodeInfo {
+        uuid: format!("dn{i}"),
+        hostname: "127.0.0.1".into(),
+        rpc_port: 0,
+        data_port: data_addr.port(),
+        http_port: 0,
+        supported_transports: vec!["tcp".into()],
+        rdma_port: 0,
+    };
+    let (storage2, nn) = (storage.clone(), nn_addr.to_string());
+    rt.spawn(async move {
+        let tcp = Arc::new(TcpTransport::new(storage2.clone(), data_addr));
+        tokio::spawn(tcp.clone().start_server());
+        let mut client = NamenodeClient::new(nn, info, volumes, storage2.clone());
+        client.set_replication_coordinator(Arc::new(ReplicationCoordinator::new(
+            storage2,
+            vec![tcp as Arc<dyn DataTransport>],
+        )));
+        client.set_heartbeat_interval(Duration::from_millis(100));
+        let client = Arc::new(client);
+        while client.register().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        client.start_heartbeat_loop().await;
+    });
+    DataNodeProc { rt: Some(rt), storage, _dir: dir }
+}
+
 async fn start_cluster(n: usize) -> Cluster {
     let name_dir = TempDir::new().unwrap();
     let nn_addr = free_addr();
@@ -85,37 +120,7 @@ async fn start_cluster(n: usize) -> Cluster {
 
     let mut dns = Vec::new();
     for i in 0..n {
-        let dir = TempDir::new().unwrap();
-        let volumes = Arc::new(VolumeManager::new(dir.path(), "BP-test".to_string()).unwrap());
-        let storage = Arc::new(BlockStorage::new(volumes.get_finalized_dir(), volumes.get_tmp_dir()).unwrap());
-        let rt = runtime();
-        let data_addr = free_addr();
-        let info = DatanodeInfo {
-            uuid: format!("dn{i}"),
-            hostname: "127.0.0.1".into(),
-            rpc_port: 0,
-            data_port: data_addr.port(),
-            http_port: 0,
-            supported_transports: vec!["tcp".into()],
-            rdma_port: 0,
-        };
-        let (storage2, nn) = (storage.clone(), nn_addr.to_string());
-        rt.spawn(async move {
-            let tcp = Arc::new(TcpTransport::new(storage2.clone(), data_addr));
-            tokio::spawn(tcp.clone().start_server());
-            let mut client = NamenodeClient::new(nn, info, volumes, storage2.clone());
-            client.set_replication_coordinator(Arc::new(ReplicationCoordinator::new(
-                storage2,
-                vec![tcp as Arc<dyn DataTransport>],
-            )));
-            client.set_heartbeat_interval(Duration::from_millis(100));
-            let client = Arc::new(client);
-            while client.register().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            client.start_heartbeat_loop().await;
-        });
-        dns.push(DataNodeProc { rt: Some(rt), storage, _dir: dir });
+        dns.push(spawn_datanode(i, TempDir::new().unwrap(), nn_addr));
     }
     for _ in 0..200 {
         if datanodes.get_live_datanodes().len() == n {
@@ -249,5 +254,73 @@ async fn losing_a_datanode_mid_block_with_a_replacement() {
 async fn losing_a_datanode_mid_block_without_a_replacement() {
     for nth in 0..3 {
         write_through_a_datanode_failure(3, nth, false).await;
+    }
+}
+
+/// The DataNode killed mid-write comes back with its replicas (as a
+/// restarted pod on its volume does): its stale replica of the interrupted
+/// block must not reach readers, and the block is re-replicated to it with
+/// the right content. Every replica of every block, on every DataNode,
+/// must hold exactly the file's bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datanode_killed_mid_write_comes_back() {
+    for nth in 0..3 {
+        let mut c = start_cluster(3).await;
+        let fs = client_without_replacement(&c);
+        let data = pattern(7 * MB / 2, 40 + nth as u8);
+        let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(3), ..Default::default() };
+        let mut w = fs.create("/f.bin", opts).await.unwrap();
+        w.write_bytes(Bytes::copy_from_slice(&data[..3 * MB / 2])).await.unwrap();
+        let mut pipeline = Vec::new();
+        for _ in 0..100 {
+            let open = c.namespace.lookup("/f.bin").await.unwrap().read().await.blocks.clone().unwrap();
+            if let Some(b) = open.get(1) {
+                pipeline = (0..3).filter(|i| c.dns[*i].storage.find_rbw(b.block_id).is_some()).collect();
+                if pipeline.len() == 3 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(pipeline.len(), 3);
+        let victim = pipeline[nth];
+        c.dns[victim].kill().await;
+        for _ in 0..100 {
+            if c.datanodes.get_live_datanodes().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        w.write_bytes(Bytes::copy_from_slice(&data[3 * MB / 2..])).await.unwrap();
+        w.close().await.unwrap();
+
+        // Back, on its old volume.
+        let placeholder = DataNodeProc { rt: None, storage: c.dns[victim].storage.clone(), _dir: TempDir::new().unwrap() };
+        let old = std::mem::replace(&mut c.dns[victim], placeholder);
+        c.dns[victim] = spawn_datanode(victim, old._dir, c.nn_addr);
+        let blocks = c.namespace.lookup("/f.bin").await.unwrap().read().await.blocks.clone().unwrap();
+        let mut replicated = false;
+        for _ in 0..600 {
+            if blocks.iter().all(|b| c.dns.iter().all(|d| d.storage.get_block_metadata(b.block_id).map_or(false, |m| m.block_id.generation_stamp == b.generation_stamp))) {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(replicated, "every block on all three DataNodes again");
+        let mut offset = 0usize;
+        for b in &blocks {
+            let want = &data[offset..offset + b.num_bytes as usize];
+            for (i, dn) in c.dns.iter().enumerate() {
+                let got = dn.storage.read_block(&pillar_datanode::storage::block_storage::BlockId::new(b.block_id, b.generation_stamp), 0, b.num_bytes).unwrap();
+                assert!(&got[..] == want, "dn{i} (victim dn{victim}) block {} at offset {} differs", b.block_id, offset);
+            }
+            offset += b.num_bytes as usize;
+        }
+        for _ in 0..5 {
+            assert_eq!(read(&fs, "/f.bin").await, data, "a read of the file (victim dn{victim})");
+        }
+        drop(fs);
+        c.shutdown().await;
     }
 }
