@@ -13,6 +13,9 @@ import org.apache.hadoop.security.UserGroupInformation;
  * Stock Hadoop client against a Kerberized Pillar (realm PILLAR.TEST):
  *   KerberosInterop <hdfs-uri> kerberos <keytab dir>   users log in from keytabs
  *   KerberosInterop <hdfs-uri> simple                  must be refused
+ *   KerberosInterop <hdfs-uri> unprotected <keytab dir>  alice, asking for less
+ *                                                      protection than the server's
+ * hadoop.rpc.protection is $RPC_PROTECTION (default authentication).
  */
 public class KerberosInterop {
     static void check(boolean ok, String what) {
@@ -24,6 +27,8 @@ public class KerberosInterop {
         Configuration conf = new Configuration();
         conf.set("fs.defaultFS", uri);
         conf.set("hadoop.security.authentication", auth);
+        String protection = System.getenv("RPC_PROTECTION");
+        conf.set("hadoop.rpc.protection", protection == null || protection.isEmpty() ? "authentication" : protection);
         conf.set("dfs.namenode.kerberos.principal", "nn/_HOST@PILLAR.TEST");
         conf.set("dfs.datanode.kerberos.principal", "dn/_HOST@PILLAR.TEST");
         conf.set("dfs.replication", "3");
@@ -48,6 +53,23 @@ public class KerberosInterop {
         }
 
         String dir = args[2];
+        if (args[1].equals("unprotected")) {
+            Configuration conf = conf(uri, "kerberos");
+            conf.set("hadoop.rpc.protection", "authentication");
+            UserGroupInformation.setConfiguration(conf);
+            UserGroupInformation.loginUserFromKeytab("alice@PILLAR.TEST", dir + "/alice.keytab");
+            String err = "";
+            try (FileSystem fs = FileSystem.newInstance(conf)) {
+                fs.listStatus(new Path("/"));
+            } catch (Exception e) {
+                err = e.toString();
+                for (Throwable c = e.getCause(); c != null; c = c.getCause()) err += " / " + c;
+            }
+            check(err.contains("No common protection layer"),
+                  "a client without " + System.getenv("RPC_PROTECTION") + " is refused (" + err.split("\n")[0] + ")");
+            System.out.println("ALL OK unprotected");
+            return;
+        }
         Configuration conf = conf(uri, "kerberos");
         UserGroupInformation.setConfiguration(conf);
         UserGroupInformation.loginUserFromKeytab("alice@PILLAR.TEST", dir + "/alice.keytab");

@@ -6,9 +6,11 @@
 # a dn/ principal may join the NameNode.
 #
 #   tests/interop/run-java-kerberos.sh       # needs a JDK (11+), curl, MIT krb5
+#   RPC_PROTECTION=privacy tests/interop/run-java-kerberos.sh   # hadoop.rpc.protection
 set -euo pipefail
 
 HADOOP_VERSION=${HADOOP_VERSION:-3.5.0}
+export RPC_PROTECTION=${RPC_PROTECTION:-authentication}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 CACHE=${PILLAR_INTEROP_CACHE:-$HOME/.cache/pillar-interop}
@@ -37,7 +39,8 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
 
 "$BIN/pillar-namenode" --rpc-addr 127.0.0.1:19100 --http-addr 127.0.0.1:19170 \
     --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" \
-    --kerberos-keytab "$KDC/nn.keytab" --kerberos-principal nn/localhost@PILLAR.TEST >"$WORK/nn.log" 2>&1 &
+    --kerberos-keytab "$KDC/nn.keytab" --kerberos-principal nn/localhost@PILLAR.TEST \
+    --rpc-protection "$RPC_PROTECTION" >"$WORK/nn.log" 2>&1 &
 echo $! >"$WORK/nn.pid"
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19100) 2>/dev/null && break; sleep 0.2; done
 # DataNodes log in from their keytab (KDCs from krb5.conf) to call the NameNode.
@@ -47,7 +50,7 @@ datanode() { # index uuid [kerberos flags...]
     mkdir -p "$WORK/dn$i"
     "$BIN/pillar-datanode" --namenode 127.0.0.1:19100 --uuid "$uuid" --hostname 127.0.0.1 \
         --rpc-addr "127.0.0.1:1996$i" --data-addr "127.0.0.1:5011$i" --http-addr "127.0.0.1:5017$i" \
-        --volume-mount-point "$WORK/dn$i" --transport tcp "$@" >"$WORK/dn$i.log" 2>&1 &
+        --volume-mount-point "$WORK/dn$i" --transport tcp --rpc-protection "$RPC_PROTECTION" "$@" >"$WORK/dn$i.log" 2>&1 &
     echo $! >"$WORK/dn$i.pid"
 }
 for i in 0 1 2; do
@@ -75,6 +78,9 @@ fail() {
 # host it connects to (nn/_HOST -> nn/localhost).
 java_client hdfs://localhost:19100 kerberos "$KDC" || fail "kerberos"
 java_client hdfs://localhost:19100 simple || fail "simple"
+if [ "$RPC_PROTECTION" != authentication ]; then
+    java_client hdfs://localhost:19100 unprotected "$KDC" || fail "unprotected"
+fi
 
 # Only the three Kerberized DataNodes joined; both impostors were refused.
 grep 'Registered datanode' "$WORK/nn.log" | grep -q rogue && fail "an impostor DataNode registered"
@@ -85,4 +91,4 @@ echo "ok    DataNodes without a dn/ Kerberos principal cannot join"
 # The DataNode-to-NameNode authentication against this KDC: replays, users
 # and forged NameNode replies are refused.
 (cd "$ROOT" && PILLAR_KDC_DIR=$KDC cargo test -q -p pillar-common --lib grpc_auth 2>&1 | tail -3) || fail "grpc_auth tests"
-echo "Kerberos interop passed (Hadoop $HADOOP_VERSION)"
+echo "Kerberos interop passed (Hadoop $HADOOP_VERSION, RPC protection $RPC_PROTECTION)"

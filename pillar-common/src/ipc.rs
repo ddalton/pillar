@@ -53,6 +53,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::digest_md5::DigestServer;
+use crate::sasl::{Open, Protection, Qop, Seal, SecurityLayer};
 use pillar_proto::hadoop::common::{
     rpc_response_header_proto::{RpcErrorCodeProto, RpcStatusProto},
     rpc_sasl_proto::{self, SaslState},
@@ -160,6 +161,12 @@ pub trait RpcHandler: Send + Sync + 'static {
     /// Tokens the protocol accepts as credentials, besides `authentication`.
     fn tokens(&self) -> Option<&dyn TokenAuthority> {
         None
+    }
+
+    /// The protection SASL callers may negotiate (`hadoop.rpc.protection`);
+    /// SIMPLE callers have none.
+    fn protection(&self) -> Protection {
+        Protection::default()
     }
 
     /// Run `method` on the encoded request `body` for `user` (the
@@ -305,18 +312,68 @@ fn fatal_frame(req: &RpcRequestHeaderProto, class: &str, msg: &str) -> Bytes {
 #[derive(Default)]
 struct Gssapi {
     context: Option<krb5::KerberosContext>,
-    /// The security-layer offer was sent; the next token is the choice.
-    offered: bool,
+    /// The security-layer offer (layer bits) once sent; the next token is
+    /// the choice.
+    offered: Option<u8>,
     /// Set once the exchange completed.
     principal: Option<String>,
+    /// The layer the client chose, if it protects messages.
+    layer: Option<SecurityLayer>,
 }
 
-/// RFC 4752 security layer bit: no protection beyond authentication
-/// (Hadoop's `hadoop.rpc.protection=authentication`).
-const SASL_LAYER_NONE: u8 = 1;
+/// Largest message the server takes through a GSSAPI security layer
+/// (RFC 4752's three-octet maximum).
+const GSS_MAX_BUFFER: u32 = 0xFF_FFFF;
+
+/// One direction of a GSSAPI security layer: RFC 4121 Wrap tokens, sealed
+/// for privacy. The acceptor's sequence numbers start at the AP-REP's (0),
+/// which the security layer offer used.
+struct GssSeal {
+    tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+    seq: u64,
+    sealed: bool,
+}
+
+impl Seal for GssSeal {
+    fn seal(&mut self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let token = if self.sealed {
+            self.tokens.emit_wrap(self.seq, message)
+        } else {
+            self.tokens.emit_wrap_unsealed(self.seq, message, 0)
+        };
+        self.seq += 1;
+        token.map_err(|e| e.to_string())
+    }
+}
+
+/// The receiving direction: a token must verify, be sealed on a privacy
+/// connection, and come in sequence (no replays within the connection).
+struct GssOpen {
+    tokens: krb5::token::PerMessageTokens<krb5::token::ContextKey>,
+    last: Option<u64>,
+    sealed: bool,
+}
+
+impl Open for GssOpen {
+    fn open(&mut self, token: &[u8]) -> Result<Vec<u8>, String> {
+        let v = self
+            .tokens
+            .verify_wrap_unsealed(token)
+            .or_else(|_| self.tokens.unwrap(token))
+            .map_err(|e| format!("GSSAPI message does not verify: {}", e))?;
+        if self.sealed && v.flags & krb5::token::FLAG_SEALED == 0 {
+            return Err("unencrypted message on a privacy connection".into());
+        }
+        if self.last.is_some_and(|last| v.seq <= last) {
+            return Err(format!("GSSAPI sequence number {} after {}: replayed or reordered", v.seq, self.last.unwrap()));
+        }
+        self.last = Some(v.seq);
+        Ok(v.message)
+    }
+}
 
 impl Gssapi {
-    fn step(&mut self, k: &KerberosServer, msg: &RpcSaslProto) -> Result<RpcSaslProto, String> {
+    fn step(&mut self, k: &KerberosServer, protection: &Protection, msg: &RpcSaslProto) -> Result<RpcSaslProto, String> {
         let challenge = |token: Vec<u8>| RpcSaslProto { state: SaslState::Challenge as i32, token: Some(token), ..Default::default() };
         match SaslState::try_from(msg.state) {
             Ok(SaslState::Negotiate) => Ok(RpcSaslProto {
@@ -343,15 +400,18 @@ impl Gssapi {
                 self.context = Some(context);
                 Ok(challenge(ap_rep))
             }
-            Ok(SaslState::Response) if !self.offered => {
+            Ok(SaslState::Response) if self.offered.is_none() => {
                 // The initiator has the AP-REP; offer the security layers
-                // (only "none"), wrapped (integrity, no confidentiality).
+                // the server is configured for, and the largest message it
+                // takes through them, wrapped (integrity, no confidentiality).
                 let context = self.context.as_ref().ok_or("RESPONSE before INITIATE")?;
                 let tokens = context.per_message_tokens().map_err(|e| e.to_string())?;
-                let offer = tokens
-                    .emit_wrap_unsealed(0, &[SASL_LAYER_NONE, 0, 0, 0], 0)
-                    .map_err(|e| e.to_string())?;
-                self.offered = true;
+                let bits = protection.levels().iter().fold(0u8, |b, q| b | q.gssapi_bit());
+                let max = if bits & !Qop::Authentication.gssapi_bit() != 0 { GSS_MAX_BUFFER } else { 0 };
+                let mut offer = vec![bits];
+                offer.extend_from_slice(&max.to_be_bytes()[1..]);
+                let offer = tokens.emit_wrap_unsealed(0, &offer, 0).map_err(|e| e.to_string())?;
+                self.offered = Some(bits);
                 Ok(challenge(offer))
             }
             Ok(SaslState::Response) => {
@@ -363,13 +423,30 @@ impl Gssapi {
                     .or_else(|_| tokens.unwrap(token))
                     .map_err(|e| format!("security layer choice: {}", e))?
                     .message;
-                if choice.len() < 4 || choice[0] & SASL_LAYER_NONE == 0 {
-                    return Err("the client chose a security layer this server does not offer".into());
-                }
+                let offered = self.offered.unwrap_or_default();
+                let qop = [Qop::Authentication, Qop::Integrity, Qop::Privacy]
+                    .into_iter()
+                    .find(|q| choice.first() == Some(&q.gssapi_bit()) && offered & q.gssapi_bit() != 0);
+                let Some(qop) = qop.filter(|_| choice.len() >= 4) else {
+                    return Err(format!(
+                        "the client chose security layer {:?}; this server offers {}",
+                        choice.first(),
+                        protection
+                    ));
+                };
                 // An authorization id, if any, must be the authenticated one.
                 let authz = String::from_utf8_lossy(&choice[4..]).into_owned();
                 if !authz.is_empty() && authz != context.client_principal {
                     return Err(format!("{} may not act as {}", context.client_principal, authz));
+                }
+                if qop != Qop::Authentication {
+                    let half = || context.per_message_tokens().map_err(|e| e.to_string());
+                    let sealed = qop == Qop::Privacy;
+                    self.layer = Some(SecurityLayer {
+                        qop,
+                        seal: Box::new(GssSeal { tokens: half()?, seq: 1, sealed }),
+                        open: Box::new(GssOpen { tokens: half()?, last: None, sealed }),
+                    });
                 }
                 self.principal = Some(context.client_principal.clone());
                 Ok(RpcSaslProto { state: SaslState::Success as i32, ..Default::default() })
@@ -382,18 +459,57 @@ impl Gssapi {
 /// SASL DIGEST-MD5 with a token: the client's INITIATE answers the
 /// challenge sent with NEGOTIATE. The username is the base64 token
 /// identifier, the password the base64 token password.
-fn token_step(d: &DigestServer, tokens: &dyn TokenAuthority, msg: &RpcSaslProto) -> Result<(String, RpcSaslProto), String> {
+fn token_step(
+    d: &DigestServer,
+    tokens: &dyn TokenAuthority,
+    msg: &RpcSaslProto,
+) -> Result<(String, RpcSaslProto, Option<SecurityLayer>), String> {
     use base64::Engine;
     let b64 = &base64::engine::general_purpose::STANDARD;
     let mut caller = None;
-    let (_, rspauth) = d.respond(msg.token.as_deref().unwrap_or_default(), |username| {
+    let done = d.respond(msg.token.as_deref().unwrap_or_default(), |username| {
         let identifier = b64.decode(username).ok()?;
         let (who, password) = tokens.password(&identifier)?;
         caller = Some(who);
         Some(b64.encode(password))
     })?;
     let caller = caller.ok_or("no caller")?;
-    Ok((caller, RpcSaslProto { state: SaslState::Success as i32, token: Some(rspauth), ..Default::default() }))
+    let reply = RpcSaslProto { state: SaslState::Success as i32, token: Some(done.rspauth), ..Default::default() };
+    Ok((caller, reply, done.layer))
+}
+
+/// What the connection's writer task is handed: a frame, or the security
+/// layer to wrap every later frame with.
+enum Out {
+    Frame(Bytes),
+    Protect(Box<dyn Seal>),
+}
+
+/// A response frame inside the security layer, as Hadoop's
+/// `Server.wrapWithSasl`: the whole frame (length included) wrapped, sent
+/// as a SASL WRAP message.
+fn wrap_frame(seal: &mut dyn Seal, frame_bytes: &[u8]) -> Result<Bytes, String> {
+    let token = seal.seal(frame_bytes)?;
+    let header = RpcResponseHeaderProto {
+        call_id: CALL_ID_SASL as u32,
+        status: RpcStatusProto::Success as i32,
+        ..Default::default()
+    };
+    let sasl = RpcSaslProto { state: SaslState::Wrap as i32, token: Some(token), ..Default::default() };
+    Ok(frame(&header, Some(&sasl.encode_to_vec())))
+}
+
+/// The bytes inside a client's SASL WRAP message.
+fn unwrap_frame(open: &mut dyn Open, mut raw: Bytes) -> Result<Vec<u8>, String> {
+    let header: RpcRequestHeaderProto = take_delimited(&mut raw)?;
+    if header.call_id != CALL_ID_SASL {
+        return Err(format!("unprotected call {} on a connection with RPC protection", header.call_id));
+    }
+    let sasl: RpcSaslProto = take_delimited(&mut raw)?;
+    if sasl.state != SaslState::Wrap as i32 {
+        return Err(format!("SASL state {} on a connection with RPC protection", sasl.state));
+    }
+    open.open(sasl.token.as_deref().unwrap_or_default())
 }
 
 /// Serve one Hadoop IPC connection until the client closes it.
@@ -417,9 +533,20 @@ where
     }
 
     // Replies may complete out of order; one writer task owns the socket.
-    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(64);
+    // Once a security layer is negotiated, it wraps every frame after the
+    // SASL SUCCESS, in the order they are sent.
+    let (out_tx, mut out_rx) = mpsc::channel::<Out>(64);
     let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
+        let mut seal: Option<Box<dyn Seal>> = None;
+        while let Some(out) = out_rx.recv().await {
+            let frame = match (out, seal.as_mut()) {
+                (Out::Protect(s), _) => {
+                    seal = Some(s);
+                    continue;
+                }
+                (Out::Frame(f), None) => f,
+                (Out::Frame(f), Some(s)) => wrap_frame(s.as_mut(), &f).map_err(std::io::Error::other)?,
+            };
             wr.write_all(&frame).await?;
             wr.flush().await?;
         }
@@ -434,19 +561,54 @@ where
     // Token authentication: the exchange, and the caller once it succeeded.
     let mut digest: Option<DigestServer> = None;
     let mut token_caller: Option<String> = None;
+    let protection = handler.protection();
+    // With a security layer: its receiving half, the unwrapped bytes not yet
+    // a whole RPC, and the whole ones waiting.
+    let mut open: Option<Box<dyn Open>> = None;
+    let mut plain = BytesMut::new();
+    let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    let invalid = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidData, m);
     let result: std::io::Result<()> = async {
         loop {
-            let len = match rd.read_u32().await {
-                Ok(n) => n as usize,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e),
+            let mut buf = match pending.pop_front() {
+                Some(rpc) => rpc,
+                None => {
+                    let len = match rd.read_u32().await {
+                        Ok(n) => n as usize,
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                        Err(e) => return Err(e),
+                    };
+                    if len > MAX_FRAME {
+                        return Err(invalid(format!("{} byte RPC frame", len)));
+                    }
+                    let mut raw = BytesMut::zeroed(len);
+                    rd.read_exact(&mut raw).await?;
+                    let raw = raw.freeze();
+                    match open.as_mut() {
+                        None => raw,
+                        Some(layer) => {
+                            // Protected: only SASL WRAP messages, each holding
+                            // RPCs (length prefixed; one may span messages).
+                            let data = unwrap_frame(layer.as_mut(), raw).map_err(|e| {
+                                warn!("{}: {}", peer, e);
+                                invalid(e)
+                            })?;
+                            plain.extend_from_slice(&data);
+                            while plain.len() >= 4 {
+                                let n = u32::from_be_bytes(plain[..4].try_into().unwrap()) as usize;
+                                if n > MAX_FRAME {
+                                    return Err(invalid(format!("{} byte RPC frame", n)));
+                                }
+                                if plain.len() < 4 + n {
+                                    break;
+                                }
+                                pending.push_back(plain.split_to(4 + n).freeze().slice(4..));
+                            }
+                            continue;
+                        }
+                    }
+                }
             };
-            if len > MAX_FRAME {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} byte RPC frame", len)));
-            }
-            let mut buf = BytesMut::zeroed(len);
-            rd.read_exact(&mut buf).await?;
-            let mut buf = buf.freeze();
 
             let header: RpcRequestHeaderProto = take_delimited(&mut buf)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("RPC header: {}", e)))?;
@@ -459,13 +621,16 @@ where
                     let sasl: RpcSaslProto = take_delimited(&mut buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                     let tokens = handler.tokens().filter(|t| t.enabled());
+                    // The security layer a successful exchange negotiated.
+                    let mut layer: Option<SecurityLayer> = None;
                     let negotiate = sasl.state == SaslState::Negotiate as i32;
                     let wants_digest = sasl.state == SaslState::Initiate as i32
                         && sasl.auths.first().map_or(false, |a| a.mechanism == "DIGEST-MD5");
                     let reply = match handler.authentication() {
                         _ if wants_digest => match (&digest, tokens) {
-                            (Some(d), Some(t)) => token_step(d, t, &sasl).map(|(caller, step)| {
+                            (Some(d), Some(t)) => token_step(d, t, &sasl).map(|(caller, step, l)| {
                                 token_caller = Some(caller);
+                                layer = l;
                                 step
                             }),
                             _ => Err("token authentication is not enabled".to_string()),
@@ -482,10 +647,11 @@ where
                             },
                         }),
                         Authentication::Simple => Err("Pillar has only SIMPLE authentication enabled".to_string()),
-                        Authentication::Kerberos(k) => match gssapi.step(k, &sasl) {
+                        Authentication::Kerberos(k) => match gssapi.step(k, &protection, &sasl) {
                             Ok(step) => {
                                 if let Some(principal) = &gssapi.principal {
                                     authenticated = Some((principal.clone(), k.short_name(principal)));
+                                    layer = gssapi.layer.take();
                                 }
                                 Ok(step)
                             }
@@ -495,7 +661,7 @@ where
                     // TOKEN goes first in the offer, as in Hadoop.
                     let reply = match reply {
                         Ok(mut offer) if negotiate && tokens.is_some() => {
-                            let d = digest.insert(DigestServer::new(SASL_DEFAULT_REALM, "", SASL_DEFAULT_REALM));
+                            let d = digest.insert(DigestServer::new(SASL_DEFAULT_REALM, "", SASL_DEFAULT_REALM, &protection));
                             offer.auths.insert(0, rpc_sasl_proto::SaslAuth {
                                 method: "TOKEN".into(),
                                 mechanism: "DIGEST-MD5".into(),
@@ -509,11 +675,17 @@ where
                     };
                     match reply {
                         Ok(reply) => {
-                            let _ = out_tx.send(frame(&response_header(&header, RpcStatusProto::Success), Some(&reply.encode_to_vec()))).await;
+                            let _ = out_tx.send(Out::Frame(frame(&response_header(&header, RpcStatusProto::Success), Some(&reply.encode_to_vec())))).await;
+                            // Everything after SUCCESS goes through the layer.
+                            if let Some(l) = layer.take() {
+                                debug!("{}: RPC protection {}", peer, l.qop);
+                                let _ = out_tx.send(Out::Protect(l.seal)).await;
+                                open = Some(l.open);
+                            }
                         }
                         Err(msg) => {
                             warn!("{}: authentication failed: {}", peer, msg);
-                            let _ = out_tx.send(fatal_frame(&header, "javax.security.sasl.SaslException", &msg)).await;
+                            let _ = out_tx.send(Out::Frame(fatal_frame(&header, "javax.security.sasl.SaslException", &msg))).await;
                             return Ok(());
                         }
                     }
@@ -530,7 +702,7 @@ where
                             let caller = token_caller.clone().unwrap();
                             if !claimed.is_empty() && claimed != caller {
                                 let msg = format!("Authenticated user ({}) doesn't match what the client claims to be ({})", caller, claimed);
-                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, &msg)).await;
+                                let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, &msg))).await;
                                 return Ok(());
                             }
                             user = caller;
@@ -538,12 +710,12 @@ where
                         Authentication::Simple => user = claimed,
                         Authentication::Kerberos(_) => {
                             let Some((principal, short)) = &authenticated else {
-                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED)).await;
+                                let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED))).await;
                                 return Ok(());
                             };
                             let Some(short) = short else {
                                 let msg = format!("No auth_to_local rule maps {} to a user", principal);
-                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, &msg)).await;
+                                let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, &msg))).await;
                                 return Ok(());
                             };
                             // The client names itself (full principal or short
@@ -551,7 +723,7 @@ where
                             if !claimed.is_empty() && claimed != *principal && claimed != *short {
                                 let msg = format!("User {} (auth:KERBEROS) is not authorized to impersonate {}", principal, claimed);
                                 warn!("{}: {}", peer, msg);
-                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, &msg)).await;
+                                let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, &msg))).await;
                                 return Ok(());
                             }
                             user = short.clone();
@@ -561,7 +733,7 @@ where
                 CALL_ID_PING => {}
                 id if id >= 0 => {
                     if matches!(handler.authentication(), Authentication::Kerberos(_)) && user.is_empty() {
-                        let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED)).await;
+                        let _ = out_tx.send(Out::Frame(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED))).await;
                         return Ok(());
                     }
                     let parsed = take_delimited::<RequestHeaderProto>(&mut buf)
@@ -570,7 +742,7 @@ where
                         Ok(v) => v,
                         Err(e) => {
                             let err = RpcError::new("java.io.IOException", format!("bad request: {}", e), RpcErrorCodeProto::ErrorApplication);
-                            let _ = out_tx.send(error_frame(&header, &err)).await;
+                            let _ = out_tx.send(Out::Frame(error_frame(&header, &err))).await;
                             continue;
                         }
                     };
@@ -580,7 +752,7 @@ where
                             format!("Unknown protocol: {}", rh.declaring_class_protocol_name),
                             RpcErrorCodeProto::ErrorNoSuchProtocol,
                         );
-                        let _ = out_tx.send(error_frame(&header, &err)).await;
+                        let _ = out_tx.send(Out::Frame(error_frame(&header, &err))).await;
                         continue;
                     }
                     let handler = handler.clone();
@@ -594,7 +766,7 @@ where
                                 error_frame(&header, &e)
                             }
                         };
-                        let _ = out_tx.send(reply).await;
+                        let _ = out_tx.send(Out::Frame(reply)).await;
                     });
                 }
                 id => debug!("{}: ignoring call id {}", peer, id),
@@ -656,20 +828,21 @@ mod tests {
     fn negotiation_offers_kerberos_and_steps_are_ordered() {
         let k = server("nn/localhost@PILLAR.TEST");
         let mut g = Gssapi::default();
-        let offer = g.step(&k, &RpcSaslProto { state: SaslState::Negotiate as i32, ..Default::default() }).unwrap();
+        let p = Protection::default();
+        let offer = g.step(&k, &p, &RpcSaslProto { state: SaslState::Negotiate as i32, ..Default::default() }).unwrap();
         assert_eq!(offer.state, SaslState::Negotiate as i32);
         let a = &offer.auths[0];
         assert_eq!((a.method.as_str(), a.mechanism.as_str()), ("KERBEROS", "GSSAPI"));
         assert_eq!((a.protocol.as_deref(), a.server_id.as_deref()), (Some("nn"), Some("localhost")));
         // A RESPONSE before INITIATE, or a non-GSSAPI mechanism, is refused.
         let resp = RpcSaslProto { state: SaslState::Response as i32, ..Default::default() };
-        assert!(g.step(&k, &resp).is_err());
+        assert!(g.step(&k, &p, &resp).is_err());
         let digest = RpcSaslProto {
             state: SaslState::Initiate as i32,
             auths: vec![rpc_sasl_proto::SaslAuth { method: "TOKEN".into(), mechanism: "DIGEST-MD5".into(), ..Default::default() }],
             ..Default::default()
         };
-        assert!(g.step(&k, &digest).is_err());
+        assert!(g.step(&k, &p, &digest).is_err());
         assert!(g.principal.is_none());
     }
 
