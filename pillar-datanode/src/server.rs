@@ -263,10 +263,17 @@ impl DataNode {
         let uuid = config.uuid.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
 
         // Initialize volume manager
-        let volume_manager = Arc::new(VolumeManager::new(
-            &config.volume_mount_point,
-            config.block_pool_id.clone(),
-        )?);
+        // A DataNode replaced before the old process is gone (a pod
+        // force-deleted and recreated on its volume) waits for it to exit.
+        let volume_manager = loop {
+            match VolumeManager::new(&config.volume_mount_point, config.block_pool_id.clone()) {
+                Err(crate::storage::volume_manager::VolumeError::InUse(volume, holder)) => {
+                    warn!("Volume {} is in use by another DataNode ({}); waiting for it to exit", volume, holder);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                other => break Arc::new(other?),
+            }
+        };
 
         info!("Volume manager initialized at: {:?}", config.volume_mount_point);
 

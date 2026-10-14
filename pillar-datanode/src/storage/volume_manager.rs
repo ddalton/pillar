@@ -17,6 +17,10 @@ pub enum VolumeError {
 
     #[error("System error: {0}")]
     SystemError(String),
+
+    /// Another DataNode process has the volume (its `in_use.lock`).
+    #[error("Volume {0} is in use by another DataNode ({1})")]
+    InUse(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, VolumeError>;
@@ -40,6 +44,32 @@ impl VolumeInfo {
     }
 }
 
+/// Take `<mount>/in_use.lock` exclusively (released when the process
+/// exits, however it exits), recording `pid@host` in it.
+fn lock_volume(mount_point: &Path) -> Result<fs::File> {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+    let path = mount_point.join("in_use.lock");
+    let mut f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+    #[allow(deprecated)]
+    if let Err(e) = nix::fcntl::flock(f.as_raw_fd(), nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        if e == nix::errno::Errno::EWOULDBLOCK {
+            let mut holder = String::new();
+            let _ = f.read_to_string(&mut holder);
+            return Err(VolumeError::InUse(mount_point.display().to_string(), holder.trim().to_string()));
+        }
+        return Err(VolumeError::SystemError(format!("locking {}: {}", path.display(), e)));
+    }
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| fs::read_to_string("/etc/hostname"))
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default();
+    f.set_len(0)?;
+    f.rewind()?;
+    write!(f, "{}@{}", std::process::id(), host)?;
+    Ok(f)
+}
+
 /// Manages a Flint RWO volume for DataNode storage
 pub struct VolumeManager {
     /// Mount point of the Flint volume (e.g., /mnt/pillar-data)
@@ -53,6 +83,9 @@ pub struct VolumeManager {
 
     /// Current directory for finalized blocks
     current_dir: PathBuf,
+
+    /// `in_use.lock`, held (flock) while this VolumeManager lives.
+    _lock: fs::File,
 
     /// Temporary directory for blocks being written
     tmp_dir: PathBuf,
@@ -78,6 +111,12 @@ impl VolumeManager {
             ));
         }
 
+        // One DataNode process per volume (HDFS's `in_use.lock`): a
+        // replacement started while the old process still runs (a pod
+        // force-deleted and recreated on its volume) would serve and report
+        // replicas the other is still changing.
+        let lock = lock_volume(&mount_point)?;
+
         // Create HDFS directory structure
         let base_dir = mount_point.join("current").join(&block_pool_id);
         let current_dir = base_dir.join("current").join("finalized");
@@ -101,6 +140,7 @@ impl VolumeManager {
             base_dir,
             current_dir,
             tmp_dir,
+            _lock: lock,
         })
     }
 
@@ -243,5 +283,17 @@ mod tests {
 
         let volume_manager = VolumeManager::new(mount_point, "BP-test-001".to_string()).unwrap();
         assert!(volume_manager.is_healthy());
+    }
+
+    #[test]
+    fn one_datanode_process_per_volume() {
+        let temp_dir = TempDir::new().unwrap();
+        let first = VolumeManager::new(temp_dir.path(), "BP-test-001".to_string()).unwrap();
+        match VolumeManager::new(temp_dir.path(), "BP-test-001".to_string()) {
+            Err(VolumeError::InUse(_, holder)) => assert!(holder.starts_with(&format!("{}@", std::process::id())), "{holder}"),
+            other => panic!("a second VolumeManager on the volume: {:?}", other.map(|_| ())),
+        }
+        drop(first);
+        VolumeManager::new(temp_dir.path(), "BP-test-001".to_string()).expect("free once the first is gone");
     }
 }
