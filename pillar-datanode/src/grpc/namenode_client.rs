@@ -352,7 +352,11 @@ impl NamenodeClient {
                     }
 
                     for command in commands {
-                        self.handle_command(command);
+                        if matches!(command, DatanodeCommand::Register) {
+                            self.reregister().await;
+                        } else {
+                            self.handle_command(command);
+                        }
                     }
                 }
                 Err(e) => {
@@ -444,6 +448,21 @@ impl NamenodeClient {
             DatanodeCommand::Shutdown => {
                 warn!("Received shutdown command from NameNode (not implemented; ignoring)");
             }
+            DatanodeCommand::Register => debug!("Register is handled by the heartbeat loop"),
+        }
+    }
+
+    /// Register again and report every replica, so a restarted NameNode
+    /// learns where its blocks are. On failure the next heartbeat asks again.
+    async fn reregister(&self) {
+        info!("NameNode asked this DataNode to re-register");
+        if let Err(e) = self.register().await {
+            warn!("Re-registration failed: {}", e);
+            return;
+        }
+        match self.send_block_report().await {
+            Ok(()) => info!("Re-registered and sent a full block report"),
+            Err(e) => warn!("Full block report after re-registration failed: {}", e),
         }
     }
 }
@@ -467,6 +486,9 @@ pub enum DatanodeCommand {
     InvalidateBlocks { blocks: Vec<(u64, u64)> },
     /// Shutdown the DataNode gracefully
     Shutdown,
+    /// The NameNode does not know this DataNode (it restarted, or declared
+    /// the node dead): register again and send a full block report.
+    Register,
 }
 
 fn replication_target(info: &DatanodeInfoProto) -> ReplicationTarget {
@@ -488,6 +510,9 @@ fn replication_target(info: &DatanodeInfoProto) -> ReplicationTarget {
 /// Translate a `DatanodeCommandProto` into a [`DatanodeCommand`]. Command
 /// types Pillar does not act on are logged and skipped.
 pub fn parse_command(cmd: DatanodeCommandProto) -> Option<DatanodeCommand> {
+    if cmd.cmd_type == datanode_command_proto::Type::RegisterCommand as i32 {
+        return Some(DatanodeCommand::Register);
+    }
     if cmd.cmd_type != datanode_command_proto::Type::BlockCommand as i32 {
         debug!("Ignoring DataNode command type {}", cmd.cmd_type);
         return None;

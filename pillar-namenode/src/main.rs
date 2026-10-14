@@ -39,6 +39,11 @@ struct Args {
     #[clap(long, default_value = "128")]
     block_size_mb: u64,
 
+    /// Directory for the persisted namespace (fsimage + edit log). Without
+    /// it the namespace lives in memory only and is lost on restart.
+    #[clap(long)]
+    name_dir: Option<std::path::PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -74,6 +79,9 @@ async fn main() -> Result<()> {
     config.etcd_endpoints = args.etcd_endpoints;
     config.default_replication = args.replication;
     config.default_block_size = args.block_size_mb * 1024 * 1024;
+    if args.name_dir.is_some() {
+        config.name_dir = args.name_dir;
+    }
 
     info!("Configuration loaded from environment and CLI arguments");
     info!("Etcd endpoints: {:?}", config.etcd_endpoints);

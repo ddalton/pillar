@@ -55,6 +55,13 @@ pub(crate) fn encode_command(command: &DatanodeCommand, block_pool_id: &str) -> 
             blocks.iter().map(|b| block_proto(b, 0)).collect(),
             Vec::new(),
         ),
+        DatanodeCommand::Register => {
+            return DatanodeCommandProto {
+                cmd_type: datanode_command_proto::Type::RegisterCommand as i32,
+                register_cmd: Some(RegisterCommandProto {}),
+                ..Default::default()
+            };
+        }
     };
     DatanodeCommandProto {
         cmd_type: datanode_command_proto::Type::BlockCommand as i32,

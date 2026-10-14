@@ -9,7 +9,6 @@ data:
   # NameNode-specific configuration
   NAMENODE_RPC_PORT: {{ .Values.namenode.rpcPort | quote }}
   NAMENODE_HTTP_PORT: {{ .Values.namenode.httpPort | quote }}
-  NAMENODE_METADATA_PATH: "/var/lib/pillar/metadata/metadata.db"
 
   # NameNode performance tuning
   {{- if .Values.namenode.config.handlerCount }}

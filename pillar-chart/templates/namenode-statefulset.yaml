@@ -55,9 +55,13 @@ spec:
         - --etcd-endpoints={{ include "pillar.etcdEndpoints" . }}
         - --replication={{ .Values.hdfs.replication }}
         - --block-size-mb={{ .Values.hdfs.blockSize }}
+        - --name-dir=/var/lib/pillar/name
         {{- if gt (int .Values.namenode.replicas) 1 }}
         - --ha-enabled=true
         {{- end }}
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/pillar/name
         ports:
         - name: rpc
           containerPort: {{ .Values.namenode.rpcPort }}
@@ -77,6 +81,11 @@ spec:
             port: rpc
           initialDelaySeconds: 10
           periodSeconds: 5
+      {{- if not .Values.namenode.persistence.enabled }}
+      volumes:
+      - name: data
+        emptyDir: {}
+      {{- end }}
   {{- if .Values.namenode.persistence.enabled }}
   volumeClaimTemplates:
   - metadata:

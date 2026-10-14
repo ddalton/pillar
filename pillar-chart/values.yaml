@@ -88,12 +88,13 @@ namenode:
   # HTTP UI port
   httpPort: 9870
 
-  # Optional local persistence (logs, temp files)
-  # Note: Metadata is stored in etcd, not here
+  # The namespace (fsimage + edit log) lives in --name-dir on this volume.
+  # Disabled, it is an emptyDir: it survives container restarts but not the
+  # pod being deleted or rescheduled, which loses every file's metadata.
   persistence:
-    enabled: false
+    enabled: true
     storageClass: ""
-    size: 1Gi
+    size: 10Gi
 
   # NameNode-specific configuration
   config:

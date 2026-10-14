@@ -40,6 +40,8 @@ tower = { workspace = true }
 # Metadata persistence
 rusqlite = { workspace = true }
 etcd-client = { workspace = true }
+postcard = { version = "1.1", features = ["use-std"] }
+crc32c = "0.6.8"
 
 [dev-dependencies]
 tempfile = "3.8"
