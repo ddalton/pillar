@@ -21,6 +21,12 @@
 
 pub mod dispatch;
 
+/// The effective user of the Hadoop IPC connection a request came in on
+/// (from its connection context; SIMPLE auth), attached to every request's
+/// extensions.
+#[derive(Debug, Clone)]
+pub struct CallerUser(pub String);
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -311,8 +317,9 @@ where
                     }
                     let svc = svc.clone();
                     let out_tx = out_tx.clone();
+                    let user = user.clone();
                     tokio::spawn(async move {
-                        let reply = match dispatch::dispatch(&*svc, &rh.method_name, &body).await {
+                        let reply = match dispatch::dispatch(&*svc, &rh.method_name, &body, &user).await {
                             Ok(resp) => frame(&response_header(&header, RpcStatusProto::Success), Some(&resp)),
                             Err(e) => {
                                 debug!("{} -> {}: {}", rh.method_name, e.exception_class, e.message);

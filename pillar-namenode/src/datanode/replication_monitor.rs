@@ -8,6 +8,9 @@
 //! 2. **Under-replicated blocks** (fewer known replicas than the file's
 //!    replication, but at least one) get a TRANSFER command queued for a
 //!    live holder, naming new targets that do not already hold the block.
+//! 3. **Over-replicated blocks** (after setReplication lowered the factor,
+//!    or a DataNode came back after its blocks were re-replicated) have
+//!    the excess replicas deleted.
 //!
 //! A block must stay under-replicated for a grace period before it is
 //! scheduled, so blocks whose write pipeline is still reporting replicas
@@ -50,6 +53,7 @@ pub struct PassStats {
     pub under_replicated: usize,
     pub missing: usize,
     pub scheduled: usize,
+    pub excess_deleted: usize,
 }
 
 pub struct ReplicationMonitor {
@@ -99,7 +103,7 @@ impl ReplicationMonitor {
         loop {
             tick.tick().await;
             let stats = self.run_once().await;
-            if stats.dead_datanodes + stats.scheduled + stats.missing > 0 {
+            if stats.dead_datanodes + stats.scheduled + stats.missing + stats.excess_deleted > 0 {
                 info!("Replication monitor: {:?}", stats);
             }
         }
@@ -139,7 +143,15 @@ impl ReplicationMonitor {
             };
             let Some(expected) = expected.filter(|r| *r > 0) else { continue };
             let have = holders.len();
-            if have >= expected as usize {
+            if have > expected as usize {
+                for extra in &holders[expected as usize..] {
+                    info!("Block {} has {}/{} replicas: deleting the one on {}", block.block_id, have, expected, extra.uuid);
+                    self.block_manager.drop_replica(&block, &extra.uuid);
+                    stats.excess_deleted += 1;
+                }
+                continue;
+            }
+            if have == expected as usize {
                 continue;
             }
             if have == 0 {

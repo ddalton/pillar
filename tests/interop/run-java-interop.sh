@@ -55,7 +55,7 @@ sleep 1 # first heartbeats carry capacity
 
 cd "$HERE"
 java_client() { # [mode]
-    HADOOP_USER_NAME=hdfs java -cp "$CACHE/*" HdfsInterop.java hdfs://127.0.0.1:19000 "$@" 2>&1 \
+    HADOOP_USER_NAME=alice java -cp "$CACHE/*" HdfsInterop.java hdfs://127.0.0.1:19000 "$@" 2>&1 \
         | grep -vE '^(SLF4J|WARNING)|^$'
 }
 fail() {

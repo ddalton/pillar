@@ -1,14 +1,20 @@
 import java.io.File;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.Random;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.ContentSummary;
+import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsAction;
+import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
 
 /** Stock Hadoop DFSClient against Pillar: the code path `hadoop fs` uses. */
 public class HdfsInterop {
@@ -92,6 +98,52 @@ public class HdfsInterop {
             threw = true;
         }
         check(threw, "create(overwrite=false) on an existing file throws FileAlreadyExistsException");
+
+        // Metadata calls take effect (they used to answer success and do nothing).
+        Path m = new Path("/java/renamed.bin");
+        check(fs.getFileStatus(m).getOwner().equals(System.getenv("HADOOP_USER_NAME")),
+              "owner is the calling user (" + fs.getFileStatus(m).getOwner() + ")");
+        fs.setPermission(m, new FsPermission((short) 0640));
+        fs.setOwner(m, "bob", "eng");
+        fs.setTimes(m, 1_000_000L, 2_000_000L);
+        check(fs.setReplication(m, (short) 2), "setReplication");
+        FileStatus ms = fs.getFileStatus(m);
+        check(ms.getPermission().toShort() == 0640 && ms.getOwner().equals("bob") && ms.getGroup().equals("eng")
+              && ms.getModificationTime() == 1_000_000L && ms.getAccessTime() == 2_000_000L && ms.getReplication() == 2,
+              "setPermission/setOwner/setTimes/setReplication are visible");
+        fs.access(m, FsAction.READ);
+        boolean missing = false;
+        try { fs.access(new Path("/java/nope"), FsAction.READ); } catch (java.io.FileNotFoundException e) { missing = true; }
+        check(missing, "access() on a missing path throws FileNotFoundException");
+        ContentSummary cs = fs.getContentSummary(new Path("/java"));
+        check(cs.getLength() == data.length + "replaced\n".length() && cs.getFileCount() == 2 && cs.getDirectoryCount() == 2,
+              "getContentSummary: " + cs.getLength() + " bytes, " + cs.getFileCount() + " files, " + cs.getDirectoryCount() + " dirs");
+
+        // append: a full last block starts a new one; a partial last block
+        // cannot be extended (UnsupportedOperationException), except with
+        // CreateFlag.NEW_BLOCK.
+        Path ap = new Path("/java/append.bin");
+        byte[] head = new byte[1 << 20];
+        new Random(5).nextBytes(head);
+        try (FSDataOutputStream out = fs.create(ap)) { out.write(head); }
+        try (FSDataOutputStream out = fs.append(ap)) { out.write("tail".getBytes()); }
+        check(fs.getFileStatus(ap).getLen() == head.length + 4, "append after a full block");
+        boolean refused = false;
+        // DFSClient can only unwrap IOExceptions, so it arrives as a
+        // RemoteException naming the class.
+        try (FSDataOutputStream out = fs.append(ap)) { out.write("x".getBytes()); }
+        catch (org.apache.hadoop.ipc.RemoteException e) {
+            refused = e.getClassName().equals("java.lang.UnsupportedOperationException");
+        }
+        check(refused, "append into a partial last block is refused");
+        try (FSDataOutputStream out = ((DistributedFileSystem) fs).append(ap,
+                EnumSet.of(CreateFlag.APPEND, CreateFlag.NEW_BLOCK), 4096, null)) {
+            out.write("more".getBytes());
+        }
+        byte[] got;
+        try (FSDataInputStream in = fs.open(ap)) { got = in.readAllBytes(); }
+        check(got.length == head.length + 8 && Arrays.equals(Arrays.copyOf(got, head.length), head)
+              && new String(got, head.length, 8).equals("tailmore"), "append with NEW_BLOCK; content intact");
 
         check(fs.delete(new Path("/java"), true), "recursive delete");
         check(!fs.exists(new Path("/java")), "gone after delete");

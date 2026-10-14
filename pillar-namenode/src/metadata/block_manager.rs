@@ -305,6 +305,30 @@ impl BlockManager {
         }
     }
 
+    /// Forget `datanode_uuid`'s replica of `block_id` and have the DataNode
+    /// delete it (an excess replica, or a corrupt one).
+    pub fn drop_replica(&self, block_id: &BlockId, datanode_uuid: &str) {
+        if let Some(idx) = self.datanode_table.index_of(datanode_uuid) {
+            if let Some(mut locations) = self.block_locations.get_mut(block_id) {
+                locations.retain(|&i| i != idx);
+            }
+        }
+        self.queue_invalidation(datanode_uuid, *block_id);
+    }
+
+    /// A replica reported corrupt (reportBadBlocks): drop it so the
+    /// replication monitor makes a good copy, unless it is the block's last
+    /// known replica, which HDFS keeps too (it may be partly readable).
+    /// Returns whether it was dropped.
+    pub fn drop_corrupt_replica(&self, block_id: &BlockId, datanode_uuid: &str) -> bool {
+        let holders = self.get_block_locations_shared(block_id).unwrap_or_default();
+        if holders.len() < 2 || !holders.iter().any(|h| h.uuid == datanode_uuid) {
+            return false;
+        }
+        self.drop_replica(block_id, datanode_uuid);
+        true
+    }
+
     /// Tell `datanode_uuid` to delete its replica of `block_id`.
     pub fn queue_invalidation(&self, datanode_uuid: &str, block_id: BlockId) {
         let mut pending = self.pending_invalidations.entry(datanode_uuid.to_string()).or_default();
@@ -554,6 +578,21 @@ mod tests {
         assert_eq!(bm.get_file_blocks(1).unwrap(), vec![a1, c1]);
         assert!(bm.get_file_blocks(2).is_none());
         assert_eq!(bm.get_block_info(&c1).unwrap().inode_id, 1);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_replica_is_dropped_unless_it_is_the_last() {
+        let bm = BlockManager::new();
+        let b = bm.allocate_block(7).await.unwrap();
+        bm.report_block(DatanodeId::new("dn1".into(), "h1".into(), 1), b, 10);
+        bm.report_block(DatanodeId::new("dn2".into(), "h2".into(), 1), b, 10);
+        assert!(!bm.drop_corrupt_replica(&b, "dn3"), "not a holder");
+        assert!(bm.drop_corrupt_replica(&b, "dn1"));
+        assert_eq!(bm.take_invalidations("dn1"), vec![b]);
+        assert_eq!(bm.get_replica_count(&b), 1);
+        assert!(!bm.drop_corrupt_replica(&b, "dn2"), "the last replica is kept");
+        assert_eq!(bm.get_replica_count(&b), 1);
+        assert!(bm.take_invalidations("dn2").is_empty());
     }
 
     #[tokio::test]

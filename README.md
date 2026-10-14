@@ -310,10 +310,24 @@ DataNodes):
   restarts under hdfs-native: files, renames and deletes survive, DataNodes
   re-register and report their replicas, new writes get fresh block ids.
 
+Metadata calls take effect and are persisted: `setReplication` (the
+NameNode then adds or deletes replicas), `setPermission`, `setOwner`,
+`setTimes`, `getContentSummary`; files are owned by the calling user.
+Permissions are recorded but not enforced (like HDFS with
+`dfs.permissions.enabled=false`). `reportBadBlocks` replaces corrupt
+replicas.
+
+`append` starts a new block: it works when the file's last block is full,
+or with `CreateFlag.NEW_BLOCK`. Extending a partially filled last block is
+refused with `UnsupportedOperationException` (hdfs-native then retries
+with a new block).
+
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
-append, hflush/hsync recovery, pipeline recovery after a DataNode fails
-mid-write, block checksum (`-checksum`), short-circuit reads, erasure
-coding, and NameNode HA (etcd is not consulted).
+leases and files under construction, hflush/hsync, pipeline recovery after
+a DataNode fails mid-write, block checksum (`-checksum`), short-circuit
+reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
+(etcd is not consulted). Calls for unsupported features fail with
+`UnsupportedOperationException` rather than pretending to succeed.
 
 ## Namespace persistence
 

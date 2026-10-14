@@ -237,7 +237,9 @@ impl NameNode {
             self.datanode_manager.clone(),
             self.placement_policy.clone(),
         )
-        .with_edit_log(self.edit_log.clone());
+        .with_edit_log(self.edit_log.clone())
+        .with_defaults(self.config.default_block_size, self.config.default_replication)
+        .with_block_pool_id(self.identity.block_pool_id.clone());
 
         if self.edit_log.is_durable() {
             tokio::spawn(run_checkpoints(

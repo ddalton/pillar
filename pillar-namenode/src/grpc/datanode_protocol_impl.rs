@@ -11,7 +11,7 @@ use pillar_proto::hadoop::hdfs::{
 };
 use crate::grpc::DatanodeProtocolService;
 use crate::grpc::datanode_protocol_service::DatanodeCommand;
-use crate::metadata::block_manager::DatanodeId;
+use crate::metadata::block_manager::{BlockId, DatanodeId};
 use pillar_common::hdfs::block_list::decode_block_list;
 use pillar_proto::hadoop::hdfs::DatanodeInfosProto;
 
@@ -301,9 +301,22 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
     /// Report bad blocks from DataNode
     async fn report_bad_blocks(
         &self,
-        _request: Request<ReportBadBlocksRequestProto>,
+        request: Request<ReportBadBlocksRequestProto>,
     ) -> Result<Response<ReportBadBlocksResponseProto>, Status> {
-        // Log and acknowledge bad block reports
+        // A DataNode found replicas that fail their checksums: drop them
+        // (unless one is a block's last replica) so good copies are made.
+        for lb in request.into_inner().blocks {
+            let block = BlockId::new(lb.b.block_id, lb.b.generation_stamp);
+            for dn in lb.locs {
+                let dropped = self.service.drop_corrupt_replica(&block, &dn.id.datanode_uuid);
+                warn!(
+                    "DataNode reports block {} on {} corrupt; {}",
+                    block.block_id,
+                    dn.id.datanode_uuid,
+                    if dropped { "deleting it" } else { "kept (unknown or last replica)" }
+                );
+            }
+        }
         Ok(Response::new(ReportBadBlocksResponseProto {}))
     }
 }
