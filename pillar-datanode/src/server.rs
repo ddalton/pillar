@@ -31,6 +31,10 @@ pub struct DataNodeConfig {
     /// (`dn/<host>@<REALM>`). Without them, SIMPLE.
     pub kerberos_keytab: Option<std::path::PathBuf>,
     pub kerberos_principal: Option<String>,
+    /// With Kerberos, the NameNode's principal, which the DataNode
+    /// authenticates to on every call (default `nn/<NameNode host>@<the
+    /// DataNode's realm>`).
+    pub namenode_principal: Option<String>,
 
     /// Data transfer server address (for block I/O)
     pub data_addr: SocketAddr,
@@ -97,6 +101,7 @@ impl Default for DataNodeConfig {
             rpc_addr: "0.0.0.0:9867".parse().unwrap(),
             kerberos_keytab: None,
             kerberos_principal: None,
+            namenode_principal: None,
             data_addr: "0.0.0.0:50010".parse().unwrap(),
             http_addr: "0.0.0.0:50075".parse().unwrap(),
             volume_mount_point: PathBuf::from("/mnt/pillar-data"),
@@ -145,6 +150,9 @@ impl DataNodeConfig {
         }
         if let Ok(val) = env::var("DATANODE_KERBEROS_PRINCIPAL") {
             config.kerberos_principal = Some(val);
+        }
+        if let Ok(val) = env::var("DATANODE_NAMENODE_PRINCIPAL") {
+            config.namenode_principal = Some(val);
         }
 
         if let Ok(val) = env::var("DATANODE_RPC_PORT") {
@@ -397,6 +405,20 @@ impl DataNode {
             block_storage.clone(),
         );
         namenode_client.set_replication_coordinator(replication_coordinator);
+        if let (Some(keytab), Some(principal)) = (&config.kerberos_keytab, &config.kerberos_principal) {
+            let service = config.namenode_principal.clone().unwrap_or_else(|| {
+                let host = config.namenode_addr.rsplit_once(':').map_or(config.namenode_addr.as_str(), |(h, _)| h);
+                let realm = principal.rsplit_once('@').map_or("", |(_, r)| r);
+                format!("nn/{}@{}", host, realm)
+            });
+            let kerberos = Arc::new(
+                pillar_common::grpc_auth::KerberosClient::new(keytab, principal, &service)
+                    .map_err(|e| anyhow::anyhow!("Kerberos to the NameNode: {}", e))?,
+            );
+            kerberos.clone().spawn_refresher();
+            namenode_client.set_kerberos(kerberos);
+            info!("Calls to the NameNode are authenticated as {} (to {})", principal, service);
+        }
         if let Some(secs) = config.heartbeat_interval {
             namenode_client.set_heartbeat_interval(std::time::Duration::from_secs(secs.max(1)));
         }

@@ -99,14 +99,14 @@ const SASL_DEFAULT_REALM: &str = "default";
 /// A Kerberos service: its principal (`<service>/<host>@<REALM>`) and the
 /// keytab holding its keys.
 pub struct KerberosServer {
-    keytab: krb5::Keytab,
-    principal: String,
+    pub(crate) keytab: krb5::Keytab,
+    pub(crate) principal: String,
     /// `<service>`: what Hadoop calls the SASL protocol (`nn`, `dn`).
     protocol: String,
     /// `<host>`: the SASL server id.
     server_id: String,
     /// Principals of this realm map to short names (DEFAULT rule).
-    realm: String,
+    pub(crate) realm: String,
 }
 
 impl KerberosServer {
