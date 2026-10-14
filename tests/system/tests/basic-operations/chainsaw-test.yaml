@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: basic-operations
+spec:
+  description: >-
+    hdfs dfs mkdir -p, put, ls, stat, cat, cp, get, rm with the stock Hadoop
+    client; every read is compared byte for byte with what was written.
+  steps:
+  - name: cluster
+    try:
+    - apply:
+        file: ../../common/pillar-cluster.yaml
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+  - name: operations
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          # Under set -e, "! cmd" does not stop the script when cmd succeeds.
+          fails() { if "$@"; then echo "FAIL: succeeded: $*"; exit 1; fi; }
+          head -c 3500000 /dev/urandom > /tmp/data.bin   # 3.3 blocks
+          hdfs dfs -mkdir -p /test/nested
+          hdfs dfs -put /tmp/data.bin /test/nested/data.bin
+          hdfs dfs -ls /test/nested | grep -q '/test/nested/data.bin'
+          [ "$(hdfs dfs -stat '%b %r' /test/nested/data.bin)" = "3500000 3" ]
+          [ "$(hdfs dfs -cat /test/nested/data.bin | md5sum)" = "$(md5sum < /tmp/data.bin)" ]
+          hdfs dfs -cp /test/nested/data.bin /test/copy.bin
+          hdfs dfs -get /test/copy.bin /tmp/copy.bin
+          cmp /tmp/data.bin /tmp/copy.bin
+          echo hello | hdfs dfs -put - /test/small.txt
+          [ "$(hdfs dfs -cat /test/small.txt)" = hello ]
+          hdfs dfs -put -f /tmp/data.bin /test/small.txt            # overwrite
+          [ "$(hdfs dfs -stat %b /test/small.txt)" = 3500000 ]
+          hdfs dfs -rm -skipTrash /test/small.txt
+          fails hdfs dfs -test -e /test/small.txt
+          echo PASS
+          SCRIPT

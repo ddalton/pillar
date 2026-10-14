@@ -47,6 +47,11 @@ spec:
             name: {{ include "pillar.fullname" . }}-datanode-config
         args:
         - --namenode={{ include "pillar.fullname" . }}-namenode:{{ .Values.namenode.rpcPort }}
+        # Clients connect to the address a DataNode registers, so it must be
+        # routable from other pods: the pod IP. The UUID must survive
+        # restarts: the pod name.
+        - --hostname=$(POD_IP)
+        - --uuid=$(POD_NAME)
         - --rpc-addr=0.0.0.0:{{ .Values.datanode.rpcPort }}
         - --data-addr=0.0.0.0:{{ .Values.datanode.dataPort }}
         - --http-addr=0.0.0.0:{{ .Values.datanode.httpPort }}
@@ -76,14 +81,16 @@ spec:
           mountPath: /mnt/pillar-data
         resources:
           {{- toYaml .Values.datanode.resources | nindent 10 }}
+        # The data port: the DataNode serves no separate RPC port yet, so a
+        # probe on `rpc` fails forever and the kubelet kills the container.
         livenessProbe:
           tcpSocket:
-            port: rpc
+            port: data
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           tcpSocket:
-            port: rpc
+            port: data
           initialDelaySeconds: 10
           periodSeconds: 5
   volumeClaimTemplates:

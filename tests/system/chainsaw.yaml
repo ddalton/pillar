@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/configuration-chainsaw-v1alpha2.json
+# Pillar system tests. Each test deploys its own NameNode + 3 DataNodes in
+# its own namespace, so tests run in parallel without sharing state.
+# Run: ./kind.sh (builds the images, creates a kind cluster, runs this).
+apiVersion: chainsaw.kyverno.io/v1alpha2
+kind: Configuration
+metadata:
+  name: pillar
+spec:
+  timeouts:
+    apply: 60s
+    assert: 300s
+    cleanup: 300s
+    delete: 120s
+    error: 60s
+    exec: 300s
+  execution:
+    parallel: 2
+  discovery:
+    testFile: chainsaw-test
+  # Test scripts use $(...) and $VAR for the shell, not for chainsaw.
+  templating:
+    enabled: false
+  # On a failure, show what the cluster was doing: a CI log is all a remote
+  # reader has.
+  error:
+    catch:
+    - events: {}
+    - describe:
+        apiVersion: v1
+        kind: Pod
+    - podLogs:
+        selector: app=pillar-namenode
+        tail: 100
+    - podLogs:
+        selector: app=pillar-datanode
+        tail: 50

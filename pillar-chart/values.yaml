@@ -2,8 +2,9 @@
 
 ## Etcd Configuration (for NameNode metadata HA)
 etcd:
-  # Enable etcd for high-availability metadata storage
-  enabled: true
+  # The NameNode does not use etcd yet (its namespace is in --name-dir on
+  # the NameNode's volume); enabling this only deploys the etcd cluster.
+  enabled: false
 
   image:
     repository: quay.io/coreos/etcd

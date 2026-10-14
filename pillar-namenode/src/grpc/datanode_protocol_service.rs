@@ -7,6 +7,7 @@ use crate::datanode::DatanodeManager;
 use crate::metadata::BlockManager;
 use crate::metadata::block_manager::{BlockId, DatanodeId};
 use crate::datanode::manager::StorageInfo;
+use pillar_common::hdfs::storage_identity::StorageIdentity;
 
 /// DatanodeProtocol service - handles communication from DataNodes to NameNode
 pub struct DatanodeProtocolService {
@@ -14,6 +15,9 @@ pub struct DatanodeProtocolService {
     block_manager: Arc<BlockManager>,
     /// Commands waiting for each DataNode's next heartbeat, by uuid.
     pending_commands: DashMap<String, Vec<DatanodeCommand>>,
+    /// This namespace's identity: handed out by versionRequest, required
+    /// of every registering DataNode.
+    identity: StorageIdentity,
 }
 
 impl DatanodeProtocolService {
@@ -25,6 +29,30 @@ impl DatanodeProtocolService {
             datanode_manager,
             block_manager,
             pending_commands: DashMap::new(),
+            identity: crate::metadata::edit_log::new_identity(None),
+        }
+    }
+
+    /// Serve `identity` (default: a fresh one, as for an in-memory namespace).
+    pub fn with_identity(mut self, identity: StorageIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn identity(&self) -> &StorageIdentity {
+        &self.identity
+    }
+
+    /// A DataNode may only join if its volume belongs to this namespace
+    /// (HDFS IncorrectVersionException otherwise).
+    pub fn check_identity(&self, cluster_id: &str, namespace_id: u32) -> Result<(), Status> {
+        if cluster_id == self.identity.cluster_id && namespace_id == self.identity.namespace_id {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(format!(
+                "incompatible storage: DataNode has clusterID={} namespaceID={}, NameNode has {}",
+                cluster_id, namespace_id, self.identity
+            )))
         }
     }
 
@@ -179,6 +207,15 @@ impl DatanodeProtocolService {
     /// Record that `uuid` holds a finalized replica. `report_block`
     /// de-duplicates locations, so repeated reports are idempotent.
     fn record_replica(&self, uuid: &str, datanode_id: &DatanodeId, block: BlockId, num_bytes: u64) {
+        // Not in the namespace (its file was deleted, perhaps before a
+        // restart lost the pending deletion), or a stale generation stamp:
+        // delete it. Safe because a DataNode only registers here if its
+        // volume carries this namespace's identity.
+        if self.block_manager.get_block_info(&block).is_none() {
+            info!("DataNode {} holds unknown replica {:?}; deleting it", uuid, block);
+            self.block_manager.queue_invalidation(uuid, block);
+            return;
+        }
         self.block_manager.report_block(datanode_id.clone(), block, num_bytes);
         let _ = self.datanode_manager.add_block_to_datanode(uuid, block);
     }

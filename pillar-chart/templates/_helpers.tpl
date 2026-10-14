@@ -67,6 +67,9 @@ Generate etcd initial cluster string for StatefulSet
 Generate etcd endpoints for NameNode
 */}}
 {{- define "pillar.etcdEndpoints" -}}
+{{- if not .Values.etcd.enabled -}}
+none
+{{- else -}}
 {{- $fullname := include "pillar.fullname" . -}}
 {{- $namespace := .Release.Namespace -}}
 {{- $replicas := int .Values.etcd.replicas -}}
@@ -76,4 +79,5 @@ Generate etcd endpoints for NameNode
   {{- $endpoints = append $endpoints $endpoint -}}
 {{- end -}}
 {{- join "," $endpoints -}}
+{{- end -}}
 {{- end }}

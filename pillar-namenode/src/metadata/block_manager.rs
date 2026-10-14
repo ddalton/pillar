@@ -305,6 +305,14 @@ impl BlockManager {
         }
     }
 
+    /// Tell `datanode_uuid` to delete its replica of `block_id`.
+    pub fn queue_invalidation(&self, datanode_uuid: &str, block_id: BlockId) {
+        let mut pending = self.pending_invalidations.entry(datanode_uuid.to_string()).or_default();
+        if !pending.contains(&block_id) {
+            pending.push(block_id);
+        }
+    }
+
     /// Replicas a DataNode should delete (blocks removed from the namespace).
     pub fn take_invalidations(&self, datanode_uuid: &str) -> Vec<BlockId> {
         self.pending_invalidations.remove(datanode_uuid).map(|(_, v)| v).unwrap_or_default()

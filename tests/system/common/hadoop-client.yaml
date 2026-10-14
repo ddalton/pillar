@@ -1,0 +1,43 @@
+# The stock Apache Hadoop client, idle until a test execs `hdfs dfs` in it.
+# 1 MiB blocks so small files span several blocks.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hadoop-client-conf
+data:
+  core-site.xml: |
+    <?xml version="1.0"?>
+    <configuration>
+      <property><name>fs.defaultFS</name><value>hdfs://pillar-namenode:9000</value></property>
+    </configuration>
+  hdfs-site.xml: |
+    <?xml version="1.0"?>
+    <configuration>
+      <property><name>dfs.blocksize</name><value>1048576</value></property>
+      <property><name>dfs.replication</name><value>3</value></property>
+    </configuration>
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hadoop-client
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: client
+    image: apache/hadoop:3.3.6
+    command: [sleep, infinity]
+    env:
+    - name: HADOOP_USER_NAME
+      value: hdfs
+    volumeMounts:
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/core-site.xml
+      subPath: core-site.xml
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/hdfs-site.xml
+      subPath: hdfs-site.xml
+  volumes:
+  - name: conf
+    configMap:
+      name: hadoop-client-conf

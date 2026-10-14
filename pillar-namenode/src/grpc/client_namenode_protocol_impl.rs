@@ -479,15 +479,17 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn get_content_summary(
         &self,
-        _request: Request<GetContentSummaryRequestProto>,
+        request: Request<GetContentSummaryRequestProto>,
     ) -> Result<Response<GetContentSummaryResponseProto>, Status> {
+        let s = self.service.handle_get_content_summary(&request.into_inner().path).await?;
         Ok(Response::new(GetContentSummaryResponseProto {
             summary: ContentSummaryProto {
-                length: 0,
-                file_count: 0,
-                directory_count: 1,
+                length: s.length,
+                file_count: s.file_count,
+                directory_count: s.directory_count,
+                // -1 (no quota) as the uint64 the proto carries.
                 quota: u64::MAX,
-                space_consumed: 0,
+                space_consumed: s.space_consumed,
                 space_quota: u64::MAX,
                 type_quota_infos: None,
                 snapshot_length: None,

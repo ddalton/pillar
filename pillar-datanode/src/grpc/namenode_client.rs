@@ -8,6 +8,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 
 use pillar_common::hdfs::block_list::{encode_block_list, ReportedBlock};
+use pillar_common::hdfs::storage_identity::StorageIdentity;
 use pillar_proto::hdfs::datanode::datanode_protocol_service_client::DatanodeProtocolServiceClient;
 use pillar_proto::hdfs::datanode::{
     block_command_proto, datanode_command_proto, received_deleted_block_info_proto,
@@ -18,7 +19,7 @@ use pillar_proto::hdfs::datanode::{
 };
 use pillar_proto::hdfs::{
     BlockKeyProto, BlockProto, DatanodeIdProto, DatanodeInfoProto, DatanodeStorageProto,
-    ExportedBlockKeysProto, StorageInfoProto, StorageReportProto,
+    ExportedBlockKeysProto, StorageInfoProto, StorageReportProto, VersionRequestProto,
 };
 
 use crate::storage::{VolumeManager, BlockStorage};
@@ -45,6 +46,11 @@ pub enum NamenodeClientError {
 
     #[error("Transport error: {0}")]
     TransportError(#[from] tonic::transport::Error),
+
+    /// The volume belongs to another namespace, or holds data but no
+    /// identity: registering could get its replicas deleted as unknown.
+    #[error("Incompatible storage: {0}")]
+    IncompatibleStorage(String),
 }
 
 pub type Result<T> = std::result::Result<T, NamenodeClientError>;
@@ -77,6 +83,9 @@ pub struct NamenodeClient {
     client: DatanodeProtocolServiceClient<Channel>,
     replication_coordinator: Option<Arc<ReplicationCoordinator>>,
     transfer_slots: Arc<Semaphore>,
+    /// The namespace this volume belongs to (its `current/VERSION`), once
+    /// known.
+    identity: std::sync::Mutex<Option<StorageIdentity>>,
 }
 
 impl NamenodeClient {
@@ -93,6 +102,15 @@ impl NamenodeClient {
             .tcp_nodelay(true)
             .connect_lazy();
         block_storage.enable_events();
+        let identity = match StorageIdentity::read(&volume_manager.version_file()) {
+            Ok(id) => id,
+            Err(e) => {
+                // Left unset: bind() then refuses, since the volume holds
+                // data or a VERSION it cannot vouch for.
+                error!("Unreadable {}: {}", volume_manager.version_file().display(), e);
+                None
+            }
+        };
         Self {
             namenode_addr,
             datanode_info,
@@ -105,6 +123,45 @@ impl NamenodeClient {
             client: DatanodeProtocolServiceClient::new(channel),
             replication_coordinator: None,
             transfer_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
+            identity: std::sync::Mutex::new(identity),
+        }
+    }
+
+    /// Check the NameNode's identity against this volume's, adopting it if
+    /// the volume is new (no VERSION, no blocks). HDFS `DataStorage`
+    /// refuses a mismatched namespace the same way.
+    fn bind(&self, theirs: &StorageIdentity) -> Result<()> {
+        let mut mine = self.identity.lock().unwrap();
+        match &*mine {
+            Some(m) if m == theirs => Ok(()),
+            Some(m) => Err(NamenodeClientError::IncompatibleStorage(format!(
+                "this volume belongs to {}, but the NameNode at {} serves {}",
+                m, self.namenode_addr, theirs
+            ))),
+            None => {
+                let version = self.volume_manager.version_file();
+                if version.exists() {
+                    return Err(NamenodeClientError::IncompatibleStorage(format!(
+                        "{} is unreadable",
+                        version.display()
+                    )));
+                }
+                let blocks = self.block_storage.get_block_count();
+                if blocks > 0 {
+                    return Err(NamenodeClientError::IncompatibleStorage(format!(
+                        "this volume holds {} blocks but no {}; refusing to join {}",
+                        blocks,
+                        version.display(),
+                        theirs
+                    )));
+                }
+                theirs
+                    .write(&version, "DATA_NODE")
+                    .map_err(|e| NamenodeClientError::RegistrationFailed(format!("writing {}: {}", version.display(), e)))?;
+                info!("Volume joined namespace {}", theirs);
+                *mine = Some(theirs.clone());
+                Ok(())
+            }
         }
     }
 
@@ -148,11 +205,15 @@ impl NamenodeClient {
     fn create_registration_proto(&self) -> DatanodeRegistrationProto {
         DatanodeRegistrationProto {
             datanode_id: self.create_datanode_id_proto(),
-            storage_info: StorageInfoProto {
-                layout_version: 0,
-                namespce_id: 0,  // Note: This is the actual field name in the protobuf (typo in Hadoop)
-                cluster_id: self.block_pool_id.clone(),
-                c_time: 0,
+            storage_info: {
+                let id = self.identity.lock().unwrap().clone();
+                StorageInfoProto {
+                    layout_version: 0,
+                    // The protobuf's field name (typo in Hadoop).
+                    namespce_id: id.as_ref().map_or(0, |i| i.namespace_id),
+                    cluster_id: id.map(|i| i.cluster_id).unwrap_or_default(),
+                    c_time: 0,
+                }
             },
             keys: ExportedBlockKeysProto {
                 is_block_token_enabled: false,
@@ -188,6 +249,14 @@ impl NamenodeClient {
         info!("Registering with NameNode at {}", self.namenode_addr);
 
         let volume_info = self.volume_stats().map_err(NamenodeClientError::RegistrationFailed)?;
+
+        // Which namespace does the NameNode serve? Only join our own.
+        let ns = self.client().version_request(Request::new(VersionRequestProto {})).await?.into_inner().info;
+        self.bind(&StorageIdentity {
+            cluster_id: ns.storage_info.cluster_id,
+            namespace_id: ns.storage_info.namespce_id,
+            block_pool_id: ns.block_pool_id,
+        })?;
 
         let request = Request::new(RegisterDatanodeRequestProto {
             registration: self.create_registration_proto(),
@@ -457,7 +526,10 @@ impl NamenodeClient {
     async fn reregister(&self) {
         info!("NameNode asked this DataNode to re-register");
         if let Err(e) = self.register().await {
-            warn!("Re-registration failed: {}", e);
+            match e {
+                NamenodeClientError::IncompatibleStorage(_) => error!("Not re-registering: {}", e),
+                _ => warn!("Re-registration failed: {}", e),
+            }
             return;
         }
         match self.send_block_report().await {

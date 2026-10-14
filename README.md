@@ -86,6 +86,13 @@ After building, binaries will be in `target/release/`:
 - `pillar-namenode` - NameNode server
 - `pillar-datanode` - DataNode server
 
+### Container images
+
+```bash
+docker build --target namenode -t pillar/namenode:dev .
+docker build --target datanode -t pillar/datanode:dev .
+```
+
 ## Quick Start
 
 ### Standalone Mode (Development)
@@ -192,29 +199,25 @@ In the future, Pillar will provide a CLI tool to generate these XML files automa
 
 ## Testing
 
-Pillar includes a comprehensive system test framework using [KUTTL](https://kuttl.dev/) that verifies:
+System tests run on Kubernetes with [Chainsaw](https://kyverno.github.io/chainsaw/):
+NameNode and DataNode pods built from this tree, driven by the stock
+Apache Hadoop client (`hdfs dfs`):
 
-- **Basic Operations**: All core HDFS operations (mkdir, put, get, ls, cat, cp, mv, rm)
-- **Replication**: Multi-DataNode block replication and consistency
-- **Hadoop CLI**: Full compatibility with standard `hadoop fs` commands
-- **Data Persistence**: File integrity across pod restarts
+- **Basic operations**: mkdir, put, get, ls, stat, cat, cp, rm, overwrite
+- **Hadoop CLI**: more of `hadoop fs`, including commands that must fail
+- **Replication**: every DataNode holds every block (and its `.meta`); deletes remove them
+- **NameNode restart**: the NameNode pod is force-deleted and recovers its namespace
+- **Helm chart**: the chart as shipped serves the client
 
 ### Running Tests
 
 ```bash
-cd tests/system
-
-# Install prerequisites
-make install-kuttl
-
-# Run all tests
-make test
-
-# Run specific test
-make test-basic
-make test-replication
-make test-cli
+tests/system/kind.sh                            # build images, kind cluster, all tests
+TESTS=tests/namenode-restart tests/system/kind.sh
 ```
+
+The `system-chainsaw` GitHub workflow runs the same script on every pull
+request; `rust-ci` runs the workspace tests and the Java client interop.
 
 See [tests/system/README.md](tests/system/README.md) for comprehensive testing documentation.
 
@@ -254,7 +257,7 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - Etcd StatefulSet for metadata storage
 
 - [x] **Phase 5:** Integration Testing
-  - KUTTL-based system test framework
+  - Chainsaw system tests on kind (converted from KUTTL)
   - Basic HDFS operations test (mkdir, put, get, ls, cat, cp)
   - Multi-DataNode replication testing (3-way replication)
   - Comprehensive Hadoop CLI compatibility tests
@@ -310,8 +313,7 @@ DataNodes):
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
 append, hflush/hsync recovery, pipeline recovery after a DataNode fails
 mid-write, block checksum (`-checksum`), short-circuit reads, erasure
-coding, and NameNode HA (etcd is not consulted). The KUTTL suites in
-`tests/system` have not been re-run against these changes.
+coding, and NameNode HA (etcd is not consulted).
 
 ## Namespace persistence
 
@@ -329,7 +331,16 @@ before answering, the way HDFS does (`dfs.namenode.name.dir`):
   dropped; corruption anywhere else stops startup.
 - Block **locations** are not persisted: DataNodes are told to re-register
   when they heartbeat a NameNode that does not know them, and send a full
-  block report.
+  block report. Replicas the namespace does not know (their file was
+  deleted, possibly before a crash lost the pending deletion) or with a
+  stale generation stamp are deleted.
+- Formatting a name directory gives the namespace an **identity** (cluster
+  id, namespace id, block pool id in `current/VERSION`; `--cluster-id`
+  picks the cluster id). Each DataNode records it on its volume when it
+  first joins, and refuses a NameNode with any other identity: a NameNode
+  started on an empty or wrong directory gets no DataNodes, and so cannot
+  delete their replicas as unknown. A volume that holds blocks but no
+  `VERSION` is refused too.
 - A lock file stops two NameNodes from using the same directory.
 
 Without `--name-dir` the namespace is in memory only and lost on restart

@@ -195,3 +195,49 @@ async fn files_survive_a_namenode_crash_and_restart() {
     assert_eq!(read(&fs, "/data/big.bin").await, big);
     nn.crash().await;
 }
+
+/// A NameNode on a fresh (or wrong) name directory has a different
+/// identity: the DataNodes refuse to join it, so it never sees their
+/// replicas and cannot have them deleted as unknown. Back on the right
+/// directory they rejoin, and a replica the namespace does not know about
+/// (here planted while the NameNode was down) is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn datanodes_refuse_a_namenode_with_another_identity() {
+    let name_dir = TempDir::new().unwrap();
+    let nn_addr = free_addr();
+    let nn = start_namenode(nn_addr, name_dir.path()).await;
+    let dns = start_datanodes(nn_addr, 3).await;
+    eventually("three live DataNodes", || nn.datanodes.get_live_datanodes().len() == 3).await;
+    let data = pattern(3 * MB / 2, 0x42);
+    write(&client(nn_addr), "/precious.bin", &data).await;
+    let per_dn: Vec<usize> = dns.iter().map(|(_, s)| s.get_block_count()).collect();
+    assert_eq!(per_dn, vec![2, 2, 2]);
+    nn.crash().await;
+
+    // The wrong directory: formatted afresh, new identity.
+    let other_dir = TempDir::new().unwrap();
+    let nn = start_namenode(nn_addr, other_dir.path()).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await; // ~15 heartbeats
+    assert!(nn.datanodes.get_live_datanodes().is_empty(), "a DataNode joined a foreign namespace");
+    assert_eq!(nn.blocks.blocks_snapshot().len(), 0);
+    let still: Vec<usize> = dns.iter().map(|(_, s)| s.get_block_count()).collect();
+    assert_eq!(still, per_dn, "replicas changed while refusing the foreign NameNode");
+    nn.crash().await;
+
+    // An orphan: a replica of a block the namespace never had.
+    {
+        use pillar_datanode::storage::block_storage::BlockId as DnBlockId;
+        use std::io::Write;
+        let orphan = DnBlockId::new(999_999, 1);
+        dns[0].1.begin_write(&orphan).unwrap().write_all(b"orphan").unwrap();
+        dns[0].1.finalize_block(&orphan).unwrap();
+    }
+
+    let nn = start_namenode(nn_addr, name_dir.path()).await;
+    eventually("DataNodes rejoin their own NameNode", || nn.datanodes.get_live_datanodes().len() == 3).await;
+    eventually("the orphan replica is deleted", || dns[0].1.get_block_metadata(999_999).is_none()).await;
+    assert_eq!(read(&client(nn_addr), "/precious.bin").await, data);
+    let after: Vec<usize> = dns.iter().map(|(_, s)| s.get_block_count()).collect();
+    assert_eq!(after, per_dn);
+    nn.crash().await;
+}

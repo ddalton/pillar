@@ -104,6 +104,11 @@ impl VolumeManager {
         })
     }
 
+    /// `current/VERSION`: the namespace identity this volume belongs to.
+    pub fn version_file(&self) -> PathBuf {
+        self.mount_point.join("current").join("VERSION")
+    }
+
     /// Volume statistics with block-pool usage supplied by the caller
     /// (`BlockStorage::total_bytes`): one `statvfs`, no directory walk.
     /// This is what heartbeats should use.

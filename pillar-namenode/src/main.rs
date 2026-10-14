@@ -44,6 +44,11 @@ struct Args {
     #[clap(long)]
     name_dir: Option<std::path::PathBuf>,
 
+    /// Cluster id for a newly formatted name directory (default: random).
+    /// An already formatted directory must carry this id.
+    #[clap(long)]
+    cluster_id: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -81,6 +86,9 @@ async fn main() -> Result<()> {
     config.default_block_size = args.block_size_mb * 1024 * 1024;
     if args.name_dir.is_some() {
         config.name_dir = args.name_dir;
+    }
+    if args.cluster_id.is_some() {
+        config.cluster_id = args.cluster_id;
     }
 
     info!("Configuration loaded from environment and CLI arguments");

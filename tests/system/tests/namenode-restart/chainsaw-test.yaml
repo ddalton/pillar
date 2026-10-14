@@ -1,0 +1,77 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: namenode-restart
+spec:
+  description: >-
+    The NameNode pod is force-deleted (no graceful shutdown) and comes back
+    on the same PersistentVolume: every file is still there, DataNodes
+    re-register and report their replicas, and new writes work.
+  steps:
+  - name: cluster
+    try:
+    - apply:
+        file: ../../common/pillar-cluster.yaml
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+  - name: write
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          # Under set -e, "! cmd" does not stop the script when cmd succeeds.
+          fails() { if "$@"; then echo "FAIL: succeeded: $*"; exit 1; fi; }
+          head -c 2500000 /dev/urandom > /tmp/before.bin
+          hdfs dfs -mkdir -p /keep/dir
+          hdfs dfs -put /tmp/before.bin /keep/dir/before.bin
+          echo doomed | hdfs dfs -put - /keep/doomed
+          hdfs dfs -rm -skipTrash /keep/doomed
+          hdfs dfs -mv /keep/dir /keep/moved
+          md5sum < /tmp/before.bin > /tmp/before.md5
+          SCRIPT
+  - name: crash-namenode
+    try:
+    - script:
+        content: |
+          set -eu
+          uid=$(kubectl -n "$NAMESPACE" get pod pillar-namenode-0 -o jsonpath='{.metadata.uid}')
+          kubectl -n "$NAMESPACE" delete pod pillar-namenode-0 --grace-period=0 --force --wait=true
+          for _ in $(seq 60); do
+            now=$(kubectl -n "$NAMESPACE" get pod pillar-namenode-0 -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+            [ -n "$now" ] && [ "$now" != "$uid" ] && exit 0
+            sleep 2
+          done
+          echo "FAIL: the NameNode pod was not recreated"; exit 1
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: |
+          set -eu
+          kubectl -n "$NAMESPACE" logs pillar-namenode-0 | grep 'Namespace loaded'
+          bash ../../common/wait-for-datanodes.sh
+  - name: verify
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          # Under set -e, "! cmd" does not stop the script when cmd succeeds.
+          fails() { if "$@"; then echo "FAIL: succeeded: $*"; exit 1; fi; }
+          # Reads succeed once the DataNodes' block reports are in.
+          for _ in $(seq 30); do
+            hdfs dfs -cat /keep/moved/before.bin > /tmp/after.bin 2>/dev/null && break
+            sleep 2
+          done
+          [ "$(md5sum < /tmp/after.bin)" = "$(cat /tmp/before.md5)" ]
+          fails hdfs dfs -test -e /keep/doomed
+          fails hdfs dfs -test -e /keep/dir
+          echo after | hdfs dfs -put - /keep/after.txt
+          [ "$(hdfs dfs -cat /keep/after.txt)" = after ]
+          echo PASS
+          SCRIPT

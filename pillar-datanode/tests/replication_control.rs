@@ -85,6 +85,16 @@ async fn start_datanode(nn: &NameNode, uuid: &str) -> DataNode {
     DataNode { _dir: dir, storage }
 }
 
+/// Make `block` part of the namespace (as addBlock would), so replicas of
+/// it are kept; replicas of unknown blocks are deleted.
+fn known(nn: &NameNode, inode: u64, block: BlockId, num_bytes: u64) {
+    use pillar_namenode::metadata::namespace::BlockInfo;
+    nn.blocks.restore_file(
+        inode,
+        &[BlockInfo { block_id: block.block_id, generation_stamp: block.generation_stamp, num_bytes }],
+    );
+}
+
 fn holders(nn: &NameNode, block: &BlockId) -> Vec<String> {
     let mut v: Vec<String> = nn
         .blocks
@@ -115,6 +125,7 @@ async fn a_queued_transfer_creates_a_replica_the_namenode_then_knows_about() {
 
     // dn1 receives a block (as if a client had written it).
     let data: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i * 7 + 3) as u8).collect();
+    known(&nn, 100, BlockId::new(1, 1001), data.len() as u64);
     let local = DnBlockId::new(1, 1001);
     {
         use std::io::Write;
@@ -149,9 +160,12 @@ async fn a_queued_transfer_creates_a_replica_the_namenode_then_knows_about() {
 async fn a_full_block_report_carries_generation_stamps_and_lengths() {
     let nn = start_namenode().await;
     let dn = start_datanode(&nn, "dn1").await;
-    {
+    known(&nn, 100, BlockId::new(9, 4242), 1000);
+    known(&nn, 101, BlockId::new(10, 5000), 1000);
+    // A known block; one the namespace never had (or deleted); and a stale
+    // generation stamp of a known block.
+    for b in [DnBlockId::new(9, 4242), DnBlockId::new(77, 1), DnBlockId::new(10, 4999)] {
         use std::io::Write;
-        let b = DnBlockId::new(9, 4242);
         dn.storage.begin_write(&b).unwrap().write_all(&[1u8; 1000]).unwrap();
         dn.storage.finalize_block(&b).unwrap();
     }
@@ -172,4 +186,14 @@ async fn a_full_block_report_carries_generation_stamps_and_lengths() {
 
     assert_eq!(holders(&nn, &BlockId::new(9, 4242)), ["dn1"]);
     assert!(holders(&nn, &BlockId::new(9, 0)).is_empty(), "reported under genstamp 0");
+
+    // The unknown and the stale replicas are deleted on the next heartbeat;
+    // the known one stays.
+    assert!(holders(&nn, &BlockId::new(77, 1)).is_empty());
+    assert!(holders(&nn, &BlockId::new(10, 4999)).is_empty());
+    eventually("unknown and stale replicas are deleted", || {
+        dn.storage.get_block_metadata(77).is_none() && dn.storage.get_block_metadata(10).is_none()
+    })
+    .await;
+    assert!(dn.storage.get_block_metadata(9).is_some());
 }
