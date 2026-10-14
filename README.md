@@ -362,7 +362,27 @@ DataNodes (`getReplicaVisibleLength` on the DataNode IPC port), everything
 the writer hflushed. `hsync` with `UPDATE_LENGTH` records the length on the
 NameNode, so the file's status shows it.
 
-Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
+**Security.** By default clients authenticate with SIMPLE (the client says
+who it is). With Kerberos, `--kerberos-keytab` and `--kerberos-principal`
+(`nn/<host>@<REALM>` on the NameNode, `dn/<host>@<REALM>` on DataNodes)
+make the Hadoop IPC ports require SASL GSSAPI, as HDFS with
+`hadoop.security.authentication=kerberos`: SIMPLE clients are refused, a
+caller is its authenticated principal mapped by Hadoop's DEFAULT
+`auth_to_local` rule (`alice@REALM` and `alice/host@REALM` are `alice`),
+and naming another user (impersonation; there are no proxy-user rules) is
+refused. The NameNode then serves its client protocol over Hadoop IPC
+only, not gRPC. `tests/interop/run-java-kerberos.sh` runs the stock Java
+client against a throwaway MIT KDC (`tests/kerberos/kdc.sh`).
+
+What Kerberos does **not** cover yet: block access tokens, so a client
+that reaches a DataNode's data port can read or write any block by id, and
+a Kerberized client cannot read a file still being written (it asks the
+DataNodes with the block's token); the DataNode-to-NameNode channel
+(gRPC) is not authenticated; permissions are recorded but not enforced;
+RPC integrity and privacy (`hadoop.rpc.protection` beyond
+`authentication`) and data transfer encryption are not offered.
+
+Not supported yet: block tokens,
 block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with

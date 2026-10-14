@@ -27,6 +27,11 @@ pub struct DataNodeConfig {
     /// RPC server address
     pub rpc_addr: SocketAddr,
 
+    /// Kerberos for the IPC port: the keytab and the DataNode's principal
+    /// (`dn/<host>@<REALM>`). Without them, SIMPLE.
+    pub kerberos_keytab: Option<std::path::PathBuf>,
+    pub kerberos_principal: Option<String>,
+
     /// Data transfer server address (for block I/O)
     pub data_addr: SocketAddr,
 
@@ -90,6 +95,8 @@ impl Default for DataNodeConfig {
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "localhost".to_string()),
             rpc_addr: "0.0.0.0:9867".parse().unwrap(),
+            kerberos_keytab: None,
+            kerberos_principal: None,
             data_addr: "0.0.0.0:50010".parse().unwrap(),
             http_addr: "0.0.0.0:50075".parse().unwrap(),
             volume_mount_point: PathBuf::from("/mnt/pillar-data"),
@@ -131,6 +138,13 @@ impl DataNodeConfig {
 
         if let Ok(val) = env::var("DATANODE_VOLUME_MOUNT_POINT") {
             config.volume_mount_point = PathBuf::from(val);
+        }
+
+        if let Ok(val) = env::var("DATANODE_KERBEROS_KEYTAB") {
+            config.kerberos_keytab = Some(val.into());
+        }
+        if let Ok(val) = env::var("DATANODE_KERBEROS_PRINCIPAL") {
+            config.kerberos_principal = Some(val);
         }
 
         if let Ok(val) = env::var("DATANODE_RPC_PORT") {
@@ -433,7 +447,15 @@ impl DataNode {
 
         // The IPC port: ClientDatanodeProtocol (getReplicaVisibleLength,
         // for readers of files still being written).
-        let ipc = crate::ipc::serve(self.config.rpc_addr, self.block_storage.clone())
+        let auth = match (&self.config.kerberos_keytab, &self.config.kerberos_principal) {
+            (Some(keytab), Some(principal)) => pillar_common::ipc::Authentication::Kerberos(
+                pillar_common::ipc::KerberosServer::new(keytab, principal)
+                    .map_err(|e| anyhow::anyhow!("Kerberos: {}", e))?,
+            ),
+            (None, None) => pillar_common::ipc::Authentication::Simple,
+            _ => anyhow::bail!("Kerberos needs both a keytab and a principal"),
+        };
+        let ipc = crate::ipc::serve(self.config.rpc_addr, self.block_storage.clone(), auth)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind the IPC port {}: {}", self.config.rpc_addr, e))?;
         info!("DataNode IPC (ClientDatanodeProtocol) on {}", ipc);

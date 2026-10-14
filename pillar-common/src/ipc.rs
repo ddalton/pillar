@@ -10,10 +10,26 @@
 //! reply     len(u32) <delimited RpcResponseHeaderProto> [<delimited response>]
 //! ```
 //!
-//! Special call ids: -33 SASL, -3 connection context, -4 ping. Only SIMPLE
-//! authentication is supported: a SASL `NEGOTIATE` is answered with
-//! `SUCCESS`, exactly as a Hadoop server with only SIMPLE enabled does.
-//! Calls are dispatched concurrently and answered as they complete.
+//! Special call ids: -33 SASL, -3 connection context, -4 ping. Calls are
+//! dispatched concurrently and answered as they complete.
+//!
+//! Authentication ([`Authentication`]) is SIMPLE (the client says who it
+//! is; a SASL `NEGOTIATE` is answered with `SUCCESS`, as a Hadoop server
+//! with only SIMPLE enabled does) or Kerberos: SASL GSSAPI, as Hadoop's
+//! `SaslRpcServer` (`hadoop.security.authentication=kerberos`, QOP
+//! `authentication`):
+//!
+//! ```text
+//! C NEGOTIATE                  S NEGOTIATE auths=[KERBEROS GSSAPI <protocol>/<server id>]
+//! C INITIATE  AP-REQ           S CHALLENGE AP-REP           (mutual authentication)
+//! C RESPONSE  (empty)          S CHALLENGE wrap(offer)      (security layer: auth only)
+//! C RESPONSE  wrap(choice)     S SUCCESS
+//! ```
+//!
+//! The caller is then the authenticated principal, mapped to a short name
+//! by Hadoop's DEFAULT `auth_to_local` rule; a connection context naming
+//! anyone else (impersonation, which needs proxy-user rules Pillar does not
+//! have) is refused, as is any call before authentication.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,7 +45,7 @@ use tracing::{debug, info, warn};
 
 use pillar_proto::hadoop::common::{
     rpc_response_header_proto::{RpcErrorCodeProto, RpcStatusProto},
-    rpc_sasl_proto::SaslState,
+    rpc_sasl_proto::{self, SaslState},
     IpcConnectionContextProto, RequestHeaderProto, RpcRequestHeaderProto, RpcResponseHeaderProto, RpcSaslProto,
 };
 
@@ -47,11 +63,76 @@ const RPC_OP_CLOSE_CONNECTION: i32 = 2;
 /// `ipc.maximum.data.length` default.
 const MAX_FRAME: usize = 128 * 1024 * 1024;
 
+/// How a server authenticates its callers.
+pub enum Authentication {
+    /// SIMPLE: the caller is whoever its connection context says.
+    Simple,
+    /// Kerberos (SASL GSSAPI).
+    Kerberos(KerberosServer),
+}
+
+static SIMPLE: Authentication = Authentication::Simple;
+
+/// A Kerberos service: its principal (`<service>/<host>@<REALM>`) and the
+/// keytab holding its keys.
+pub struct KerberosServer {
+    keytab: krb5::Keytab,
+    principal: String,
+    /// `<service>`: what Hadoop calls the SASL protocol (`nn`, `dn`).
+    protocol: String,
+    /// `<host>`: the SASL server id.
+    server_id: String,
+    /// Principals of this realm map to short names (DEFAULT rule).
+    realm: String,
+}
+
+impl KerberosServer {
+    /// `principal` must be `<service>/<host>@<REALM>` with a key in the keytab.
+    pub fn new(keytab: &std::path::Path, principal: &str) -> std::io::Result<Self> {
+        let invalid = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
+        let (name, realm) = principal
+            .split_once('@')
+            .ok_or_else(|| invalid(format!("principal {} has no realm", principal)))?;
+        let (protocol, server_id) = name
+            .split_once('/')
+            .ok_or_else(|| invalid(format!("principal {} is not <service>/<host>@<REALM>", principal)))?;
+        let keytab = krb5::Keytab::load(keytab)
+            .map_err(|e| invalid(format!("keytab {}: {}", keytab.display(), e)))?;
+        if keytab.find_key(principal).is_none() {
+            return Err(invalid(format!("the keytab has no key for {}", principal)));
+        }
+        Ok(Self {
+            keytab,
+            principal: principal.to_string(),
+            protocol: protocol.to_string(),
+            server_id: server_id.to_string(),
+            realm: realm.to_string(),
+        })
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// Hadoop's DEFAULT `auth_to_local` rule: a principal of this realm is
+    /// its first component (`alice@R`, `alice/host@R` -> `alice`); others
+    /// have no local name.
+    pub fn short_name(&self, principal: &str) -> Option<String> {
+        let (name, realm) = principal.split_once('@')?;
+        (realm == self.realm).then(|| name.split('/').next().unwrap_or(name).to_string()).filter(|n| !n.is_empty())
+    }
+}
+
 /// A protocol served over Hadoop IPC.
 #[async_trait]
 pub trait RpcHandler: Send + Sync + 'static {
     /// The protocol name clients put in `RequestHeaderProto`.
     fn protocol(&self) -> &'static str;
+
+    /// How callers authenticate (default SIMPLE).
+    fn authentication(&self) -> &Authentication {
+        &SIMPLE
+    }
 
     /// Run `method` on the encoded request `body` for `user` (the
     /// connection's effective user); the encoded response.
@@ -180,6 +261,96 @@ fn error_frame(req: &RpcRequestHeaderProto, e: &RpcError) -> Bytes {
     frame(&h, None)
 }
 
+const ACCESS_CONTROL: &str = "org.apache.hadoop.security.AccessControlException";
+const SIMPLE_NOT_ENABLED: &str = "SIMPLE authentication is not enabled.  Available:[KERBEROS]";
+
+/// A fatal reply: the client gives up on the connection.
+fn fatal_frame(req: &RpcRequestHeaderProto, class: &str, msg: &str) -> Bytes {
+    let mut h = response_header(req, RpcStatusProto::Fatal);
+    h.exception_class_name = Some(class.to_string());
+    h.error_msg = Some(msg.to_string());
+    h.error_detail = Some(RpcErrorCodeProto::FatalUnauthorized as i32);
+    frame(&h, None)
+}
+
+/// SASL GSSAPI (RFC 4752) on the server side, step by step.
+#[derive(Default)]
+struct Gssapi {
+    context: Option<krb5::KerberosContext>,
+    /// The security-layer offer was sent; the next token is the choice.
+    offered: bool,
+    /// Set once the exchange completed.
+    principal: Option<String>,
+}
+
+/// RFC 4752 security layer bit: no protection beyond authentication
+/// (Hadoop's `hadoop.rpc.protection=authentication`).
+const SASL_LAYER_NONE: u8 = 1;
+
+impl Gssapi {
+    fn step(&mut self, k: &KerberosServer, msg: &RpcSaslProto) -> Result<RpcSaslProto, String> {
+        let challenge = |token: Vec<u8>| RpcSaslProto { state: SaslState::Challenge as i32, token: Some(token), ..Default::default() };
+        match SaslState::try_from(msg.state) {
+            Ok(SaslState::Negotiate) => Ok(RpcSaslProto {
+                state: SaslState::Negotiate as i32,
+                auths: vec![rpc_sasl_proto::SaslAuth {
+                    method: "KERBEROS".into(),
+                    mechanism: "GSSAPI".into(),
+                    protocol: Some(k.protocol.clone()),
+                    server_id: Some(k.server_id.clone()),
+                    challenge: None,
+                }],
+                ..Default::default()
+            }),
+            Ok(SaslState::Initiate) => {
+                if !msg.auths.iter().any(|a| a.mechanism == "GSSAPI") {
+                    return Err("only the GSSAPI mechanism (Kerberos) is supported".into());
+                }
+                let token = msg.token.as_deref().unwrap_or_default();
+                let (context, ap_rep) = krb5::KerberosContext::accept_token(&k.keytab, token)
+                    .map_err(|e| format!("GSS initiate failed: {}", e))?;
+                if context.service_principal != k.principal {
+                    return Err(format!("ticket for {}, not {}", context.service_principal, k.principal));
+                }
+                self.context = Some(context);
+                Ok(challenge(ap_rep))
+            }
+            Ok(SaslState::Response) if !self.offered => {
+                // The initiator has the AP-REP; offer the security layers
+                // (only "none"), wrapped (integrity, no confidentiality).
+                let context = self.context.as_ref().ok_or("RESPONSE before INITIATE")?;
+                let tokens = context.per_message_tokens().map_err(|e| e.to_string())?;
+                let offer = tokens
+                    .emit_wrap_unsealed(0, &[SASL_LAYER_NONE, 0, 0, 0], 0)
+                    .map_err(|e| e.to_string())?;
+                self.offered = true;
+                Ok(challenge(offer))
+            }
+            Ok(SaslState::Response) => {
+                let context = self.context.as_ref().ok_or("RESPONSE before INITIATE")?;
+                let tokens = context.per_message_tokens().map_err(|e| e.to_string())?;
+                let token = msg.token.as_deref().unwrap_or_default();
+                let choice = tokens
+                    .verify_wrap_unsealed(token)
+                    .or_else(|_| tokens.unwrap(token))
+                    .map_err(|e| format!("security layer choice: {}", e))?
+                    .message;
+                if choice.len() < 4 || choice[0] & SASL_LAYER_NONE == 0 {
+                    return Err("the client chose a security layer this server does not offer".into());
+                }
+                // An authorization id, if any, must be the authenticated one.
+                let authz = String::from_utf8_lossy(&choice[4..]).into_owned();
+                if !authz.is_empty() && authz != context.client_principal {
+                    return Err(format!("{} may not act as {}", context.client_principal, authz));
+                }
+                self.principal = Some(context.client_principal.clone());
+                Ok(RpcSaslProto { state: SaslState::Success as i32, ..Default::default() })
+            }
+            _ => Err(format!("unexpected SASL state {}", msg.state)),
+        }
+    }
+}
+
 /// Serve one Hadoop IPC connection until the client closes it.
 pub async fn serve_connection<S, H>(stream: S, handler: Arc<H>, peer: SocketAddr) -> std::io::Result<()>
 where
@@ -211,6 +382,10 @@ where
     });
 
     let mut user = String::new();
+    // Kerberos: the SASL exchange's state, and once it succeeded the
+    // authenticated principal and its local name.
+    let mut gssapi = Gssapi::default();
+    let mut authenticated: Option<(String, Option<String>)> = None;
     let result: std::io::Result<()> = async {
         loop {
             let len = match rd.read_u32().await {
@@ -235,33 +410,69 @@ where
                 CALL_ID_SASL => {
                     let sasl: RpcSaslProto = take_delimited(&mut buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    // SIMPLE-only: NEGOTIATE succeeds at once; anything else
-                    // (a client insisting on Kerberos) is refused.
-                    if sasl.state == SaslState::Negotiate as i32 {
-                        let reply = RpcSaslProto { state: SaslState::Success as i32, ..Default::default() };
-                        let _ = out_tx.send(frame(&response_header(&header, RpcStatusProto::Success), Some(&reply.encode_to_vec()))).await;
-                    } else {
-                        let e = RpcError::new(
-                            "org.apache.hadoop.security.AccessControlException",
-                            "Pillar supports only SIMPLE authentication",
-                            RpcErrorCodeProto::FatalUnauthorized,
-                        );
-                        let mut h = response_header(&header, RpcStatusProto::Fatal);
-                        h.exception_class_name = Some(e.exception_class);
-                        h.error_msg = Some(e.message);
-                        h.error_detail = Some(e.code as i32);
-                        let _ = out_tx.send(frame(&h, None)).await;
-                        return Ok(());
+                    let reply = match handler.authentication() {
+                        // SIMPLE-only: NEGOTIATE succeeds at once; anything
+                        // else (a client insisting on Kerberos) is refused.
+                        Authentication::Simple if sasl.state == SaslState::Negotiate as i32 => {
+                            Ok(RpcSaslProto { state: SaslState::Success as i32, ..Default::default() })
+                        }
+                        Authentication::Simple => Err("Pillar has only SIMPLE authentication enabled".to_string()),
+                        Authentication::Kerberos(k) => match gssapi.step(k, &sasl) {
+                            Ok(step) => {
+                                if let Some(principal) = &gssapi.principal {
+                                    authenticated = Some((principal.clone(), k.short_name(principal)));
+                                }
+                                Ok(step)
+                            }
+                            Err(e) => Err(e),
+                        },
+                    };
+                    match reply {
+                        Ok(reply) => {
+                            let _ = out_tx.send(frame(&response_header(&header, RpcStatusProto::Success), Some(&reply.encode_to_vec()))).await;
+                        }
+                        Err(msg) => {
+                            warn!("{}: authentication failed: {}", peer, msg);
+                            let _ = out_tx.send(fatal_frame(&header, "javax.security.sasl.SaslException", &msg)).await;
+                            return Ok(());
+                        }
                     }
                 }
                 CALL_ID_CONNECTION_CONTEXT => {
                     let ctx: IpcConnectionContextProto = take_delimited(&mut buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    user = ctx.user_info.and_then(|u| u.effective_user).unwrap_or_default();
-                    debug!("{}: connection context user={:?} protocol={:?}", peer, user, ctx.protocol);
+                    let claimed = ctx.user_info.and_then(|u| u.effective_user).unwrap_or_default();
+                    debug!("{}: connection context user={:?} protocol={:?}", peer, claimed, ctx.protocol);
+                    match handler.authentication() {
+                        Authentication::Simple => user = claimed,
+                        Authentication::Kerberos(_) => {
+                            let Some((principal, short)) = &authenticated else {
+                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED)).await;
+                                return Ok(());
+                            };
+                            let Some(short) = short else {
+                                let msg = format!("No auth_to_local rule maps {} to a user", principal);
+                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, &msg)).await;
+                                return Ok(());
+                            };
+                            // The client names itself (full principal or short
+                            // name); anyone else would be impersonation.
+                            if !claimed.is_empty() && claimed != *principal && claimed != *short {
+                                let msg = format!("User {} (auth:KERBEROS) is not authorized to impersonate {}", principal, claimed);
+                                warn!("{}: {}", peer, msg);
+                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, &msg)).await;
+                                return Ok(());
+                            }
+                            user = short.clone();
+                        }
+                    }
                 }
                 CALL_ID_PING => {}
                 id if id >= 0 => {
+                    if matches!(handler.authentication(), Authentication::Kerberos(_)) && user.is_empty() {
+                        let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, SIMPLE_NOT_ENABLED)).await;
+                        return Ok(());
+                    }
                     let parsed = take_delimited::<RequestHeaderProto>(&mut buf)
                         .and_then(|rh| take_delimited_bytes(&mut buf).map(|body| (rh, body)));
                     let (rh, body) = match parsed {
@@ -314,6 +525,62 @@ where
 mod tests {
     use super::*;
     use bytes::Buf;
+
+    fn server(principal: &str) -> KerberosServer {
+        let (name, realm) = principal.split_once('@').unwrap();
+        let (protocol, server_id) = name.split_once('/').unwrap();
+        KerberosServer {
+            keytab: krb5::Keytab::from_keys(Vec::new()),
+            principal: principal.into(),
+            protocol: protocol.into(),
+            server_id: server_id.into(),
+            realm: realm.into(),
+        }
+    }
+
+    #[test]
+    fn principals_map_to_short_names_by_the_default_rule() {
+        let k = server("nn/nn.example.com@EXAMPLE.COM");
+        assert_eq!(k.short_name("alice@EXAMPLE.COM").as_deref(), Some("alice"));
+        assert_eq!(k.short_name("hdfs/dn1.example.com@EXAMPLE.COM").as_deref(), Some("hdfs"));
+        // Another realm has no local name; nor does a malformed principal.
+        assert_eq!(k.short_name("alice@OTHER.COM"), None);
+        assert_eq!(k.short_name("alice"), None);
+        assert_eq!(k.short_name("@EXAMPLE.COM"), None);
+    }
+
+    #[test]
+    fn a_kerberos_server_needs_service_host_realm_and_a_key() {
+        let dir = std::env::temp_dir().join(format!("pillar-kt-{}", std::process::id()));
+        let missing = dir.join("none.keytab");
+        for bad in ["nn@EXAMPLE.COM", "nn/host", "alice"] {
+            let e = KerberosServer::new(&missing, bad).err().expect(bad);
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{bad}");
+        }
+        let e = KerberosServer::new(&missing, "nn/host@EXAMPLE.COM").err().expect("no keytab");
+        assert!(e.to_string().contains("keytab"), "{e}");
+    }
+
+    #[test]
+    fn negotiation_offers_kerberos_and_steps_are_ordered() {
+        let k = server("nn/localhost@PILLAR.TEST");
+        let mut g = Gssapi::default();
+        let offer = g.step(&k, &RpcSaslProto { state: SaslState::Negotiate as i32, ..Default::default() }).unwrap();
+        assert_eq!(offer.state, SaslState::Negotiate as i32);
+        let a = &offer.auths[0];
+        assert_eq!((a.method.as_str(), a.mechanism.as_str()), ("KERBEROS", "GSSAPI"));
+        assert_eq!((a.protocol.as_deref(), a.server_id.as_deref()), (Some("nn"), Some("localhost")));
+        // A RESPONSE before INITIATE, or a non-GSSAPI mechanism, is refused.
+        let resp = RpcSaslProto { state: SaslState::Response as i32, ..Default::default() };
+        assert!(g.step(&k, &resp).is_err());
+        let digest = RpcSaslProto {
+            state: SaslState::Initiate as i32,
+            auths: vec![rpc_sasl_proto::SaslAuth { method: "TOKEN".into(), mechanism: "DIGEST-MD5".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(g.step(&k, &digest).is_err());
+        assert!(g.principal.is_none());
+    }
 
     #[test]
     fn negative_call_ids_keep_their_bits_in_the_uint32_reply() {
