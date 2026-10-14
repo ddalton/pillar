@@ -10,6 +10,9 @@
 //! refuses further transactions: memory and disk may have diverged.
 //!
 //! On disk, in `<name_dir>/current`:
+//! * `VERSION`: the namespace's [`StorageIdentity`], made when the
+//!   directory is formatted; DataNodes refuse a NameNode whose identity
+//!   differs from the one on their volumes;
 //! * `fsimage_<txid>`: the whole namespace as of transaction `txid`;
 //! * `edits_<txid>`: the transactions from `txid` on, one segment per
 //!   checkpoint.
@@ -29,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use pillar_common::hdfs::storage_identity::StorageIdentity;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
@@ -147,8 +151,25 @@ struct ImageHeader {
     inodes: u64,
 }
 
+/// A new namespace identity (HDFS `NNStorage.newClusterID` and friends):
+/// `cluster_id` if given, else a random `CID-<uuid>`; a random positive
+/// namespace id; a block pool id derived from both.
+pub fn new_identity(cluster_id: Option<&str>) -> StorageIdentity {
+    let namespace_id = rand::random::<u32>() % (i32::MAX as u32) + 1;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    StorageIdentity {
+        cluster_id: cluster_id.map(str::to_string).unwrap_or_else(|| format!("CID-{}", uuid::Uuid::new_v4())),
+        namespace_id,
+        block_pool_id: format!("BP-{}-pillar-{}", namespace_id, millis),
+    }
+}
+
 /// What [`EditLog::open`] recovered.
 pub struct Recovered {
+    pub identity: StorageIdentity,
     pub namespace: Namespace,
     pub counters: Counters,
     /// Last transaction applied.
@@ -336,6 +357,12 @@ impl EditLog {
     /// Open (or format) the name directory, recover the namespace, and
     /// return a log ready for new transactions.
     pub async fn open(name_dir: &Path) -> io::Result<(Self, Recovered)> {
+        Self::open_with(name_dir, None).await
+    }
+
+    /// [`EditLog::open`]; `cluster_id` names the cluster when formatting,
+    /// and must match the directory's when it is already formatted.
+    pub async fn open_with(name_dir: &Path, cluster_id: Option<&str>) -> io::Result<(Self, Recovered)> {
         let dir = name_dir.join("current");
         fs::create_dir_all(&dir)?;
         let lock = File::create(name_dir.join("in_use.lock"))?;
@@ -346,15 +373,38 @@ impl EditLog {
             )
         })?;
 
+        let version = dir.join("VERSION");
+        let mut identity = StorageIdentity::read(&version)?;
         let mut images = list(&dir, "fsimage_")?;
         if images.is_empty() {
             if !list(&dir, "edits_")?.is_empty() {
                 return Err(invalid(format!("{}: edits but no fsimage", dir.display())));
             }
-            info!("Formatting empty name directory {}", name_dir.display());
+            let id = identity.take().unwrap_or_else(|| new_identity(cluster_id));
+            id.write(&version, "NAME_NODE")?;
+            info!("Formatting empty name directory {} ({})", name_dir.display(), id);
+            identity = Some(id);
             let ns = Namespace::new();
             write_image(&dir, 0, Counters::of(&ns, &BlockManager::new()), &ns.records().await)?;
             images = list(&dir, "fsimage_")?;
+        }
+        let identity = match identity {
+            Some(id) => id,
+            None => {
+                // Formatted before identities existed.
+                let id = new_identity(cluster_id);
+                warn!("{} has no VERSION; assigning {}", dir.display(), id);
+                id.write(&version, "NAME_NODE")?;
+                id
+            }
+        };
+        if let Some(want) = cluster_id {
+            if want != identity.cluster_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} belongs to cluster {}, not {}", name_dir.display(), identity.cluster_id, want),
+                ));
+            }
         }
 
         // Newest readable image (an older one is kept for this case).
@@ -416,7 +466,7 @@ impl EditLog {
             checkpointing: Mutex::new(()),
             _lock: lock,
         };
-        Ok((Self::new(txid, Some(disk)), Recovered { namespace, counters, txid, replayed }))
+        Ok((Self::new(txid, Some(disk)), Recovered { identity, namespace, counters, txid, replayed }))
     }
 }
 
@@ -849,5 +899,21 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(nn);
         EditLog::open(dir.path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_identity_is_made_at_format_and_kept() {
+        let dir = TempDir::new().unwrap();
+        let (_, first) = EditLog::open_with(dir.path(), Some("CID-test")).await.unwrap();
+        assert_eq!(first.identity.cluster_id, "CID-test");
+        assert!(first.identity.namespace_id > 0);
+        let (_, again) = EditLog::open(dir.path()).await.unwrap();
+        assert_eq!(again.identity, first.identity);
+        let err = EditLog::open_with(dir.path(), Some("CID-other")).await.err().expect("wrong cluster id");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // A fresh directory is a different namespace.
+        let other = TempDir::new().unwrap();
+        let (_, fresh) = EditLog::open(other.path()).await.unwrap();
+        assert_ne!(fresh.identity, first.identity);
     }
 }

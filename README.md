@@ -329,7 +329,16 @@ before answering, the way HDFS does (`dfs.namenode.name.dir`):
   dropped; corruption anywhere else stops startup.
 - Block **locations** are not persisted: DataNodes are told to re-register
   when they heartbeat a NameNode that does not know them, and send a full
-  block report.
+  block report. Replicas the namespace does not know (their file was
+  deleted, possibly before a crash lost the pending deletion) or with a
+  stale generation stamp are deleted.
+- Formatting a name directory gives the namespace an **identity** (cluster
+  id, namespace id, block pool id in `current/VERSION`; `--cluster-id`
+  picks the cluster id). Each DataNode records it on its volume when it
+  first joins, and refuses a NameNode with any other identity: a NameNode
+  started on an empty or wrong directory gets no DataNodes, and so cannot
+  delete their replicas as unknown. A volume that holds blocks but no
+  `VERSION` is refused too.
 - A lock file stops two NameNodes from using the same directory.
 
 Without `--name-dir` the namespace is in memory only and lost on restart

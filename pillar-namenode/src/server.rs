@@ -48,6 +48,10 @@ pub struct NameNodeConfig {
 
     /// ...or this long after the last checkpoint, if anything changed.
     pub checkpoint_period: std::time::Duration,
+
+    /// Cluster id to format a new name directory with (HDFS
+    /// `namenode -format -clusterid`); must match an existing one.
+    pub cluster_id: Option<String>,
 }
 
 impl Default for NameNodeConfig {
@@ -65,6 +69,7 @@ impl Default for NameNodeConfig {
             name_dir: None,
             checkpoint_txns: 1_000_000,
             checkpoint_period: std::time::Duration::from_secs(3600),
+            cluster_id: None,
         }
     }
 }
@@ -147,6 +152,7 @@ pub struct NameNode {
     datanode_manager: Arc<DatanodeManager>,
     placement_policy: Arc<BlockPlacementPolicy>,
     edit_log: Arc<EditLog>,
+    identity: pillar_common::hdfs::storage_identity::StorageIdentity,
 }
 
 impl NameNode {
@@ -176,9 +182,9 @@ impl NameNode {
         // Initialize core components, recovering the namespace if it is
         // persisted.
         let block_manager = Arc::new(BlockManager::new());
-        let (namespace, edit_log) = match &config.name_dir {
+        let (namespace, edit_log, identity) = match &config.name_dir {
             Some(dir) => {
-                let (log, recovered) = EditLog::open(dir)
+                let (log, recovered) = EditLog::open_with(dir, config.cluster_id.as_deref())
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to load namespace from {}: {}", dir.display(), e))?;
                 recovered.restore_blocks(&block_manager).await;
@@ -189,13 +195,15 @@ impl NameNode {
                     block_manager.get_total_blocks(),
                     recovered.txid
                 );
-                (recovered.namespace, log)
+                (recovered.namespace, log, recovered.identity)
             }
             None => {
                 tracing::warn!("No name directory: the namespace is kept in memory and lost on restart");
-                (Namespace::new(), EditLog::in_memory())
+                let identity = crate::metadata::edit_log::new_identity(config.cluster_id.as_deref());
+                (Namespace::new(), EditLog::in_memory(), identity)
             }
         };
+        info!("Namespace identity: {}", identity);
         let namespace = Arc::new(namespace);
         let edit_log = Arc::new(edit_log);
         let datanode_manager = Arc::new(DatanodeManager::new());
@@ -213,6 +221,7 @@ impl NameNode {
             datanode_manager,
             placement_policy,
             edit_log,
+            identity,
         })
     }
 
@@ -243,7 +252,8 @@ impl NameNode {
         let datanode_service = DatanodeProtocolService::new(
             self.datanode_manager.clone(),
             self.block_manager.clone(),
-        );
+        )
+        .with_identity(self.identity.clone());
 
         info!("gRPC services initialized");
 

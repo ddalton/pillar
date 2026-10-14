@@ -106,6 +106,12 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
             datanode_id.host_name
         );
 
+        let storage = &registration.storage_info;
+        if let Err(e) = self.service.check_identity(&storage.cluster_id, storage.namespce_id) {
+            warn!("Refusing DataNode {}: {}", datanode_id.datanode_uuid, e.message());
+            return Err(e);
+        }
+
         match self.service
             .handle_register_datanode(datanode_id)
             .await
@@ -264,15 +270,16 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
         &self,
         _request: Request<VersionRequestProto>,
     ) -> Result<Response<VersionResponseProto>, Status> {
+        let id = self.service.identity();
         Ok(Response::new(VersionResponseProto {
             info: NamespaceInfoProto {
                 build_version: env!("CARGO_PKG_VERSION").to_string(),
                 unused: 0,
-                block_pool_id: "BP-pillar-001".to_string(),
+                block_pool_id: id.block_pool_id.clone(),
                 storage_info: StorageInfoProto {
                     layout_version: 1,
-                    namespce_id: 1,  // Note: proto has typo "namespce_id"
-                    cluster_id: "pillar-cluster".to_string(),
+                    namespce_id: id.namespace_id,  // Note: proto has typo "namespce_id"
+                    cluster_id: id.cluster_id.clone(),
                     c_time: 0,
                 },
                 software_version: env!("CARGO_PKG_VERSION").to_string(),
