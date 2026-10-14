@@ -327,14 +327,17 @@ impl NamenodeClient {
     /// Send a full block report to NameNode (HDFS BlockListAsLongs encoding,
     /// with each replica's length and generation stamp).
     pub async fn send_block_report(&self) -> Result<()> {
-        let blocks: Vec<ReportedBlock> = self
-            .block_storage
-            .get_all_blocks()
-            .into_iter()
-            .map(|(id, num_bytes)| ReportedBlock {
+        // Finalized replicas, and those being written (so a NameNode that
+        // restarted learns the pipelines of open files' last blocks).
+        let finalized = self.block_storage.get_all_blocks().into_iter().map(|b| (b, false));
+        let rbw = self.block_storage.get_rbw_blocks().into_iter().map(|b| (b, true));
+        let blocks: Vec<ReportedBlock> = finalized
+            .chain(rbw)
+            .map(|((id, num_bytes), under_construction)| ReportedBlock {
                 block_id: id.block_id,
                 num_bytes,
                 generation_stamp: id.generation_stamp,
+                under_construction,
             })
             .collect();
 
@@ -543,7 +546,50 @@ impl NamenodeClient {
                 warn!("Received shutdown command from NameNode (not implemented; ignoring)");
             }
             DatanodeCommand::Register => debug!("Register is handled by the heartbeat loop"),
+            DatanodeCommand::RecoverBlocks { blocks } => {
+                for (block, ids) in blocks {
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        info!("Recovering block {} (new stamp {})", block.block_id, block.new_generation_stamp);
+                        match crate::recovery::recover(&block).await {
+                            Ok(done) => {
+                                if let Err(e) = this.commit_block_synchronization(&block, &done, &ids).await {
+                                    warn!("Reporting the recovery of block {} failed: {}", block.block_id, e);
+                                }
+                            }
+                            // The NameNode retries the recovery later.
+                            Err(e) => warn!("Recovery of block {} failed: {}", block.block_id, e),
+                        }
+                    });
+                }
+            }
         }
+    }
+
+    /// Tell the NameNode how a block recovery ended, which closes the file.
+    async fn commit_block_synchronization(
+        &self,
+        block: &crate::recovery::RecoveringBlock,
+        done: &crate::recovery::Recovered,
+        pipeline: &[pillar_proto::hdfs::DatanodeIdProto],
+    ) -> Result<()> {
+        let targets: Vec<_> = pipeline.iter().filter(|d| done.holders.contains(&d.datanode_uuid)).cloned().collect();
+        let request = pillar_proto::hdfs::datanode::CommitBlockSynchronizationRequestProto {
+            block: pillar_proto::hdfs::ExtendedBlockProto {
+                pool_id: self.block_pool_id.clone(),
+                block_id: block.block_id,
+                generation_stamp: block.generation_stamp,
+                num_bytes: Some(done.length),
+            },
+            new_gen_stamp: block.new_generation_stamp,
+            new_length: done.length,
+            close_file: true,
+            delete_block: done.delete,
+            new_target_storages: targets.iter().map(|t| t.datanode_uuid.clone()).collect(),
+            new_taragets: targets,
+        };
+        self.client().commit_block_synchronization(Request::new(request)).await?;
+        Ok(())
     }
 
     /// Register again and report every replica, so a restarted NameNode
@@ -586,6 +632,9 @@ pub enum DatanodeCommand {
     /// The NameNode does not know this DataNode (it restarted, or declared
     /// the node dead): register again and send a full block report.
     Register,
+    /// Settle blocks whose writer is gone (block recovery); each with the
+    /// pipeline DataNodes' ids, to report back the ones recovered.
+    RecoverBlocks { blocks: Vec<(crate::recovery::RecoveringBlock, Vec<pillar_proto::hdfs::DatanodeIdProto>)> },
 }
 
 fn replication_target(info: &DatanodeInfoProto) -> ReplicationTarget {
@@ -609,6 +658,31 @@ fn replication_target(info: &DatanodeInfoProto) -> ReplicationTarget {
 pub fn parse_command(cmd: DatanodeCommandProto) -> Option<DatanodeCommand> {
     if cmd.cmd_type == datanode_command_proto::Type::RegisterCommand as i32 {
         return Some(DatanodeCommand::Register);
+    }
+    if cmd.cmd_type == datanode_command_proto::Type::BlockRecoveryCommand as i32 {
+        let blocks = cmd
+            .recovery_cmd?
+            .blocks
+            .into_iter()
+            .map(|rb| {
+                let b = &rb.block.b;
+                let targets = rb
+                    .block
+                    .locs
+                    .iter()
+                    .map(|l| (l.id.datanode_uuid.clone(), format!("{}:{}", l.id.ip_addr, l.id.xfer_port)))
+                    .collect();
+                let ids = rb.block.locs.iter().map(|l| l.id.clone()).collect();
+                let recovering = crate::recovery::RecoveringBlock {
+                    block_id: b.block_id,
+                    generation_stamp: b.generation_stamp,
+                    new_generation_stamp: rb.new_gen_stamp,
+                    targets,
+                };
+                (recovering, ids)
+            })
+            .collect();
+        return Some(DatanodeCommand::RecoverBlocks { blocks });
     }
     if cmd.cmd_type != datanode_command_proto::Type::BlockCommand as i32 {
         debug!("Ignoring DataNode command type {}", cmd.cmd_type);

@@ -4,6 +4,7 @@ use tracing::{debug, info, warn};
 
 use crate::metadata::{Namespace, BlockManager, EditLog, EditOp, EditTxn};
 use crate::metadata::edit_log::{InodeAttributes, InodeRecord};
+use crate::grpc::datanode_protocol_service::DatanodeCommand;
 use crate::metadata::lease_manager::LeaseManager;
 use crate::metadata::namespace::{FsPermission, INode, UnderConstruction};
 use crate::metadata::block_manager::{BlockId, DatanodeId};
@@ -24,7 +25,23 @@ pub struct ClientNamenodeService {
     block_pool_id: String,
     /// Who holds which open files.
     leases: Arc<LeaseManager>,
+    /// Where to send block recovery commands (DataNode heartbeats); without
+    /// it, lease recovery settles the last block from reports alone.
+    datanode_commands: std::sync::OnceLock<Arc<crate::grpc::DatanodeProtocolService>>,
+    /// Block recoveries under way, by inode.
+    recovering: dashmap::DashMap<u64, Recovering>,
 }
+
+/// A block recovery under way.
+struct Recovering {
+    #[allow(dead_code)]
+    block: BlockId,
+    started: tokio::time::Instant,
+}
+
+/// How long a block recovery may take before it is started again (HDFS
+/// retries a recovery once the lease's recovery has stalled).
+const BLOCK_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ClientNamenodeService {
     pub fn new(
@@ -43,7 +60,14 @@ impl ClientNamenodeService {
             default_replication: 3,
             block_pool_id: "BP-pillar-001".to_string(),
             leases: Arc::new(LeaseManager::default()),
+            datanode_commands: std::sync::OnceLock::new(),
+            recovering: dashmap::DashMap::new(),
         }
+    }
+
+    /// Send block recovery commands through `commands`.
+    pub fn set_datanode_commands(&self, commands: Arc<crate::grpc::DatanodeProtocolService>) {
+        let _ = self.datanode_commands.set(commands);
     }
 
     /// Use `leases` (e.g. with other soft/hard limits).
@@ -86,11 +110,14 @@ impl ClientNamenodeService {
             }
             (inode.id, inode.under_construction.as_ref().map(|uc| uc.holder.clone()))
         };
-        if let Some(holder) = holder {
-            info!("recoverLease({}) by {}: recovering {}'s lease", path, client, holder);
-            self.recover_file(id).await?;
+        match holder {
+            Some(holder) => {
+                info!("recoverLease({}) by {}: recovering {}'s lease", path, client, holder);
+                // False while a block recovery is under way: clients retry.
+                self.recover_file(id).await
+            }
+            None => Ok(true),
         }
-        Ok(true)
     }
 
     /// listOpenFiles: (inode id, path, holder) of every open file.
@@ -110,7 +137,7 @@ impl ClientNamenodeService {
     pub async fn check_leases(&self) -> usize {
         let expired = self.leases.hard_expired();
         for (holder, id) in &expired {
-            warn!("Lease of {} on inode {} passed the hard limit; recovering the file", holder, id);
+            debug!("Lease of {} on inode {} passed the hard limit; recovering the file", holder, id);
             if let Err(e) = self.recover_file(*id).await {
                 warn!("Recovering inode {}: {}", id, e);
             }
@@ -122,15 +149,56 @@ impl ClientNamenodeService {
     /// being written keeps the length a DataNode reported when it finished
     /// the block; if no DataNode finished it, no data in it was ever
     /// acknowledged (Pillar has no hflush yet), so it is dropped.
-    async fn recover_file(&self, inode_id: u64) -> Result<(), Status> {
+    async fn recover_file(&self, inode_id: u64) -> Result<bool, Status> {
         let mut tx = self.begin().await?;
-        let Some(inode) = self.namespace.get_inode(inode_id) else { return Ok(()) };
+        let Some(inode) = self.namespace.get_inode(inode_id) else { return Ok(true) };
         let mut guard = inode.write().await;
-        let Some(uc) = guard.under_construction.clone() else { return Ok(()) };
+        let Some(uc) = guard.under_construction.clone() else { return Ok(true) };
         if let Some(open) = guard.open_block().cloned() {
             let id = BlockId::new(open.block_id, open.generation_stamp);
+            let finished = self.block_manager.get_replica_count(&id) > 0;
+            // No DataNode finished the block: ask its pipeline (block
+            // recovery) for the length every replica has, if any of it is
+            // alive. The file stays open until the DataNode reports back.
+            if !finished {
+                if let Some(commands) = self.datanode_commands.get() {
+                    let live: std::collections::HashSet<String> =
+                        self.datanode_manager.get_live_datanodes().into_iter().map(|d| d.id.uuid).collect();
+                    let expected = self.block_manager.get_expected_locations(&id);
+                    let pipeline: Vec<DatanodeId> = expected.iter().filter(|d| live.contains(&d.uuid)).cloned().collect();
+                    if !expected.is_empty() && pipeline.is_empty() {
+                        // Its DataNodes are all down: wait for one to come
+                        // back (HDFS does too) rather than lose the block.
+                        debug!("Lease recovery of inode {}: no DataNode of block {} is alive; retrying later", inode_id, open.block_id);
+                        return Ok(false);
+                    }
+                    if !pipeline.is_empty() {
+                        if let Some(r) = self.recovering.get(&inode_id) {
+                            if r.started.elapsed() < BLOCK_RECOVERY_TIMEOUT {
+                                return Ok(false);
+                            }
+                            warn!("Recovery of block {} timed out; starting it again", open.block_id);
+                        }
+                        // The stamp is reserved in the edit log, so it is
+                        // never handed out again even if this NameNode
+                        // restarts before the recovery is committed.
+                        let new_gs = self.block_manager.allocate_generation_stamp().await;
+                        tx.log(EditOp::ReserveGenerationStamp { generation_stamp: new_gs });
+                        drop(guard);
+                        tx.commit().await.map_err(edit_status)?;
+                        let primary = pipeline[0].uuid.clone();
+                        commands.queue_command(
+                            &primary,
+                            DatanodeCommand::RecoverBlocks { blocks: vec![(id, new_gs, pipeline)] },
+                        );
+                        self.recovering.insert(inode_id, Recovering { block: id, started: tokio::time::Instant::now() });
+                        info!("Lease recovery of inode {}: recovering block {} on {} (new stamp {})", inode_id, open.block_id, primary, new_gs);
+                        return Ok(false);
+                    }
+                }
+            }
             let blocks = guard.blocks.as_mut().expect("a file");
-            if self.block_manager.get_replica_count(&id) > 0 || open.num_bytes > 0 {
+            if finished || open.num_bytes > 0 {
                 // A finished replica, or committed data from before an
                 // append: keep the block at the length known for it.
                 let len = self.block_manager.get_block_info(&id).map_or(open.num_bytes, |b| b.num_bytes.max(open.num_bytes));
@@ -139,7 +207,7 @@ impl ClientNamenodeService {
             } else {
                 blocks.pop();
                 self.block_manager.remove_block(&id);
-                info!("Lease recovery of inode {}: block {} dropped (no DataNode finished it)", inode_id, open.block_id);
+                info!("Lease recovery of inode {}: block {} dropped (no live DataNode has it)", inode_id, open.block_id);
             }
             tx.log(EditOp::SetBlocks { inode: inode_id, blocks: blocks.clone() });
         }
@@ -148,7 +216,81 @@ impl ClientNamenodeService {
         tx.log(EditOp::Close { inode: inode_id });
         tx.commit().await.map_err(edit_status)?;
         self.leases.remove(&uc.holder, inode_id);
+        self.recovering.remove(&inode_id);
+        Ok(true)
+    }
+
+    /// commitBlockSynchronization: a DataNode finished recovering `block`
+    /// (the generation stamp the recovery was started with): its replicas on
+    /// `holders` are `new_length` bytes with `new_generation_stamp`, or the
+    /// block had no replica left (`delete_block`). Closes the file.
+    pub async fn handle_commit_block_synchronization(
+        &self,
+        block: BlockId,
+        new_generation_stamp: u64,
+        new_length: u64,
+        close_file: bool,
+        delete_block: bool,
+        holders: &[String],
+    ) -> Result<(), Status> {
+        let info = self.block_manager.get_block_info(&block).ok_or_else(|| {
+            Status::not_found(format!("commitBlockSynchronization: no block {:?}", block))
+        })?;
+        let inode = self.namespace.get_inode(info.inode_id).ok_or_else(|| {
+            Status::not_found(format!("commitBlockSynchronization: the file of block {} is gone", block.block_id))
+        })?;
+        let mut tx = self.begin().await?;
+        let mut guard = inode.write().await;
+        let Some(uc) = guard.under_construction.clone() else {
+            // Closed meanwhile (e.g. a second recovery report).
+            return Ok(());
+        };
+        let inode_id = guard.id;
+        let blocks = guard.blocks.as_mut().expect("a file");
+        let Some(pos) = blocks.iter().position(|b| b.block_id == block.block_id) else {
+            return Err(Status::not_found(format!("block {} is not in its file", block.block_id)));
+        };
+        if delete_block {
+            blocks.remove(pos);
+            self.block_manager.remove_block(&block);
+            info!("Block recovery: block {} had no replica; removed", block.block_id);
+        } else {
+            let new = BlockId::new(block.block_id, new_generation_stamp);
+            self.block_manager.update_generation_stamp(block, new);
+            let _ = self.block_manager.update_block_size(&new, new_length);
+            blocks[pos].generation_stamp = new_generation_stamp;
+            blocks[pos].num_bytes = new_length;
+            for uuid in holders {
+                if let Some(dn) = self.datanode_manager.get_datanode(uuid) {
+                    self.block_manager.add_block_location(new, dn.id);
+                }
+            }
+            self.block_manager.clear_expected_locations(&new);
+            info!("Block recovery: block {} is {} bytes on {:?} (stamp {})", block.block_id, new_length, holders, new_generation_stamp);
+        }
+        tx.log(EditOp::SetBlocks { inode: inode_id, blocks: blocks.clone() });
+        if close_file {
+            guard.under_construction = None;
+            tx.log(EditOp::Close { inode: inode_id });
+        }
+        drop(guard);
+        tx.commit().await.map_err(edit_status)?;
+        if close_file {
+            self.leases.remove(&uc.holder, inode_id);
+            self.recovering.remove(&inode_id);
+        }
         Ok(())
+    }
+
+    /// Whether block `block_id` (any stamp) is the block being written of a
+    /// file still open: a replica of it with a newer stamp than the
+    /// NameNode's is from a recovery not yet committed, and must be kept.
+    pub async fn is_block_being_written(&self, block_id: u64) -> bool {
+        let Some(id) = self.block_manager.find_block(block_id) else { return false };
+        let Some(info) = self.block_manager.get_block_info(&id) else { return false };
+        let Some(inode) = self.namespace.get_inode(info.inode_id) else { return false };
+        let inode = inode.read().await;
+        inode.open_block().is_some_and(|b| b.block_id == block_id)
     }
 
     /// Before `client` opens an existing file: if another writer has it
@@ -165,7 +307,14 @@ impl ClientNamenodeService {
         };
         if holder != client && self.leases.soft_expired(&holder) {
             info!("{} {} by {}: {}'s lease expired; recovering the file", op, path, client, holder);
-            return self.recover_file(id).await;
+            if self.recover_file(id).await? {
+                return Ok(());
+            }
+            return Err(crate::ipc::hadoop_status(
+                tonic::Code::Unavailable,
+                "org.apache.hadoop.hdfs.protocol.RecoveryInProgressException",
+                format!("Failed to {} {}: recovery of the file's last block is in progress", op, path),
+            ));
         }
         Err(already_being_created(format!(
             "Failed to {} {} for {}: the file is open for writing by {}",
@@ -4100,6 +4249,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_recovery_hands_a_block_with_a_live_pipeline_to_block_recovery() {
+        let namespace = Arc::new(Namespace::new());
+        let blocks = Arc::new(BlockManager::new());
+        // DataNodes that stop heartbeating are dead within a second.
+        let datanodes = Arc::new(DatanodeManager::with_intervals(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(1),
+        ));
+        for i in 0..3 {
+            datanodes.register(DatanodeId::new(format!("dn{i}"), format!("h{i}"), 1), 1 << 30).unwrap();
+            let storage = crate::datanode::manager::StorageInfo { capacity: 1 << 30, used: 0, remaining: 1 << 30, block_pool_used: 0 };
+            datanodes.heartbeat(&format!("dn{i}"), storage, 0, 0).unwrap();
+        }
+        let placement = Arc::new(BlockPlacementPolicy::new(datanodes.clone(), 3));
+        let service = Arc::new(ClientNamenodeService::new(namespace.clone(), blocks.clone(), datanodes.clone(), placement));
+        let commands = Arc::new(crate::grpc::DatanodeProtocolService::new(datanodes.clone(), blocks.clone()));
+        service.set_datanode_commands(commands.clone());
+        commands.set_namespace_service(&service);
+
+        open_as(&service, "/f", "alice").await;
+        let b = service.handle_add_block_as("/f", "alice", &[]).await.unwrap();
+        let block = BlockId::new(b.block_id, b.generation_stamp);
+
+        // No finished replica, a live pipeline: recovery is handed to its
+        // first DataNode, and the file stays open meanwhile.
+        assert!(!service.handle_recover_lease("/f", "bob").await.unwrap());
+        let primary = &b.locations[0].uuid;
+        let sent = commands.take_commands(primary);
+        let new_gs = match &sent[..] {
+            [DatanodeCommand::RecoverBlocks { blocks }] => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].0, block);
+                assert_eq!(blocks[0].2.len(), b.locations.len());
+                blocks[0].1
+            }
+            other => panic!("expected a recovery command, got {other:?}"),
+        };
+        assert!(new_gs > block.generation_stamp);
+        // Asked again while it runs: still open, no second command.
+        assert!(!service.handle_recover_lease("/f", "bob").await.unwrap());
+        assert!(commands.take_commands(primary).is_empty());
+
+        // The DataNode reports back: block settled, file closed.
+        let holders = vec![primary.clone()];
+        commands.handle_commit_block_synchronization(block, new_gs, 777, true, false, &holders).await.unwrap();
+        assert!(service.handle_is_file_closed("/f").await.unwrap());
+        let located = service.handle_get_located_blocks("/f", 0, u64::MAX).await.unwrap();
+        assert_eq!(located.file_length, 777);
+        assert_eq!(located.blocks[0].generation_stamp, new_gs);
+        assert_eq!(located.blocks[0].locations.len(), 1);
+        assert!(service.handle_recover_lease("/f", "bob").await.unwrap());
+
+        // A block whose whole pipeline is down stays open (to be retried),
+        // rather than being dropped.
+        open_as(&service, "/g", "alice").await;
+        service.handle_add_block_as("/g", "alice", &[]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await; // no heartbeats: all dead
+        assert!(datanodes.get_live_datanodes().is_empty());
+        assert!(!service.handle_recover_lease("/g", "bob").await.unwrap());
+        assert!(!service.handle_is_file_closed("/g").await.unwrap());
+    }
+
+        #[tokio::test]
     async fn recover_lease_closes_now_and_delete_releases_the_lease() {
         let (service, _) = service_with_leases(60_000, 1_200_000);
         open_as(&service, "/r", "alice").await;

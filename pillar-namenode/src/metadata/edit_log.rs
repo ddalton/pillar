@@ -126,6 +126,9 @@ pub enum EditOp {
     Open { inode: u64, holder: String, blocks_at_open: u32 },
     /// The file is closed: complete(), or lease recovery.
     Close { inode: u64 },
+    /// A generation stamp handed out for a block recovery, so it is never
+    /// handed out again (HDFS logs every stamp it allocates).
+    ReserveGenerationStamp { generation_stamp: u64 },
 }
 
 /// Open files, after the inode records in an image (absent in images
@@ -570,6 +573,9 @@ async fn apply(ns: &Namespace, op: &EditOp, counters: &mut Counters) -> Result<(
         }
         EditOp::Close { inode } => {
             file(*inode)?.write().await.under_construction = None;
+        }
+        EditOp::ReserveGenerationStamp { generation_stamp } => {
+            counters.next_generation_stamp = counters.next_generation_stamp.max(generation_stamp + 1);
         }
         EditOp::Concat { target, sources } => {
             let t = ns.lookup(target).await.map_err(|e| e.to_string())?;

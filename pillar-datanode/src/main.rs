@@ -4,6 +4,7 @@ mod server;
 mod transport;
 mod replication;
 mod ipc;
+mod recovery;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

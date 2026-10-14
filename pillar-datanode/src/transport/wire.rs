@@ -139,6 +139,35 @@ where
                     return Ok(());
                 }
             }
+            Some(DataTransferOp::ReplicaInfo) => match storage.recovery_info(h.block_id) {
+                Some((finalized, id, len)) => {
+                    let mut b = [0u8; 18];
+                    b[0] = STATUS_OK;
+                    b[1] = finalized as u8;
+                    b[2..10].copy_from_slice(&id.generation_stamp.to_be_bytes());
+                    b[10..18].copy_from_slice(&len.to_be_bytes());
+                    socket.write_all(&b).await?;
+                    socket.flush().await?;
+                }
+                None => reply_error(&mut socket, STATUS_NOT_FOUND, &format!("no replica of block {}", h.block_id)).await?,
+            },
+            Some(DataTransferOp::RecoverReplica) => {
+                let s = storage.clone();
+                let (id, gs, len) = (h.block_id, h.gen_stamp, h.length);
+                let r = tokio::task::spawn_blocking(move || super::hdfs_dtp::finalize_recovered(&s, id, gs, len))
+                    .await
+                    .map_err(|e| TransportError::ProtocolError(e.to_string()))?;
+                match r {
+                    Ok(stored) => {
+                        let mut b = [0u8; 9];
+                        b[0] = STATUS_OK;
+                        b[1..].copy_from_slice(&stored.to_be_bytes());
+                        socket.write_all(&b).await?;
+                        socket.flush().await?;
+                    }
+                    Err(e) => reply_error(&mut socket, STATUS_ERROR, &e).await?,
+                }
+            }
             other => {
                 let msg = format!("operation {:?} ({}) not supported", other, op);
                 reply_error(&mut socket, STATUS_ERROR, &msg).await?;
@@ -311,6 +340,39 @@ where
 }
 
 // ------------------------------------------------------------------ client
+
+/// Block recovery: the replica of `block_id` at `peer` as (finalized?,
+/// generation stamp, length), or `None` if it has none.
+pub async fn replica_info(peer: &str, block_id: u64) -> Result<Option<(bool, u64, u64)>> {
+    let mut s = connect(peer).await?;
+    let h = Header { op: DataTransferOp::ReplicaInfo.to_u8(), block_id, gen_stamp: 0, offset: 0, length: 0 };
+    s.write_all(&h.encode()).await?;
+    s.flush().await?;
+    let status = s.read_u8().await?;
+    if status == STATUS_OK {
+        let finalized = s.read_u8().await? != 0;
+        let gs = s.read_u64().await?;
+        let len = s.read_u64().await?;
+        return Ok(Some((finalized, gs, len)));
+    }
+    let n = s.read_u16().await? as usize;
+    let mut msg = vec![0u8; n];
+    s.read_exact(&mut msg).await?;
+    match status {
+        STATUS_NOT_FOUND => Ok(None),
+        _ => Err(TransportError::ProtocolError(String::from_utf8_lossy(&msg).into_owned())),
+    }
+}
+
+/// Block recovery: have `peer` cut its replica of `block_id` to `len`,
+/// give it `recovery_gs` and finalize it. Returns the finalized length.
+pub async fn recover_replica(peer: &str, block_id: u64, recovery_gs: u64, len: u64) -> Result<u64> {
+    let mut s = connect(peer).await?;
+    let h = Header { op: DataTransferOp::RecoverReplica.to_u8(), block_id, gen_stamp: recovery_gs, offset: 0, length: len };
+    s.write_all(&h.encode()).await?;
+    s.flush().await?;
+    read_status(&mut s, block_id).await
+}
 
 async fn read_status<S: AsyncRead + Unpin>(socket: &mut S, block_id: u64) -> Result<u64> {
     let status = socket.read_u8().await?;

@@ -308,6 +308,10 @@ impl NameNode {
             }
         });
         let datanode_service_arc = Arc::new(datanode_service);
+        // Block recovery: lease recovery sends commands through the DataNode
+        // service, and DataNodes report back to the namespace through it.
+        client_service_arc.set_datanode_commands(datanode_service_arc.clone());
+        datanode_service_arc.set_namespace_service(&client_service_arc);
 
         // Replication monitor: dead DataNodes and under-replicated blocks
         // (replaces the old heartbeat monitor, which dropped dead nodes but

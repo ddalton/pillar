@@ -517,6 +517,32 @@ fn open_replica(
     }
 }
 
+/// Block recovery's last step on one replica (HDFS
+/// `updateReplicaUnderRecovery`): give it the recovery's generation stamp,
+/// cut a replica being written to the agreed length, and finalize it.
+/// Returns the finalized length.
+pub fn finalize_recovered(storage: &BlockStorage, block_id: u64, recovery_gs: u64, len: u64) -> std::result::Result<u64, String> {
+    if storage.find_rbw(block_id).is_some() {
+        let (id, on_disk) = storage.restamp_rbw(block_id, recovery_gs).map_err(|e| e.to_string())?;
+        if on_disk < len {
+            return Err(format!("replica of block {} has {} bytes, recovery needs {}", block_id, on_disk, len));
+        }
+        let (data, meta) = storage.open_rbw(&id).map_err(|e| e.to_string())?;
+        let checksum = replica_checksum(&storage.rbw_meta_path(&id));
+        truncate_replica(&data, &meta, len, checksum).map_err(|e| e.to_string())?;
+        drop((data, meta));
+        return storage.finalize_block(&id).map_err(|e| e.to_string());
+    }
+    let m = storage.get_block_metadata(block_id).ok_or_else(|| format!("no replica of block {}", block_id))?;
+    if m.block_id.generation_stamp > recovery_gs {
+        return Err(format!("replica of block {} is newer ({}) than the recovery ({})", block_id, m.block_id.generation_stamp, recovery_gs));
+    }
+    if m.num_bytes != len {
+        return Err(format!("finalized replica of block {} has {} bytes, not {}", block_id, m.num_bytes, len));
+    }
+    storage.restamp_finalized(block_id, recovery_gs).map_err(|e| e.to_string())
+}
+
 /// A reopened replica's `.meta` must use the checksum the writer sends.
 fn check_meta_header(meta: &std::fs::File, checksum: Checksum) -> std::result::Result<(), (Status, String)> {
     let mut head = [0u8; META_HEADER_LEN as usize];

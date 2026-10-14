@@ -306,6 +306,32 @@ impl BlockStorage {
         })
     }
 
+    /// What block recovery needs to know of the replica of `block_id` here:
+    /// whether it is finalized, its id and its length (on disk, for one
+    /// being written).
+    pub fn recovery_info(&self, block_id: u64) -> Option<(bool, BlockId, u64)> {
+        if let Some(m) = self.blocks.get(&block_id) {
+            return Some((true, m.block_id, m.num_bytes));
+        }
+        self.find_rbw(block_id).map(|(id, len)| (false, id, len))
+    }
+
+    /// Every replica being written here (block reports list them as under
+    /// construction), with its length on disk.
+    pub fn get_rbw_blocks(&self) -> Vec<(BlockId, u64)> {
+        let Ok(entries) = fs::read_dir(&self.tmp_dir) else { return Vec::new() };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                if name.ends_with(".meta") || name.ends_with(".tmp") {
+                    return None;
+                }
+                Some((self.parse_block_filename(&name)?, e.metadata().ok()?.len()))
+            })
+            .collect()
+    }
+
     /// Give the replica being written of `block_id` the generation stamp
     /// `new_gs` (pipeline recovery), returning its new id and length. A
     /// replica with a newer stamp than `new_gs` is refused: it belongs to a

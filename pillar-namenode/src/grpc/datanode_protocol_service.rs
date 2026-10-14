@@ -18,6 +18,11 @@ pub struct DatanodeProtocolService {
     /// This namespace's identity: handed out by versionRequest, required
     /// of every registering DataNode.
     identity: StorageIdentity,
+    /// The namespace side, for block recovery reports and for telling a
+    /// recovered replica from a stale one. Weak: the namespace service holds
+    /// this service (to send commands), and a cycle would keep both, and the
+    /// name directory's lock, alive forever.
+    namespace_service: std::sync::OnceLock<std::sync::Weak<crate::grpc::ClientNamenodeService>>,
 }
 
 impl DatanodeProtocolService {
@@ -30,6 +35,47 @@ impl DatanodeProtocolService {
             block_manager,
             pending_commands: DashMap::new(),
             identity: crate::metadata::edit_log::new_identity(None),
+            namespace_service: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Link the namespace service (block recovery).
+    pub fn set_namespace_service(&self, service: &Arc<crate::grpc::ClientNamenodeService>) {
+        let _ = self.namespace_service.set(Arc::downgrade(service));
+    }
+
+    fn namespace_service(&self) -> Option<Arc<crate::grpc::ClientNamenodeService>> {
+        self.namespace_service.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// commitBlockSynchronization from a DataNode that recovered a block.
+    pub async fn handle_commit_block_synchronization(
+        &self,
+        block: BlockId,
+        new_generation_stamp: u64,
+        new_length: u64,
+        close_file: bool,
+        delete_block: bool,
+        holders: &[String],
+    ) -> Result<(), Status> {
+        let service = self
+            .namespace_service()
+            .ok_or_else(|| Status::unimplemented("block recovery is not wired to the namespace"))?;
+        service
+            .handle_commit_block_synchronization(block, new_generation_stamp, new_length, close_file, delete_block, holders)
+            .await
+    }
+
+    /// A finalized replica the namespace does not know at this stamp: keep
+    /// it if it is a newer stamp of a block still being written (a block
+    /// recovery finished on the DataNodes but was not committed before a
+    /// NameNode restart; the next recovery settles it).
+    async fn is_uncommitted_recovery(&self, block: BlockId) -> bool {
+        match (self.namespace_service(), self.block_manager.find_block(block.block_id)) {
+            (Some(service), Some(known)) if known.generation_stamp < block.generation_stamp => {
+                service.is_block_being_written(block.block_id).await
+            }
+            _ => false,
         }
     }
 
@@ -167,14 +213,26 @@ impl DatanodeProtocolService {
     pub async fn handle_block_report(
         &self,
         uuid: String,
-        blocks: Vec<(u64, u64, u64)>, // (block_id, generation_stamp, num_bytes)
+        blocks: Vec<(u64, u64, u64, bool)>, // (block_id, generation_stamp, num_bytes, under construction)
     ) -> Result<(), Status> {
         let datanode_id = self.datanode_id(&uuid)?;
 
         info!("Received block report from {}: {} blocks", uuid, blocks.len());
 
-        for (block_id, generation_stamp, num_bytes) in blocks {
-            self.record_replica(&uuid, &datanode_id, BlockId::new(block_id, generation_stamp), num_bytes);
+        for (block_id, generation_stamp, num_bytes, under_construction) in blocks {
+            let block = BlockId::new(block_id, generation_stamp);
+            if !under_construction {
+                self.record_replica(&uuid, &datanode_id, block, num_bytes).await;
+            } else if self.block_manager.get_block_info(&block).is_some() {
+                // A replica being written of a block the namespace has: this
+                // DataNode is in its pipeline (what a restarted NameNode needs
+                // to recover the block). It is not a finished replica.
+                self.block_manager.add_expected_location(block, &datanode_id);
+            } else {
+                // Of a block deleted, or a stale generation stamp.
+                info!("DataNode {} holds unknown replica being written {:?}; deleting it", uuid, block);
+                self.block_manager.queue_invalidation(&uuid, block);
+            }
         }
 
         Ok(())
@@ -189,7 +247,7 @@ impl DatanodeProtocolService {
         num_bytes: u64,
     ) -> Result<(), Status> {
         let datanode_id = self.datanode_id(&uuid)?;
-        self.record_replica(&uuid, &datanode_id, BlockId::new(block_id, generation_stamp), num_bytes);
+        self.record_replica(&uuid, &datanode_id, BlockId::new(block_id, generation_stamp), num_bytes).await;
         info!("DataNode {} received block {} ({} bytes)", uuid, block_id, num_bytes);
         Ok(())
     }
@@ -211,12 +269,16 @@ impl DatanodeProtocolService {
 
     /// Record that `uuid` holds a finalized replica. `report_block`
     /// de-duplicates locations, so repeated reports are idempotent.
-    fn record_replica(&self, uuid: &str, datanode_id: &DatanodeId, block: BlockId, num_bytes: u64) {
+    async fn record_replica(&self, uuid: &str, datanode_id: &DatanodeId, block: BlockId, num_bytes: u64) {
         // Not in the namespace (its file was deleted, perhaps before a
         // restart lost the pending deletion), or a stale generation stamp:
         // delete it. Safe because a DataNode only registers here if its
         // volume carries this namespace's identity.
         if self.block_manager.get_block_info(&block).is_none() {
+            if self.is_uncommitted_recovery(block).await {
+                info!("DataNode {} holds {:?}, newer than the NameNode's block being written; keeping it for recovery", uuid, block);
+                return;
+            }
             info!("DataNode {} holds unknown replica {:?}; deleting it", uuid, block);
             self.block_manager.queue_invalidation(uuid, block);
             return;
@@ -252,6 +314,13 @@ pub enum DatanodeCommand {
 
     /// Register again, then send a full block report.
     Register,
+
+    /// Recover blocks whose writer is gone: each block (its current
+    /// generation stamp), the stamp its replicas take, and its pipeline.
+    /// Sent to one DataNode of the pipeline, which settles all of them.
+    RecoverBlocks {
+        blocks: Vec<(BlockId, u64, Vec<DatanodeId>)>,
+    },
 }
 
 #[cfg(test)]
