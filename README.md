@@ -374,16 +374,28 @@ refused. The NameNode then serves its client protocol over Hadoop IPC
 only, not gRPC. `tests/interop/run-java-kerberos.sh` runs the stock Java
 client against a throwaway MIT KDC (`tests/kerberos/kdc.sh`).
 
-What Kerberos does **not** cover yet: block access tokens, so a client
-that reaches a DataNode's data port can read or write any block by id, and
-a Kerberized client cannot read a file still being written (it asks the
-DataNodes with the block's token); the DataNode-to-NameNode channel
-(gRPC) is not authenticated; permissions are recorded but not enforced;
-RPC integrity and privacy (`hadoop.rpc.protection` beyond
-`authentication`) and data transfer encryption are not offered.
+**Block access tokens** are on with Kerberos (or alone with
+`--block-access-tokens`), as HDFS's `dfs.block.access.token.enable`. The
+NameNode gives every block it returns to a client a token for it (READ,
+WRITE, COPY), signed with a secret block key it rolls every 10 hours and
+sends to the DataNodes at registration and in heartbeats. DataNodes refuse
+any data transfer without a valid token for the block and the access it
+needs (`ERROR_ACCESS_TOKEN`), on Hadoop's DataTransferProtocol and on
+Pillar's own data protocol alike, and sign their own for the copies they
+make (re-replication, pipeline recovery, block recovery). On the DataNode
+IPC port a client authenticates with the block's token (SASL DIGEST-MD5,
+Hadoop's TOKEN method), so a Kerberized client can read a file still being
+written.
 
-Not supported yet: block tokens,
-block checksum (`-checksum`), short-circuit
+What security does **not** cover yet: the DataNode-to-NameNode channel
+(gRPC) is not authenticated, so a host that can reach the NameNode could
+register as a DataNode and receive the block keys; permissions are
+recorded but not enforced; there are no proxy-user rules; RPC integrity
+and privacy (`hadoop.rpc.protection` beyond `authentication`) and data
+transfer encryption (`dfs.encrypt.data.transfer`,
+`dfs.data.transfer.protection`) are not offered.
+
+Not supported yet: block checksum (`-checksum`), short-circuit
 reads, snapshots, ACLs, xattrs, quotas, erasure coding, and NameNode HA
 (etcd is not consulted). Calls for unsupported features fail with
 `UnsupportedOperationException` rather than pretending to succeed.

@@ -62,6 +62,13 @@ pub(crate) fn encode_command(command: &DatanodeCommand, block_pool_id: &str) -> 
                 ..Default::default()
             };
         }
+        DatanodeCommand::KeyUpdate { keys } => {
+            return DatanodeCommandProto {
+                cmd_type: datanode_command_proto::Type::KeyUpdateCommand as i32,
+                key_update_cmd: Some(KeyUpdateCommandProto { keys: keys.clone() }),
+                ..Default::default()
+            };
+        }
         DatanodeCommand::RecoverBlocks { blocks } => {
             let blocks = blocks
                 .iter()
@@ -144,10 +151,13 @@ impl datanode_protocol_service_server::DatanodeProtocolService for DatanodeProto
             .await
         {
             Ok(()) => {
-                let response = RegisterDatanodeResponseProto {
-                    registration: req.registration.clone(),
-                };
-                Ok(Response::new(response))
+                // The registration comes back with the block keys, so the
+                // DataNode can check block access tokens from the start.
+                let mut registration = req.registration.clone();
+                if let Some(keys) = self.service.block_keys_for(&datanode_id.datanode_uuid) {
+                    registration.keys = keys;
+                }
+                Ok(Response::new(RegisterDatanodeResponseProto { registration }))
             }
             Err(e) => Err(e),
         }

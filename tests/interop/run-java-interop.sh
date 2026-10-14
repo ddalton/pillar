@@ -6,12 +6,15 @@
 # reads back what it wrote before the crash.
 #
 #   tests/interop/run-java-interop.sh            # needs a JDK (11+) and curl
+#   BLOCK_TOKENS=1 tests/interop/run-java-interop.sh   # with block access tokens
 #
 # Hadoop's shaded client jars are fetched from Maven Central into
 # ~/.cache/pillar-interop and checked against Maven's SHA-1 files.
 set -euo pipefail
 
 HADOOP_VERSION=${HADOOP_VERSION:-3.5.0}
+NN_FLAGS=""
+[ -n "${BLOCK_TOKENS:-}" ] && NN_FLAGS="--block-access-tokens"
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 CACHE=${PILLAR_INTEROP_CACHE:-$HOME/.cache/pillar-interop}
@@ -38,7 +41,7 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
 
 start_namenode() { # log file
     "$BIN/pillar-namenode" --rpc-addr 127.0.0.1:19000 --http-addr 127.0.0.1:19870 \
-        --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" >"$1" 2>&1 &
+        --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" $NN_FLAGS >"$1" 2>&1 &
     echo $! >"$WORK/nn.pid"
     for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19000) 2>/dev/null && break; sleep 0.2; done
 }

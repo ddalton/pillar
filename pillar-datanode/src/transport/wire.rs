@@ -42,6 +42,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use pillar_common::hdfs::block_token::mode;
+use pillar_proto::hadoop::common::TokenProto;
+use prost::Message;
+
 use super::{BlockChunks, DataTransferOp, Result, TransportError};
 use crate::storage::block_storage::{BlockId, BlockStorage, BlockStorageError};
 
@@ -64,29 +68,37 @@ pub const STATUS_NOT_FOUND: u8 = 2;
 const HEADER_LEN: usize = 33;
 
 /// A decoded request header.
-#[derive(Debug, Clone, Copy)]
+///
+/// On the wire the fixed header is followed by the block access token (u16
+/// length, then an encoded `TokenProto`; length 0 when tokens are off).
+/// Every operation carries one: the data port is shared with Hadoop
+/// clients and must not offer a way around their tokens.
+#[derive(Debug, Clone)]
 pub struct Header {
     pub op: u8,
     pub block_id: u64,
     pub gen_stamp: u64,
     pub offset: u64,
     pub length: u64,
+    pub token: Option<TokenProto>,
 }
 
 impl Header {
-    fn encode(&self) -> [u8; HEADER_LEN] {
-        let mut b = [0u8; HEADER_LEN];
-        b[0] = self.op;
-        b[1..9].copy_from_slice(&self.block_id.to_be_bytes());
-        b[9..17].copy_from_slice(&self.gen_stamp.to_be_bytes());
-        b[17..25].copy_from_slice(&self.offset.to_be_bytes());
-        b[25..33].copy_from_slice(&self.length.to_be_bytes());
+    fn encode(&self) -> Vec<u8> {
+        let token = self.token.as_ref().map(|t| t.encode_to_vec()).unwrap_or_default();
+        let mut b = Vec::with_capacity(HEADER_LEN + 2 + token.len());
+        b.push(self.op);
+        for v in [self.block_id, self.gen_stamp, self.offset, self.length] {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        b.extend_from_slice(&token);
         b
     }
 
     fn decode(op: u8, rest: &[u8; HEADER_LEN - 1]) -> Self {
         let u = |i: usize| u64::from_be_bytes(rest[i..i + 8].try_into().unwrap());
-        Header { op, block_id: u(0), gen_stamp: u(8), offset: u(16), length: u(24) }
+        Header { op, block_id: u(0), gen_stamp: u(8), offset: u(16), length: u(24), token: None }
     }
 }
 
@@ -128,7 +140,23 @@ where
         }
         let mut rest = [0u8; HEADER_LEN - 1];
         socket.read_exact(&mut rest).await?;
-        let h = Header::decode(op, &rest);
+        let mut h = Header::decode(op, &rest);
+        let token_len = socket.read_u16().await? as usize;
+        if token_len > 0 {
+            let mut t = vec![0u8; token_len];
+            socket.read_exact(&mut t).await?;
+            h.token = TokenProto::decode(&t[..]).ok();
+        }
+        // The access each operation needs from the block's token.
+        let needed = match DataTransferOp::from_u8(op) {
+            Some(DataTransferOp::ReadBlock | DataTransferOp::ReplicaInfo) => mode::READ,
+            _ => mode::WRITE,
+        };
+        if let Err(e) = storage.tokens.verify(h.token.as_ref(), h.block_id, needed) {
+            warn!("Refusing op {} on block {} from {}: {}", op, h.block_id, peer, e);
+            reply_error(&mut socket, STATUS_ERROR, &format!("block access token: {}", e)).await?;
+            return Ok(());
+        }
 
         match DataTransferOp::from_u8(op) {
             Some(DataTransferOp::ReadBlock) => serve_read(&mut socket, &storage, h).await?,
@@ -343,9 +371,9 @@ where
 
 /// Block recovery: the replica of `block_id` at `peer` as (finalized?,
 /// generation stamp, length), or `None` if it has none.
-pub async fn replica_info(peer: &str, block_id: u64) -> Result<Option<(bool, u64, u64)>> {
+pub async fn replica_info(peer: &str, block_id: u64, token: Option<TokenProto>) -> Result<Option<(bool, u64, u64)>> {
     let mut s = connect(peer).await?;
-    let h = Header { op: DataTransferOp::ReplicaInfo.to_u8(), block_id, gen_stamp: 0, offset: 0, length: 0 };
+    let h = Header { op: DataTransferOp::ReplicaInfo.to_u8(), block_id, gen_stamp: 0, offset: 0, length: 0, token };
     s.write_all(&h.encode()).await?;
     s.flush().await?;
     let status = s.read_u8().await?;
@@ -366,9 +394,9 @@ pub async fn replica_info(peer: &str, block_id: u64) -> Result<Option<(bool, u64
 
 /// Block recovery: have `peer` cut its replica of `block_id` to `len`,
 /// give it `recovery_gs` and finalize it. Returns the finalized length.
-pub async fn recover_replica(peer: &str, block_id: u64, recovery_gs: u64, len: u64) -> Result<u64> {
+pub async fn recover_replica(peer: &str, block_id: u64, recovery_gs: u64, len: u64, token: Option<TokenProto>) -> Result<u64> {
     let mut s = connect(peer).await?;
-    let h = Header { op: DataTransferOp::RecoverReplica.to_u8(), block_id, gen_stamp: recovery_gs, offset: 0, length: len };
+    let h = Header { op: DataTransferOp::RecoverReplica.to_u8(), block_id, gen_stamp: recovery_gs, offset: 0, length: len, token };
     s.write_all(&h.encode()).await?;
     s.flush().await?;
     read_status(&mut s, block_id).await
@@ -390,11 +418,11 @@ async fn read_status<S: AsyncRead + Unpin>(socket: &mut S, block_id: u64) -> Res
 }
 
 /// READ on an open connection.
-pub async fn read_block<S>(socket: &mut S, block_id: u64, gen_stamp: u64, offset: u64, length: u64) -> Result<Bytes>
+pub async fn read_block<S>(socket: &mut S, block_id: u64, gen_stamp: u64, offset: u64, length: u64, token: Option<TokenProto>) -> Result<Bytes>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let h = Header { op: DataTransferOp::ReadBlock.to_u8(), block_id, gen_stamp, offset, length };
+    let h = Header { op: DataTransferOp::ReadBlock.to_u8(), block_id, gen_stamp, offset, length, token };
     socket.write_all(&h.encode()).await?;
     socket.flush().await?;
     let len = read_status(socket, block_id).await?;
@@ -410,11 +438,11 @@ where
 ///
 /// An `Err` chunk aborts the session without an end marker, so the peer
 /// discards what it received.
-pub async fn send_block<S>(socket: &mut S, block_id: u64, gen_stamp: u64, mut chunks: BlockChunks) -> Result<u64>
+pub async fn send_block<S>(socket: &mut S, block_id: u64, gen_stamp: u64, mut chunks: BlockChunks, token: Option<TokenProto>) -> Result<u64>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let h = Header { op: DataTransferOp::WriteBlock.to_u8(), block_id, gen_stamp, offset: 0, length: 0 };
+    let h = Header { op: DataTransferOp::WriteBlock.to_u8(), block_id, gen_stamp, offset: 0, length: 0, token };
     socket.write_all(&h.encode()).await?;
     let mut sent = 0u64;
     while let Some(chunk) = chunks.recv().await {
@@ -463,9 +491,9 @@ impl ConnPool {
     /// READ through the pool. A pooled connection may have been closed by
     /// the peer while idle, so a failure on one is retried once on a fresh
     /// connection (READ is idempotent).
-    pub async fn read_block(&self, peer: &str, block_id: u64, gen_stamp: u64, offset: u64, length: u64) -> Result<Bytes> {
+    pub async fn read_block(&self, peer: &str, block_id: u64, gen_stamp: u64, offset: u64, length: u64, token: Option<TokenProto>) -> Result<Bytes> {
         if let Some(mut s) = self.take(peer) {
-            match read_block(&mut s, block_id, gen_stamp, offset, length).await {
+            match read_block(&mut s, block_id, gen_stamp, offset, length, token.clone()).await {
                 Ok(data) => {
                     self.put(peer, s);
                     return Ok(data);
@@ -481,7 +509,7 @@ impl ConnPool {
             }
         }
         let mut s = connect(peer).await?;
-        let r = read_block(&mut s, block_id, gen_stamp, offset, length).await;
+        let r = read_block(&mut s, block_id, gen_stamp, offset, length, token).await;
         if matches!(r, Ok(_) | Err(TransportError::BlockNotFound(_))) {
             self.put(peer, s);
         }
@@ -491,9 +519,9 @@ impl ConnPool {
     /// WRITE session on a fresh connection (a session consumes its chunk
     /// stream, so it cannot be retried on a stale pooled one); the
     /// connection is pooled afterwards for reuse by reads.
-    pub async fn send_block(&self, peer: &str, block_id: u64, gen_stamp: u64, chunks: BlockChunks) -> Result<u64> {
+    pub async fn send_block(&self, peer: &str, block_id: u64, gen_stamp: u64, chunks: BlockChunks, token: Option<TokenProto>) -> Result<u64> {
         let mut s = connect(peer).await?;
-        let stored = send_block(&mut s, block_id, gen_stamp, chunks).await?;
+        let stored = send_block(&mut s, block_id, gen_stamp, chunks, token).await?;
         self.put(peer, s);
         Ok(stored)
     }

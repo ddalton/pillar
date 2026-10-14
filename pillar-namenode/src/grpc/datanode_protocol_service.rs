@@ -23,6 +23,10 @@ pub struct DatanodeProtocolService {
     /// this service (to send commands), and a cycle would keep both, and the
     /// name directory's lock, alive forever.
     namespace_service: std::sync::OnceLock<std::sync::Weak<crate::grpc::ClientNamenodeService>>,
+    /// Block access token keys, when tokens are enabled, and the key-set
+    /// version each DataNode last received.
+    block_tokens: std::sync::OnceLock<Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>>,
+    keys_sent: DashMap<String, u64>,
 }
 
 impl DatanodeProtocolService {
@@ -36,7 +40,21 @@ impl DatanodeProtocolService {
             pending_commands: DashMap::new(),
             identity: crate::metadata::edit_log::new_identity(None),
             namespace_service: std::sync::OnceLock::new(),
+            block_tokens: std::sync::OnceLock::new(),
+            keys_sent: DashMap::new(),
         }
+    }
+
+    /// Hand DataNodes the keys of `manager`.
+    pub fn set_block_tokens(&self, manager: Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>) {
+        let _ = self.block_tokens.set(manager);
+    }
+
+    /// The block keys for a DataNode registering now, recorded as sent.
+    pub fn block_keys_for(&self, uuid: &str) -> Option<pillar_proto::hdfs::ExportedBlockKeysProto> {
+        let m = self.block_tokens.get()?;
+        self.keys_sent.insert(uuid.to_string(), m.version());
+        Some(m.export())
     }
 
     /// Link the namespace service (block recovery).
@@ -175,6 +193,14 @@ impl DatanodeProtocolService {
         // Hand over whatever the replication monitor queued for this node,
         // plus deletions of replicas whose blocks were removed.
         let mut commands = self.take_commands(uuid);
+        // New block keys, if they rolled since this DataNode got them.
+        if let Some(m) = self.block_tokens.get() {
+            let version = m.version();
+            if self.keys_sent.get(uuid).map(|v| *v) != Some(version) {
+                self.keys_sent.insert(uuid.to_string(), version);
+                commands.push(DatanodeCommand::KeyUpdate { keys: m.export() });
+            }
+        }
         let invalid = self.block_manager.take_invalidations(uuid);
         if !invalid.is_empty() {
             commands.push(DatanodeCommand::InvalidateBlocks { blocks: invalid });
@@ -314,6 +340,11 @@ pub enum DatanodeCommand {
 
     /// Register again, then send a full block report.
     Register,
+
+    /// New block keys (they rolled).
+    KeyUpdate {
+        keys: pillar_proto::hdfs::ExportedBlockKeysProto,
+    },
 
     /// Recover blocks whose writer is gone: each block (its current
     /// generation stamp), the stamp its replicas take, and its pipeline.

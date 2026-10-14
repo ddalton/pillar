@@ -58,6 +58,10 @@ pub struct NameNodeConfig {
     pub kerberos_keytab: Option<PathBuf>,
     pub kerberos_principal: Option<String>,
 
+    /// Block access tokens (HDFS dfs.block.access.token.enable); always on
+    /// with Kerberos.
+    pub block_access_tokens: bool,
+
     /// A DataNode silent this long is stale, and this long dead (HDFS
     /// defaults: 30 s, 10.5 min).
     pub datanode_stale_interval: std::time::Duration,
@@ -87,6 +91,7 @@ impl Default for NameNodeConfig {
             cluster_id: None,
             kerberos_keytab: None,
             kerberos_principal: None,
+            block_access_tokens: false,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
             lease_soft_limit: crate::metadata::lease_manager::DEFAULT_SOFT_LIMIT,
@@ -326,6 +331,30 @@ impl NameNode {
         // service, and DataNodes report back to the namespace through it.
         client_service_arc.set_datanode_commands(datanode_service_arc.clone());
         datanode_service_arc.set_namespace_service(&client_service_arc);
+
+        // Block access tokens: minted for clients, keys sent to DataNodes,
+        // rolled on schedule.
+        let kerberos_configured = self.config.kerberos_keytab.is_some();
+        if self.config.block_access_tokens || kerberos_configured {
+            use pillar_common::hdfs::block_token::{BlockTokenSecretManager, DEFAULT_KEY_UPDATE_INTERVAL, DEFAULT_TOKEN_LIFETIME};
+            let manager = Arc::new(BlockTokenSecretManager::new(
+                &self.identity.block_pool_id,
+                DEFAULT_KEY_UPDATE_INTERVAL,
+                DEFAULT_TOKEN_LIFETIME,
+            ));
+            client_service_arc.set_block_tokens(manager.clone());
+            datanode_service_arc.set_block_tokens(manager.clone());
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    if manager.roll_if_due() {
+                        info!("Block access token keys rolled");
+                    }
+                }
+            });
+            info!("Block access tokens enabled");
+        }
 
         // Replication monitor: dead DataNodes and under-replicated blocks
         // (replaces the old heartbeat monitor, which dropped dead nodes but

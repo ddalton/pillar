@@ -46,6 +46,7 @@ use tracing::{debug, error, info, warn};
 use super::wire::{self, ConnPool};
 use super::{BlockChunks, DataTransport, Result, TransportError, TransportType};
 use crate::storage::block_storage::BlockStorage;
+use pillar_common::hdfs::block_token::mode;
 
 /// How long to wait for a single work completion before giving up.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -569,7 +570,8 @@ impl DataTransport for RdmaTransport {
         length: u64,
     ) -> Result<Bytes> {
         debug!("Reading block {} from peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
-        self.tcp_pool.read_block(peer_addr, block_id, gen_stamp, offset, length).await
+        let token = self.block_storage.tokens.mint(block_id, mode::READ);
+        self.tcp_pool.read_block(peer_addr, block_id, gen_stamp, offset, length, token).await
     }
 
     async fn send_block_to_peer(
@@ -580,7 +582,8 @@ impl DataTransport for RdmaTransport {
         chunks: BlockChunks,
     ) -> Result<u64> {
         debug!("Sending block {} to peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
-        self.tcp_pool.send_block(peer_addr, block_id, gen_stamp, chunks).await
+        let token = self.block_storage.tokens.mint(block_id, mode::WRITE);
+        self.tcp_pool.send_block(peer_addr, block_id, gen_stamp, chunks, token).await
     }
 
     fn transport_type(&self) -> TransportType {

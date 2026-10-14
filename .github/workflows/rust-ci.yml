@@ -31,6 +31,8 @@ jobs:
           java-version: '21'
       - name: Hadoop Java client interop (tests/interop/run-java-interop.sh)
         run: tests/interop/run-java-interop.sh
+      - name: Hadoop Java client interop with block access tokens
+        run: BLOCK_TOKENS=1 tests/interop/run-java-interop.sh
       - name: install MIT krb5 (a throwaway KDC for the Kerberos interop)
         run: sudo apt-get install -y krb5-kdc krb5-admin-server
       - name: Hadoop Java client with Kerberos (tests/interop/run-java-kerberos.sh)

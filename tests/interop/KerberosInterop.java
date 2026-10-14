@@ -63,9 +63,21 @@ public class KerberosInterop {
         check(Arrays.equals(back, data), "alice (Kerberos) writes and reads a multi-block file");
         check(fs.getFileStatus(f).getOwner().equals("alice"), "the file is owned by the Kerberos user, alice");
 
-        // (Reading a file still open needs the DataNode's visible length,
-        // which a Kerberized client asks for with the block's access token:
-        // that comes with block tokens.)
+        // A file still open: the reader asks a DataNode of the last block
+        // how much of it is visible, authenticating with the block's access
+        // token (SASL DIGEST-MD5 on the DataNode's IPC port).
+        Path open = new Path("/secure/open.bin");
+        int flushed = (1 << 20) + 4321;
+        try (FSDataOutputStream out = fs.create(open)) {
+            out.write(data, 0, flushed);
+            out.hflush();
+            byte[] seen;
+            try (FileSystem reader = FileSystem.newInstance(conf); FSDataInputStream in = reader.open(open)) {
+                seen = in.readAllBytes();
+            }
+            check(Arrays.equals(seen, Arrays.copyOf(data, flushed)),
+                  "another client reads the hflushed part of an open file (" + seen.length + " bytes)");
+        }
 
         // Another user.
         UserGroupInformation bob = UserGroupInformation.loginUserFromKeytabAndReturnUGI("bob@PILLAR.TEST", dir + "/bob.keytab");

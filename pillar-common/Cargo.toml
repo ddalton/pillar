@@ -19,6 +19,12 @@ prost = { workspace = true }
 async-trait = { workspace = true }
 # Kerberos (SASL GSSAPI) for Hadoop IPC
 krb5 = "0.5"
+# Block access tokens (HMAC-SHA1) and their SASL DIGEST-MD5 use
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+rand = "0.8"
+base64 = "0.22"
 
 # Checksums
 sha2 = { workspace = true }

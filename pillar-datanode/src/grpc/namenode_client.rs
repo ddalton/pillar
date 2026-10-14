@@ -267,7 +267,10 @@ impl NamenodeClient {
         let request = Request::new(RegisterDatanodeRequestProto {
             registration: self.create_registration_proto(),
         });
-        self.client().register_datanode(request).await?;
+        let response = self.client().register_datanode(request).await?.into_inner();
+        // With block access tokens on, the NameNode hands out its keys here
+        // (and new ones in heartbeats as it rolls them).
+        self.block_storage.tokens.update(&response.registration.keys);
 
         info!("Successfully registered with NameNode");
         info!("  UUID: {}", self.datanode_info.uuid);
@@ -546,12 +549,16 @@ impl NamenodeClient {
                 warn!("Received shutdown command from NameNode (not implemented; ignoring)");
             }
             DatanodeCommand::Register => debug!("Register is handled by the heartbeat loop"),
+            DatanodeCommand::KeyUpdate { keys } => {
+                debug!("Block access token keys updated");
+                self.block_storage.tokens.update(&keys);
+            }
             DatanodeCommand::RecoverBlocks { blocks } => {
                 for (block, ids) in blocks {
                     let this = self.clone();
                     tokio::spawn(async move {
                         info!("Recovering block {} (new stamp {})", block.block_id, block.new_generation_stamp);
-                        match crate::recovery::recover(&block).await {
+                        match crate::recovery::recover(&block, &this.block_storage.tokens).await {
                             Ok(done) => {
                                 if let Err(e) = this.commit_block_synchronization(&block, &done, &ids).await {
                                     warn!("Reporting the recovery of block {} failed: {}", block.block_id, e);
@@ -635,6 +642,8 @@ pub enum DatanodeCommand {
     /// Settle blocks whose writer is gone (block recovery); each with the
     /// pipeline DataNodes' ids, to report back the ones recovered.
     RecoverBlocks { blocks: Vec<(crate::recovery::RecoveringBlock, Vec<pillar_proto::hdfs::DatanodeIdProto>)> },
+    /// The NameNode's current block access token keys.
+    KeyUpdate { keys: pillar_proto::hdfs::ExportedBlockKeysProto },
 }
 
 fn replication_target(info: &DatanodeInfoProto) -> ReplicationTarget {
@@ -656,6 +665,9 @@ fn replication_target(info: &DatanodeInfoProto) -> ReplicationTarget {
 /// Translate a `DatanodeCommandProto` into a [`DatanodeCommand`]. Command
 /// types Pillar does not act on are logged and skipped.
 pub fn parse_command(cmd: DatanodeCommandProto) -> Option<DatanodeCommand> {
+    if cmd.cmd_type == datanode_command_proto::Type::KeyUpdateCommand as i32 {
+        return cmd.key_update_cmd.map(|k| DatanodeCommand::KeyUpdate { keys: k.keys });
+    }
     if cmd.cmd_type == datanode_command_proto::Type::RegisterCommand as i32 {
         return Some(DatanodeCommand::Register);
     }

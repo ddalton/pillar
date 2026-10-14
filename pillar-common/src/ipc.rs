@@ -30,6 +30,15 @@
 //! by Hadoop's DEFAULT `auth_to_local` rule; a connection context naming
 //! anyone else (impersonation, which needs proxy-user rules Pillar does not
 //! have) is refused, as is any call before authentication.
+//!
+//! A protocol may also accept tokens ([`RpcHandler::tokens`]; the DataNode
+//! takes block access tokens): NEGOTIATE then offers `TOKEN DIGEST-MD5`
+//! first, with its challenge, and the caller is whoever the token names.
+//!
+//! ```text
+//! C NEGOTIATE                  S NEGOTIATE auths=[TOKEN DIGEST-MD5 challenge, ...]
+//! C INITIATE  digest-response  S SUCCESS rspauth
+//! ```
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,6 +52,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::digest_md5::DigestServer;
 use pillar_proto::hadoop::common::{
     rpc_response_header_proto::{RpcErrorCodeProto, RpcStatusProto},
     rpc_sasl_proto::{self, SaslState},
@@ -72,6 +82,19 @@ pub enum Authentication {
 }
 
 static SIMPLE: Authentication = Authentication::Simple;
+
+/// Checks tokens presented with SASL DIGEST-MD5 (Hadoop's TOKEN method).
+pub trait TokenAuthority: Send + Sync {
+    /// Whether tokens are accepted at all (offered in NEGOTIATE).
+    fn enabled(&self) -> bool;
+
+    /// For a token identifier: the caller it authenticates and the token's
+    /// password, if the token is valid.
+    fn password(&self, identifier: &[u8]) -> Option<(String, Vec<u8>)>;
+}
+
+/// Hadoop's SASL realm and server id for DIGEST-MD5 (`SASL_DEFAULT_REALM`).
+const SASL_DEFAULT_REALM: &str = "default";
 
 /// A Kerberos service: its principal (`<service>/<host>@<REALM>`) and the
 /// keytab holding its keys.
@@ -132,6 +155,11 @@ pub trait RpcHandler: Send + Sync + 'static {
     /// How callers authenticate (default SIMPLE).
     fn authentication(&self) -> &Authentication {
         &SIMPLE
+    }
+
+    /// Tokens the protocol accepts as credentials, besides `authentication`.
+    fn tokens(&self) -> Option<&dyn TokenAuthority> {
+        None
     }
 
     /// Run `method` on the encoded request `body` for `user` (the
@@ -351,6 +379,23 @@ impl Gssapi {
     }
 }
 
+/// SASL DIGEST-MD5 with a token: the client's INITIATE answers the
+/// challenge sent with NEGOTIATE. The username is the base64 token
+/// identifier, the password the base64 token password.
+fn token_step(d: &DigestServer, tokens: &dyn TokenAuthority, msg: &RpcSaslProto) -> Result<(String, RpcSaslProto), String> {
+    use base64::Engine;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let mut caller = None;
+    let (_, rspauth) = d.respond(msg.token.as_deref().unwrap_or_default(), |username| {
+        let identifier = b64.decode(username).ok()?;
+        let (who, password) = tokens.password(&identifier)?;
+        caller = Some(who);
+        Some(b64.encode(password))
+    })?;
+    let caller = caller.ok_or("no caller")?;
+    Ok((caller, RpcSaslProto { state: SaslState::Success as i32, token: Some(rspauth), ..Default::default() }))
+}
+
 /// Serve one Hadoop IPC connection until the client closes it.
 pub async fn serve_connection<S, H>(stream: S, handler: Arc<H>, peer: SocketAddr) -> std::io::Result<()>
 where
@@ -386,6 +431,9 @@ where
     // authenticated principal and its local name.
     let mut gssapi = Gssapi::default();
     let mut authenticated: Option<(String, Option<String>)> = None;
+    // Token authentication: the exchange, and the caller once it succeeded.
+    let mut digest: Option<DigestServer> = None;
+    let mut token_caller: Option<String> = None;
     let result: std::io::Result<()> = async {
         loop {
             let len = match rd.read_u32().await {
@@ -410,12 +458,29 @@ where
                 CALL_ID_SASL => {
                     let sasl: RpcSaslProto = take_delimited(&mut buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    let tokens = handler.tokens().filter(|t| t.enabled());
+                    let negotiate = sasl.state == SaslState::Negotiate as i32;
+                    let wants_digest = sasl.state == SaslState::Initiate as i32
+                        && sasl.auths.first().map_or(false, |a| a.mechanism == "DIGEST-MD5");
                     let reply = match handler.authentication() {
+                        _ if wants_digest => match (&digest, tokens) {
+                            (Some(d), Some(t)) => token_step(d, t, &sasl).map(|(caller, step)| {
+                                token_caller = Some(caller);
+                                step
+                            }),
+                            _ => Err("token authentication is not enabled".to_string()),
+                        },
                         // SIMPLE-only: NEGOTIATE succeeds at once; anything
                         // else (a client insisting on Kerberos) is refused.
-                        Authentication::Simple if sasl.state == SaslState::Negotiate as i32 => {
-                            Ok(RpcSaslProto { state: SaslState::Success as i32, ..Default::default() })
-                        }
+                        // With tokens, SIMPLE is offered after TOKEN.
+                        Authentication::Simple if negotiate => Ok(match tokens {
+                            None => RpcSaslProto { state: SaslState::Success as i32, ..Default::default() },
+                            Some(_) => RpcSaslProto {
+                                state: SaslState::Negotiate as i32,
+                                auths: vec![rpc_sasl_proto::SaslAuth { method: "SIMPLE".into(), mechanism: String::new(), ..Default::default() }],
+                                ..Default::default()
+                            },
+                        }),
                         Authentication::Simple => Err("Pillar has only SIMPLE authentication enabled".to_string()),
                         Authentication::Kerberos(k) => match gssapi.step(k, &sasl) {
                             Ok(step) => {
@@ -426,6 +491,21 @@ where
                             }
                             Err(e) => Err(e),
                         },
+                    };
+                    // TOKEN goes first in the offer, as in Hadoop.
+                    let reply = match reply {
+                        Ok(mut offer) if negotiate && tokens.is_some() => {
+                            let d = digest.insert(DigestServer::new(SASL_DEFAULT_REALM, "", SASL_DEFAULT_REALM));
+                            offer.auths.insert(0, rpc_sasl_proto::SaslAuth {
+                                method: "TOKEN".into(),
+                                mechanism: "DIGEST-MD5".into(),
+                                protocol: Some(String::new()),
+                                server_id: Some(SASL_DEFAULT_REALM.into()),
+                                challenge: Some(d.challenge()),
+                            });
+                            Ok(offer)
+                        }
+                        r => r,
                     };
                     match reply {
                         Ok(reply) => {
@@ -444,6 +524,17 @@ where
                     let claimed = ctx.user_info.and_then(|u| u.effective_user).unwrap_or_default();
                     debug!("{}: connection context user={:?} protocol={:?}", peer, claimed, ctx.protocol);
                     match handler.authentication() {
+                        // A token names the caller; Hadoop clients send no
+                        // user in this case.
+                        _ if token_caller.is_some() => {
+                            let caller = token_caller.clone().unwrap();
+                            if !claimed.is_empty() && claimed != caller {
+                                let msg = format!("Authenticated user ({}) doesn't match what the client claims to be ({})", caller, claimed);
+                                let _ = out_tx.send(fatal_frame(&header, ACCESS_CONTROL, &msg)).await;
+                                return Ok(());
+                            }
+                            user = caller;
+                        }
                         Authentication::Simple => user = claimed,
                         Authentication::Kerberos(_) => {
                             let Some((principal, short)) = &authenticated else {
