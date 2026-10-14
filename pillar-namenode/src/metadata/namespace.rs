@@ -148,12 +148,14 @@ impl INode {
         (blocks.len() > uc.blocks_at_open as usize).then(|| blocks.last()).flatten()
     }
 
-    /// Blocks a reader may see: all of them, except the one being written.
+    /// Blocks a reader may see: all of them, except the one being written
+    /// while it has no committed length (an appended block keeps showing
+    /// its length from before the append).
     pub fn finished_blocks(&self) -> &[BlockInfo] {
         let blocks = self.blocks.as_deref().unwrap_or(&[]);
         match self.open_block() {
-            Some(_) => &blocks[..blocks.len() - 1],
-            None => blocks,
+            Some(b) if b.num_bytes == 0 => &blocks[..blocks.len() - 1],
+            _ => blocks,
         }
     }
 }

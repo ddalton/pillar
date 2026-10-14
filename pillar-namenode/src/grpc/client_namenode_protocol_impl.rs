@@ -264,7 +264,8 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
             self.service.handle_commit_block_as(&path, prev.block_id, prev.num_bytes.unwrap_or(0), &req.client_name).await?;
         }
 
-        match self.service.handle_add_block_as(&path, &req.client_name).await {
+        let excluded: Vec<String> = req.exclude_nodes.iter().map(|n| n.id.datanode_uuid.clone()).collect();
+        match self.service.handle_add_block_as(&path, &req.client_name, &excluded).await {
             Ok(block) => {
                 let response = AddBlockResponseProto {
                     block: fill_storages(LocatedBlockProto {
@@ -513,11 +514,12 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
         // CreateFlagProto NEW_BLOCK = 0x20.
         let new_block = req.flag.unwrap_or(0) & 0x20 != 0;
         info!("append: {} (new_block={})", req.src, new_block);
-        // Always a new block: no last block to extend, so the client's next
-        // call is addBlock.
-        self.service.handle_append_as(&req.src, new_block, &req.client_name).await?;
+        // The partially filled last block to extend, or none: the client's
+        // next call is then addBlock.
+        let last = self.service.handle_append_as(&req.src, new_block, &req.client_name).await?;
         let stat = file_status_proto(self.service.handle_get_file_info(&req.src).await?, req.src);
-        Ok(Response::new(AppendResponseProto { block: None, stat: Some(stat) }))
+        let block = last.map(|b| located_block_to_proto(b, self.service.block_pool_id()));
+        Ok(Response::new(AppendResponseProto { block, stat: Some(stat) }))
     }
 
     async fn abandon_block(
@@ -706,8 +708,13 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
     async fn update_pipeline(
         &self,
-        _request: Request<UpdatePipelineRequestProto>,
+        request: Request<UpdatePipelineRequestProto>,
     ) -> Result<Response<UpdatePipelineResponseProto>, Status> {
+        let req = request.into_inner();
+        let nodes: Vec<String> = req.new_nodes.into_iter().map(|n| n.datanode_uuid).collect();
+        self.service
+            .handle_update_pipeline(&req.client_name, req.new_block.block_id, req.new_block.generation_stamp, &nodes)
+            .await?;
         Ok(Response::new(UpdatePipelineResponseProto {}))
     }
 

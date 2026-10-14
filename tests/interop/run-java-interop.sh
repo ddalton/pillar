@@ -79,4 +79,14 @@ done
 grep -q 'Namespace loaded' "$WORK/nn-restarted.log" || fail "namespace not loaded"
 
 java_client verify || fail "after restart"
-echo "Java interop passed (Hadoop $HADOOP_VERSION), including a NameNode crash and restart"
+
+# Pipeline recovery: kill a DataNode while the Java client is writing a
+# block through it; the write must complete on the survivors.
+java_client pipeline "$WORK/ready" "$WORK/go" &
+java_pid=$!
+for _ in $(seq 150); do [ -f "$WORK/ready" ] && break; sleep 0.2; done
+[ -f "$WORK/ready" ] || fail "the pipeline writer never got going"
+kill -9 "$(cat "$WORK/dn1.pid")"
+touch "$WORK/go"
+wait "$java_pid" || fail "write across a DataNode failure"
+echo "Java interop passed (Hadoop $HADOOP_VERSION), including a NameNode crash and restart and a DataNode failure mid-write"

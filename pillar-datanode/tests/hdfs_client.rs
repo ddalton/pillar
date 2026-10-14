@@ -351,9 +351,8 @@ async fn metadata_calls_take_effect_and_append_starts_a_new_block() {
     assert_eq!(r.file_length(), MB + 1000);
     let all = r.read_range(0, MB + 1000).await.unwrap();
     assert!(all[..MB] == head[..] && all[MB..] == tail[..], "appended file differs");
-    // Its last block is now partial. Extending it is refused with a message
-    // naming NEW_BLOCK, and hdfs-native then appends in a new block (as it
-    // does for erasure-coded files): three blocks, contents intact.
+    // Its last block is now partial: the append extends it (the first
+    // packet completes a partial checksum chunk), contents intact.
     let more = pattern(500, 0x23);
     let mut w = fs.append("/app.bin").await.unwrap();
     w.write_bytes(Bytes::from(more.clone())).await.unwrap();

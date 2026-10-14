@@ -130,8 +130,10 @@ impl ClientNamenodeService {
         if let Some(open) = guard.open_block().cloned() {
             let id = BlockId::new(open.block_id, open.generation_stamp);
             let blocks = guard.blocks.as_mut().expect("a file");
-            if self.block_manager.get_replica_count(&id) > 0 {
-                let len = self.block_manager.get_block_info(&id).map_or(open.num_bytes, |b| b.num_bytes);
+            if self.block_manager.get_replica_count(&id) > 0 || open.num_bytes > 0 {
+                // A finished replica, or committed data from before an
+                // append: keep the block at the length known for it.
+                let len = self.block_manager.get_block_info(&id).map_or(open.num_bytes, |b| b.num_bytes.max(open.num_bytes));
                 blocks.last_mut().expect("open block").num_bytes = len;
                 info!("Lease recovery of inode {}: block {} kept, {} bytes", inode_id, open.block_id, len);
             } else {
@@ -647,11 +649,13 @@ impl ClientNamenodeService {
 
     /// Add a new block to a file (called by client when writing)
     pub async fn handle_add_block(&self, path: &str) -> Result<LocatedBlock, Status> {
-        self.handle_add_block_as(path, "").await
+        self.handle_add_block_as(path, "", &[]).await
     }
 
-    /// addBlock by `client`, which must hold the file's lease.
-    pub async fn handle_add_block_as(&self, path: &str, client: &str) -> Result<LocatedBlock, Status> {
+    /// addBlock by `client`, which must hold the file's lease, avoiding the
+    /// `excluded` DataNodes (ones the client failed to reach: it retries
+    /// with them excluded after a pipeline to a new block fails).
+    pub async fn handle_add_block_as(&self, path: &str, client: &str, excluded: &[String]) -> Result<LocatedBlock, Status> {
         let inode = self.namespace
             .lookup(path)
             .await
@@ -670,9 +674,14 @@ impl ClientNamenodeService {
 
         // Select datanodes for replica placement (before allocating, so a
         // placement failure doesn't leak an allocated block)
-        let targets = self.placement_policy
-            .choose_targets(Some(replication))
-            .map_err(|e| Status::resource_exhausted(format!("Failed to choose targets: {}", e)))?;
+        // As many of `replication` as are available outside `excluded`.
+        let exclude: Vec<&str> = excluded.iter().map(String::as_str).collect();
+        let targets = (1..=replication.max(1) as usize)
+            .rev()
+            .find_map(|n| self.placement_policy.choose_targets_excluding(n, &exclude).ok())
+            .ok_or_else(|| Status::resource_exhausted(format!(
+                "Failed to choose targets: no live DataNode outside {:?}", excluded
+            )))?;
 
         let mut tx = self.begin().await?;
         let mut inode_guard = inode.write().await;
@@ -826,12 +835,12 @@ impl ClientNamenodeService {
     /// the last block is full. Writing into a partially filled last block needs the DataNode
     /// append pipeline, which Pillar lacks, so that is refused unless the
     /// client asked for a new block (CreateFlag.NEW_BLOCK).
-    pub async fn handle_append(&self, path: &str, new_block: bool) -> Result<(), Status> {
+    pub async fn handle_append(&self, path: &str, new_block: bool) -> Result<Option<LocatedBlock>, Status> {
         self.handle_append_as(path, new_block, "").await
     }
 
     /// append by `client`: the file becomes open for it (see handle_append).
-    pub async fn handle_append_as(&self, path: &str, new_block: bool, client: &str) -> Result<(), Status> {
+    pub async fn handle_append_as(&self, path: &str, new_block: bool, client: &str) -> Result<Option<LocatedBlock>, Status> {
         self.take_over_if_open(path, client, "append").await?;
         let inode = self.namespace
             .lookup(path)
@@ -847,23 +856,56 @@ impl ClientNamenodeService {
         if inode_guard.is_dir {
             return Err(Status::invalid_argument("Cannot append to directory"));
         }
-        let partial = inode_guard
-            .blocks
-            .as_ref()
-            .and_then(|b| b.last())
-            .is_some_and(|last| last.num_bytes < inode_guard.block_size);
-        if partial && !new_block {
-            return Err(Status::unimplemented(format!(
-                "append to {}: its last block is partially filled, and Pillar cannot extend a block yet; \
-                 append with CreateFlag.NEW_BLOCK to start a new one",
-                path
-            )));
-        }
-        let (id, blocks) = (inode_guard.id, inode_guard.blocks.as_ref().map_or(0, |b| b.len()) as u32);
+        let blocks = inode_guard.blocks.as_deref().unwrap_or(&[]);
+        let partial = blocks.last().filter(|last| last.num_bytes < inode_guard.block_size).cloned();
+        let id = inode_guard.id;
+        let length: u64 = blocks.iter().map(|b| b.num_bytes).sum();
+        let count = blocks.len() as u32;
         drop(inode_guard);
-        self.open_for(&mut tx, id, client, blocks).await;
+        // Extend a partially filled last block (the client's pipeline reopens
+        // its replicas), unless the client asked for a new block. Either way
+        // the file is open for the client from here.
+        let last = match partial {
+            Some(last) if !new_block => {
+                self.open_for(&mut tx, id, client, count - 1).await;
+                Some(self.locate(&last, length - last.num_bytes))
+            }
+            _ => {
+                self.open_for(&mut tx, id, client, count).await;
+                None
+            }
+        };
         tx.commit().await.map_err(edit_status)?;
-        info!("Append to {} by {} starts a new block", path, client);
+        match &last {
+            Some(b) => info!("Append to {} by {} extends block {} at {} bytes", path, client, b.block_id, b.num_bytes),
+            None => info!("Append to {} by {} starts a new block", path, client),
+        }
+        Ok(last)
+    }
+
+    /// updatePipeline: the client rebuilt the pipeline of a block it is
+    /// writing (a DataNode failed). The generation stamp was bumped by
+    /// updateBlockForPipeline; replicas outside the new pipeline are stale.
+    pub async fn handle_update_pipeline(
+        &self,
+        client: &str,
+        block_id: u64,
+        new_generation_stamp: u64,
+        new_nodes: &[String],
+    ) -> Result<(), Status> {
+        let block = BlockId::new(block_id, new_generation_stamp);
+        let info = self.block_manager.get_block_info(&block).ok_or_else(|| {
+            Status::invalid_argument(format!("updatePipeline: block {} has no generation stamp {}", block_id, new_generation_stamp))
+        })?;
+        if let Some(inode) = self.namespace.get_inode(info.inode_id) {
+            check_holder(&*inode.read().await, &format!("inode {}", info.inode_id), client)?;
+        }
+        for holder in self.block_manager.get_block_locations_shared(&block).unwrap_or_default() {
+            if !new_nodes.contains(&holder.uuid) {
+                self.block_manager.drop_replica(&block, &holder.uuid);
+            }
+        }
+        info!("Pipeline of block {} rebuilt (generation stamp {}) on {:?}", block_id, new_generation_stamp, new_nodes);
         Ok(())
     }
 
@@ -1578,15 +1620,18 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
         close_file(&service, "/test.txt").await;
 
-        // A partially filled last block cannot be extended: refused, unless
-        // the client asks for a new block. Either way append allocates
-        // nothing itself (the client's addBlock does), and opens the file.
-        let err = service.handle_append("/test.txt", false).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        service.handle_append("/test.txt", true).await.unwrap();
+        // A partially filled last block is handed back to be extended (at
+        // its offset, with its length); append allocates nothing itself.
+        let last = service.handle_append("/test.txt", false).await.unwrap().expect("the partial last block");
+        assert_eq!((last.block_id, last.offset, last.num_bytes), (block1.block_id, 0, 64 * 1024 * 1024));
         assert_eq!(blocks().await, 1);
         assert!(!service.handle_is_file_closed("/test.txt").await.unwrap());
-        let _ = block1;
+        // Readers still see it at its old length meanwhile.
+        let located = service.handle_get_located_blocks("/test.txt", 0, u64::MAX).await.unwrap();
+        assert_eq!(located.file_length, 64 * 1024 * 1024);
+        close_file(&service, "/test.txt").await;
+        // With CreateFlag.NEW_BLOCK it is left alone: the client adds one.
+        assert!(service.handle_append("/test.txt", true).await.unwrap().is_none());
         close_file(&service, "/test.txt").await;
 
         // Mark block as full
@@ -1599,10 +1644,11 @@ mod tests {
             }
         }
 
-        // A full last block: append is fine, and still allocates nothing
-        // (allocating here as well as in the client's addBlock left an empty
-        // block no DataNode ever reported, so complete() never succeeded).
-        service.handle_append("/test.txt", false).await.unwrap();
+        // A full last block: append is fine, returns no block to extend, and
+        // still allocates nothing (allocating here as well as in the client's
+        // addBlock left an empty block no DataNode ever reported, so
+        // complete() never succeeded).
+        assert!(service.handle_append("/test.txt", false).await.unwrap().is_none());
         assert_eq!(blocks().await, 1);
     }
 
@@ -2762,7 +2808,7 @@ mod tests {
             1_000_000_000,
         ).unwrap();
 
-        // Create a file - should fail because we need 3 datanodes but only have 2
+        // Replication 3, but only 2 DataNodes
         let result = service.handle_create(
             "/test.txt",
             "user".to_string(),
@@ -2775,9 +2821,16 @@ mod tests {
         // Creation should succeed (metadata operation)
         assert!(result.is_ok());
 
-        // But adding a block should fail due to insufficient datanodes
-        let add_block_result = service.handle_add_block("/test.txt").await;
-        assert!(add_block_result.is_err());
+        // As in HDFS, the block goes to the DataNodes there are (at least
+        // the minimum replication, 1); the replication monitor adds the
+        // rest when more DataNodes join.
+        let located = service.handle_add_block("/test.txt").await.unwrap();
+        assert_eq!(located.locations.len(), 2);
+
+        // With every DataNode excluded (the client could reach none), it fails.
+        let excluded = ["dn1".to_string(), "dn2".to_string()];
+        let err = service.handle_add_block_as("/test.txt", "", &excluded).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]
@@ -3912,7 +3965,7 @@ mod tests {
         open_as(&service, "/f", "alice").await;
         assert!(!service.handle_is_file_closed("/f").await.unwrap());
 
-        let e = service.handle_add_block_as("/f", "bob").await.unwrap_err();
+        let e = service.handle_add_block_as("/f", "bob", &[]).await.unwrap_err();
         assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
         let e = service.handle_complete_as("/f", "bob").await.unwrap_err();
         assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
@@ -3924,14 +3977,14 @@ mod tests {
         assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException");
         assert!(service.handle_append_as("/f", true, "bob").await.is_err());
 
-        let b = service.handle_add_block_as("/f", "alice").await.unwrap();
+        let b = service.handle_add_block_as("/f", "alice", &[]).await.unwrap();
         service.handle_commit_block_as("/f", b.block_id, 10, "alice").await.unwrap();
         blocks.report_block(DatanodeId::new("dn0".into(), "h".into(), 1), BlockId::new(b.block_id, b.generation_stamp), 10);
         assert!(service.handle_complete_as("/f", "alice").await.unwrap());
         assert!(service.handle_is_file_closed("/f").await.unwrap());
         // A retried complete succeeds; writing to a closed file does not.
         assert!(service.handle_complete_as("/f", "alice").await.unwrap());
-        let e = service.handle_add_block_as("/f", "alice").await.unwrap_err();
+        let e = service.handle_add_block_as("/f", "alice", &[]).await.unwrap_err();
         assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
         assert_eq!(service.leases.open_file_count(), 0);
     }
@@ -3940,7 +3993,7 @@ mod tests {
     async fn after_the_soft_limit_another_client_takes_over() {
         let (service, _) = service_with_leases(100, 60_000);
         open_as(&service, "/f", "alice").await;
-        service.handle_add_block_as("/f", "alice").await.unwrap();
+        service.handle_add_block_as("/f", "alice", &[]).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         // Alice stopped renewing: Bob's create (overwrite) recovers the file
         // first. The unfinished block is dropped, and Bob gets a new file.
@@ -3951,7 +4004,7 @@ mod tests {
         let st = service.handle_list_open_files().await;
         assert_eq!(st.len(), 1);
         assert_eq!((st[0].1.as_str(), st[0].2.as_str()), ("/f", "bob"));
-        let e = service.handle_add_block_as("/f", "alice").await.unwrap_err();
+        let e = service.handle_add_block_as("/f", "alice", &[]).await.unwrap_err();
         assert_eq!(hadoop_class(&e), "org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException");
     }
 
@@ -3974,14 +4027,14 @@ mod tests {
         // /done: its last block was finished by a DataNode (reported, 700
         // bytes) but the writer died before complete().
         open_as(&service, "/done", "alice").await;
-        let b1 = service.handle_add_block_as("/done", "alice").await.unwrap();
+        let b1 = service.handle_add_block_as("/done", "alice", &[]).await.unwrap();
         service.handle_commit_block_as("/done", b1.block_id, 1024, "alice").await.unwrap();
         blocks.report_block(dn.clone(), BlockId::new(b1.block_id, b1.generation_stamp), 1024);
-        let b2 = service.handle_add_block_as("/done", "alice").await.unwrap();
+        let b2 = service.handle_add_block_as("/done", "alice", &[]).await.unwrap();
         blocks.report_block(dn.clone(), BlockId::new(b2.block_id, b2.generation_stamp), 700);
         // /torn: the writer died mid-block; no DataNode finished it.
         open_as(&service, "/torn", "alice").await;
-        let t1 = service.handle_add_block_as("/torn", "alice").await.unwrap();
+        let t1 = service.handle_add_block_as("/torn", "alice", &[]).await.unwrap();
         // Readers see only finished blocks meanwhile.
         assert_eq!(service.handle_get_located_blocks("/done", 0, u64::MAX).await.unwrap().file_length, 1024);
 
@@ -4200,9 +4253,9 @@ mod tests {
         service.handle_append("/t", true).await.unwrap();
         let b = service.handle_add_block("/t").await.unwrap();
         service.handle_commit_block("/t", b.block_id, 5).await.unwrap();
-        // The block being written stays hidden until the file is closed.
+        // The block being written is visible once it has a committed length.
         let open = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
-        assert_eq!((offsets(&open.blocks), open.under_construction), (vec![0, 100, 120], true));
+        assert_eq!((offsets(&open.blocks), open.under_construction), (vec![0, 100, 120, 190], true));
         close_file(&service, "/t").await;
         let located = service.handle_get_located_blocks("/t", 0, u64::MAX).await.unwrap();
         assert_eq!(offsets(&located.blocks), vec![0, 100, 120, 190]);

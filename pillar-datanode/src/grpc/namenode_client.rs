@@ -26,6 +26,12 @@ use crate::storage::{VolumeManager, BlockStorage};
 use crate::storage::block_storage::{BlockEvent, BlockId};
 use crate::replication::{ReplicationCoordinator, ReplicationRequest, ReplicationTarget};
 
+/// How often to look for abandoned replicas being written, and how old
+/// they must be: well past the NameNode's lease hard limit (20 min), so
+/// their file has been recovered.
+const STALE_RBW_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+const STALE_RBW_AGE: Duration = Duration::from_secs(3600);
+
 /// Block transfers a DataNode runs at once (HDFS
 /// `dfs.namenode.replication.max-streams` defaults to 2).
 const MAX_CONCURRENT_TRANSFERS: usize = 2;
@@ -409,9 +415,21 @@ impl NamenodeClient {
         let mut interval = time::interval(self.heartbeat_interval);
         let mut first_heartbeat = true;
         let mut last_full_report = time::Instant::now();
+        let mut last_sweep = time::Instant::now();
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.block_storage.event_recorded() => {
+                    // A replica was finalized or deleted: tell the NameNode
+                    // now, not at the next heartbeat (a writer's complete()
+                    // waits for it).
+                    if let Err(e) = self.send_incremental_block_report().await {
+                        warn!("Incremental block report failed: {}", e);
+                    }
+                    continue;
+                }
+            }
 
             match self.send_heartbeat().await {
                 Ok(commands) => {
@@ -435,6 +453,13 @@ impl NamenodeClient {
 
             if let Err(e) = self.send_incremental_block_report().await {
                 warn!("Incremental block report failed: {}", e);
+            }
+
+            // Replicas being written that no pipeline came back for.
+            if last_sweep.elapsed() >= STALE_RBW_SWEEP_INTERVAL {
+                last_sweep = time::Instant::now();
+                let storage = self.block_storage.clone();
+                tokio::task::spawn_blocking(move || storage.sweep_stale_rbw(STALE_RBW_AGE));
             }
 
             if last_full_report.elapsed() >= self.block_report_interval {

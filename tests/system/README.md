@@ -28,6 +28,7 @@ namespace, so tests run in parallel.
 | `hadoop-cli` | more of `hadoop fs`, including commands that must fail (`mkdir` of an existing directory, `rmdir` of a non-empty one, `cat` of a missing file) |
 | `replication` | every DataNode holds a block file and a `.meta` checksum file for each of the file's blocks; deleting the file removes them all |
 | `namenode-restart` | the NameNode pod is force-deleted and comes back on its volume; files, renames and deletes survive; DataNodes re-register; new writes work |
+| `datanode-failure` | a DataNode pod is force-deleted while the Hadoop client streams a file through it; pipeline recovery finishes the write with the right content |
 | `lease-recovery` | a writer pod is force-killed mid-file; the file stays open (`dfsadmin -listOpenFiles`, overwrite refused) until `hdfs debug recoverLease`, which keeps exactly the finished blocks |
 | `helm-chart` | the Helm chart, installed as shipped, serves the client |
 
