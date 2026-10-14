@@ -410,7 +410,7 @@ impl NameNode {
                 let realm = principal.rsplit_once('@').map(|(_, r)| r).unwrap_or_default();
                 let callers = self.config.datanode_principal.clone().unwrap_or_else(|| format!("dn/_HOST@{}", realm));
                 let server = crate::ipc::KerberosServer::new(keytab, principal).map_err(|e| anyhow::anyhow!("Kerberos: {}", e))?;
-                let acceptor = pillar_common::grpc_auth::KerberosAcceptor::new(server, &callers)
+                let acceptor = pillar_common::grpc_auth::KerberosAcceptor::new(server, &callers, self.config.rpc_protection.clone())
                     .map_err(|e| anyhow::anyhow!("--datanode-principal: {}", e))?;
                 info!("DataNodes must authenticate as {}", callers);
                 Some(Arc::new(acceptor))

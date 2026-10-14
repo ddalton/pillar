@@ -45,12 +45,12 @@ echo $! >"$WORK/nn.pid"
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19100) 2>/dev/null && break; sleep 0.2; done
 # DataNodes log in from their keytab (KDCs from krb5.conf) to call the NameNode.
 export KRB5_CONFIG=$KDC/krb5.conf
-datanode() { # index uuid [kerberos flags...]
+datanode() { # index uuid [kerberos flags...]; $DN_PROTECTION overrides the protection
     local i=$1 uuid=$2; shift 2
     mkdir -p "$WORK/dn$i"
     "$BIN/pillar-datanode" --namenode 127.0.0.1:19100 --uuid "$uuid" --hostname 127.0.0.1 \
         --rpc-addr "127.0.0.1:1996$i" --data-addr "127.0.0.1:5011$i" --http-addr "127.0.0.1:5017$i" \
-        --volume-mount-point "$WORK/dn$i" --transport tcp --rpc-protection "$RPC_PROTECTION" "$@" >"$WORK/dn$i.log" 2>&1 &
+        --volume-mount-point "$WORK/dn$i" --transport tcp --rpc-protection "${DN_PROTECTION:-$RPC_PROTECTION}" "$@" >"$WORK/dn$i.log" 2>&1 &
     echo $! >"$WORK/dn$i.pid"
 }
 for i in 0 1 2; do
@@ -61,6 +61,11 @@ done
 datanode 3 rogue-simple
 datanode 4 rogue-alice --kerberos-keytab "$KDC/alice.keytab" --kerberos-principal alice@PILLAR.TEST \
     --namenode-principal nn/localhost@PILLAR.TEST
+# With RPC protection on, a real DataNode asking for less is refused too.
+if [ "$RPC_PROTECTION" != authentication ]; then
+    DN_PROTECTION=authentication datanode 5 weak-dn --kerberos-keytab "$KDC/dn.keytab" \
+        --kerberos-principal dn/localhost@PILLAR.TEST --namenode-principal nn/localhost@PILLAR.TEST
+fi
 for _ in $(seq 50); do [ "$(grep -c 'Registered datanode' "$WORK/nn.log")" -ge 3 ] && break; sleep 0.2; done
 sleep 3
 
@@ -87,6 +92,11 @@ grep 'Registered datanode' "$WORK/nn.log" | grep -q rogue && fail "an impostor D
 grep -q 'no Kerberos credentials' "$WORK/nn.log" || fail "the SIMPLE DataNode was not refused"
 grep -q 'alice@PILLAR.TEST is not a dn principal' "$WORK/nn.log" || fail "alice's DataNode was not refused"
 echo "ok    DataNodes without a dn/ Kerberos principal cannot join"
+if [ "$RPC_PROTECTION" != authentication ]; then
+    grep 'Registered datanode' "$WORK/nn.log" | grep -q weak-dn && fail "a DataNode without $RPC_PROTECTION registered"
+    grep -q 'asks for RPC protection authentication' "$WORK/nn.log" || fail "the unprotected DataNode was not refused"
+    echo "ok    DataNode calls are protected ($RPC_PROTECTION); a DataNode asking for less is refused"
+fi
 
 # The DataNode-to-NameNode authentication against this KDC: replays, users
 # and forged NameNode replies are refused.
