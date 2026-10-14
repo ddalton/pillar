@@ -35,8 +35,13 @@ pub struct FsPermission {
 }
 
 impl FsPermission {
+    /// Permission bits and the sticky bit (0o1000).
     pub fn new(mode: u16) -> Self {
-        Self { mode: mode & 0o777 }
+        Self { mode: mode & 0o1777 }
+    }
+
+    pub fn sticky(&self) -> bool {
+        self.mode & 0o1000 != 0
     }
 
     pub fn default_dir() -> Self {
@@ -64,6 +69,21 @@ pub struct BlockInfo {
 pub struct UnderConstruction {
     pub holder: String,
     pub blocks_at_open: u32,
+}
+
+/// What a permission check needs to know of an inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InodeAttrs {
+    pub owner: String,
+    pub group: String,
+    pub mode: u16,
+    pub is_dir: bool,
+}
+
+impl InodeAttrs {
+    fn of(inode: &INode) -> Self {
+        Self { owner: inode.owner.clone(), group: inode.group.clone(), mode: inode.permissions.mode, is_dir: inode.is_dir }
+    }
 }
 
 /// INode (Index Node) - represents a file or directory in HDFS
@@ -258,6 +278,60 @@ impl Namespace {
         }
 
         Ok(current_id)
+    }
+
+    /// What permission checks need of each component of `path`, root
+    /// first: its attributes, or `None` from the first that does not exist.
+    pub async fn resolve_attrs(&self, path: &str) -> Vec<Option<InodeAttrs>> {
+        let components = Self::split_path(path);
+        let mut out = Vec::with_capacity(components.len() + 1);
+        let mut current = Some(self.root_id);
+        for i in 0..=components.len() {
+            let Some(id) = current else {
+                out.push(None);
+                continue;
+            };
+            let Some(inode) = self.inode_arc(id) else {
+                out.push(None);
+                current = None;
+                continue;
+            };
+            let inode = inode.read().await;
+            out.push(Some(InodeAttrs::of(&inode)));
+            current = components.get(i).and_then(|c| inode.children.as_ref()?.get(*c).map(|e| *e.value()));
+        }
+        out
+    }
+
+    /// The directories of the subtree at `path` (itself first), each with
+    /// the attributes of its children, for checks over a whole subtree.
+    pub async fn subtree_dirs(&self, path: &str) -> Result<Vec<(String, InodeAttrs, Vec<InodeAttrs>)>> {
+        let mut out = Vec::new();
+        let root = self.resolve(&Self::split_path(path), path).await?;
+        let mut stack = vec![(path.trim_end_matches('/').to_string(), root)];
+        while let Some((dir_path, id)) = stack.pop() {
+            let Some(inode) = self.inode_arc(id) else { continue };
+            let inode = inode.read().await;
+            if !inode.is_dir {
+                continue;
+            }
+            let mut children = Vec::new();
+            if let Some(c) = inode.children.as_ref() {
+                let ids: Vec<(String, u64)> = c.iter().map(|e| (e.key().clone(), *e.value())).collect();
+                for (name, child_id) in ids {
+                    if let Some(child) = self.inode_arc(child_id) {
+                        let child = child.read().await;
+                        if child.is_dir {
+                            stack.push((format!("{}/{}", dir_path, name), child_id));
+                        }
+                        children.push(InodeAttrs::of(&child));
+                    }
+                }
+            }
+            let shown = if dir_path.is_empty() { "/".to_string() } else { dir_path.clone() };
+            out.push((shown, InodeAttrs::of(&inode), children));
+        }
+        Ok(out)
     }
 
     /// Lookup an inode by path

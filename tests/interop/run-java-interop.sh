@@ -41,7 +41,8 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
 
 start_namenode() { # log file
     "$BIN/pillar-namenode" --rpc-addr 127.0.0.1:19000 --http-addr 127.0.0.1:19870 \
-        --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" $NN_FLAGS >"$1" 2>&1 &
+        --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" \
+        --user-groups "alice=staff;bob=staff" $NN_FLAGS >"$1" 2>&1 &
     echo $! >"$WORK/nn.pid"
     for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19000) 2>/dev/null && break; sleep 0.2; done
 }

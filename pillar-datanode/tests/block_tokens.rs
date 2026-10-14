@@ -52,6 +52,8 @@ async fn start_cluster(n: usize) -> Cluster {
         rpc_addr: nn_addr,
         http_addr: free_addr(),
         etcd_endpoints: vec!["none".into()],
+        // hdfs-native acts as the local OS user, who owns nothing here.
+        permissions: pillar_namenode::permission::Permissions::disabled(),
         name_dir: Some(PathBuf::from(name_dir.path())),
         block_access_tokens: true,
         ..Default::default()

@@ -64,6 +64,9 @@ pub struct NameNodeConfig {
     /// The protection Hadoop IPC callers may negotiate with SASL
     /// (`hadoop.rpc.protection`: authentication, integrity, privacy).
     pub rpc_protection: pillar_common::sasl::Protection,
+    /// Permission enforcement (HDFS dfs.permissions.enabled, on by
+    /// default), the superuser and supergroup, and users' groups.
+    pub permissions: crate::permission::Permissions,
 
     /// Block access tokens (HDFS dfs.block.access.token.enable); always on
     /// with Kerberos.
@@ -100,6 +103,7 @@ impl Default for NameNodeConfig {
             kerberos_principal: None,
             datanode_principal: None,
             rpc_protection: Default::default(),
+            permissions: Default::default(),
             block_access_tokens: false,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
@@ -159,6 +163,21 @@ impl NameNodeConfig {
         }
         if let Ok(val) = env::var("NAMENODE_DATANODE_PRINCIPAL") {
             config.datanode_principal = Some(val);
+        }
+        if let Ok(val) = env::var("NAMENODE_PERMISSIONS_ENABLED") {
+            config.permissions.enabled = val != "false";
+        }
+        if let Ok(val) = env::var("NAMENODE_SUPERUSER") {
+            config.permissions.superuser = val;
+        }
+        if let Ok(val) = env::var("NAMENODE_SUPERUSERGROUP") {
+            config.permissions.supergroup = val;
+        }
+        if let Ok(val) = env::var("NAMENODE_USER_GROUPS") {
+            match crate::permission::Permissions::parse_groups(&val) {
+                Ok(g) => config.permissions.groups = g,
+                Err(e) => tracing::warn!("NAMENODE_USER_GROUPS: {}", e),
+            }
         }
         if let Ok(val) = env::var("NAMENODE_RPC_PROTECTION") {
             match val.parse() {
@@ -348,6 +367,13 @@ impl NameNode {
         // Block recovery: lease recovery sends commands through the DataNode
         // service, and DataNodes report back to the namespace through it.
         client_service_arc.set_datanode_commands(datanode_service_arc.clone());
+        let p = &self.config.permissions;
+        if p.enabled {
+            info!("Permissions enforced (superuser {}, supergroup {})", p.superuser, p.supergroup);
+        } else {
+            info!("Permissions are not enforced");
+        }
+        client_service_arc.set_permissions(p.clone());
         datanode_service_arc.set_namespace_service(&client_service_arc);
 
         // Block access tokens: minted for clients, keys sent to DataNodes,

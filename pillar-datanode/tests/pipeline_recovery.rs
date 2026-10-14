@@ -106,6 +106,8 @@ async fn start_cluster(n: usize) -> Cluster {
         rpc_addr: nn_addr,
         http_addr: free_addr(),
         etcd_endpoints: vec!["none".into()],
+        // hdfs-native acts as the local OS user, who owns nothing here.
+        permissions: pillar_namenode::permission::Permissions::disabled(),
         name_dir: Some(PathBuf::from(name_dir.path())),
         // Notice a dead DataNode within a second, so new blocks avoid it.
         datanode_stale_interval: Duration::from_millis(500),

@@ -16,9 +16,39 @@ import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.client.HdfsDataOutputStream;
+import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.security.UserGroupInformation;
 
-/** Stock Hadoop DFSClient against Pillar: the code path `hadoop fs` uses. */
+/**
+ * Stock Hadoop DFSClient against Pillar: the code path `hadoop fs` uses.
+ * Runs as alice; the NameNode enforces permissions (superuser hdfs, groups
+ * alice=staff and bob=staff).
+ */
 public class HdfsInterop {
+    interface Action { void run(FileSystem fs) throws Exception; }
+
+    /** Run `a` as `user` (SIMPLE: the client names its user). */
+    static void as(String user, Configuration conf, Action a) throws Exception {
+        UserGroupInformation.createRemoteUser(user).doAs((java.security.PrivilegedExceptionAction<Void>) () -> {
+            try (FileSystem fs = FileSystem.newInstance(conf)) { a.run(fs); }
+            return null;
+        });
+    }
+
+    /** Whether `a`, as `user`, is refused with an AccessControlException. */
+    static String refused(String user, Configuration conf, Action a) throws Exception {
+        String[] why = {null};
+        as(user, conf, fs -> {
+            try { a.run(fs); } catch (AccessControlException e) { why[0] = e.getMessage().split("\n")[0]; }
+        });
+        return why[0];
+    }
+
+    static void denied(String user, Configuration conf, String what, Action a) throws Exception {
+        String why = refused(user, conf, a);
+        check(why != null, what + " is refused (" + why + ")");
+    }
+
     static void check(boolean ok, String what) {
         if (!ok) throw new AssertionError(what);
         System.out.println("ok    " + what);
@@ -47,6 +77,12 @@ public class HdfsInterop {
             pipelineAcrossADatanodeFailure(fs, args[2], args[3]);
             return;
         }
+
+        // The root is the superuser's; it opens it to everyone, like /tmp.
+        denied("alice", conf, "alice creating a directory in hdfs's 755 /", u -> u.mkdirs(new Path("/java")));
+        as("hdfs", conf, su -> su.setPermission(new Path("/"), new FsPermission((short) 01777)));
+        FsPermission root = fs.getFileStatus(new Path("/")).getPermission();
+        check(root.toShort() == 01777 && root.getStickyBit(), "the superuser makes / world-writable and sticky (" + root + ")");
 
         Path dir = new Path("/java/nested");
         check(fs.mkdirs(dir), "mkdirs -p " + dir);
@@ -109,14 +145,23 @@ public class HdfsInterop {
         check(fs.getFileStatus(m).getOwner().equals(System.getenv("HADOOP_USER_NAME")),
               "owner is the calling user (" + fs.getFileStatus(m).getOwner() + ")");
         fs.setPermission(m, new FsPermission((short) 0640));
-        fs.setOwner(m, "bob", "eng");
         fs.setTimes(m, 1_000_000L, 2_000_000L);
         check(fs.setReplication(m, (short) 2), "setReplication");
+        fs.access(m, FsAction.READ);
+        // Giving a file away takes the superuser.
+        denied("alice", conf, "alice giving her file to bob", u -> u.setOwner(m, "bob", null));
+        denied("alice", conf, "alice moving her file to a group she is not in", u -> u.setOwner(m, null, "eng"));
+        fs.setOwner(m, null, "staff");
+        check(fs.getFileStatus(m).getGroup().equals("staff"), "alice moves her file to her group, staff");
+        as("hdfs", conf, su -> su.setOwner(m, "bob", "eng"));
         FileStatus ms = fs.getFileStatus(m);
         check(ms.getPermission().toShort() == 0640 && ms.getOwner().equals("bob") && ms.getGroup().equals("eng")
               && ms.getModificationTime() == 1_000_000L && ms.getAccessTime() == 2_000_000L && ms.getReplication() == 2,
               "setPermission/setOwner/setTimes/setReplication are visible");
-        fs.access(m, FsAction.READ);
+        // bob's file now, rw-r----- for eng: nothing for alice.
+        boolean noRead = false;
+        try { fs.access(m, FsAction.READ); } catch (AccessControlException e) { noRead = true; }
+        check(noRead, "access(READ) on bob's 640 file is refused for alice");
         boolean missing = false;
         try { fs.access(new Path("/java/nope"), FsAction.READ); } catch (java.io.FileNotFoundException e) { missing = true; }
         check(missing, "access() on a missing path throws FileNotFoundException");
@@ -219,6 +264,8 @@ public class HdfsInterop {
         try { abandoned.close(); } catch (java.io.IOException expected) { }
         rescuer.close();
 
+        permissionChecks(conf, fs);
+        // bob's renamed.bin is in alice's /java: hers to delete with it.
         check(fs.delete(new Path("/java"), true), "recursive delete");
         check(!fs.exists(new Path("/java")), "gone after delete");
 
@@ -228,6 +275,56 @@ public class HdfsInterop {
         check(fs.getFileStatus(KEEP).getLen() == keepData().length, "wrote " + KEEP + " for the restart check");
         fs.close();
         System.out.println("ALL OK");
+    }
+
+    /** What bob, in alice's group, may and may not do to alice's files. */
+    static void permissionChecks(Configuration conf, FileSystem fs) throws Exception {
+        Path home = new Path("/java/home");
+        fs.mkdirs(home);
+        fs.setPermission(home, new FsPermission((short) 0750));
+        Path notes = new Path(home, "notes.txt");
+        try (FSDataOutputStream out = fs.create(notes)) { out.write("alice's notes\n".getBytes()); }
+        fs.setPermission(notes, new FsPermission((short) 0640));
+        FileStatus st = fs.getFileStatus(home);
+        // / is hdfs:supergroup, so /java and everything alice makes in it
+        // are in supergroup too (alice is not in it).
+        check(st.getGroup().equals("supergroup"), "a new directory takes its parent's group (" + st.getGroup() + ")");
+        fs.setOwner(home, null, "staff");
+        fs.setOwner(notes, null, "staff");
+
+        // Group r-x / r--: bob lists and reads, but cannot write.
+        as("bob", conf, b -> {
+            check(b.listStatus(home).length == 1, "bob (staff) lists alice's 750 directory");
+            try (FSDataInputStream in = b.open(notes)) {
+                check(new String(in.readAllBytes()).equals("alice's notes\n"), "bob (staff) reads alice's 640 file");
+            }
+        });
+        denied("bob", conf, "bob writing alice's 640 file", b -> b.append(notes).close());
+        denied("bob", conf, "bob creating a file in alice's 750 directory", b -> b.create(new Path(home, "bob.txt")).close());
+        denied("bob", conf, "bob deleting alice's file", b -> b.delete(notes, false));
+        denied("bob", conf, "bob renaming alice's file", b -> b.rename(notes, new Path("/java/stolen.txt")));
+        denied("bob", conf, "bob changing the mode of alice's file", b -> b.setPermission(notes, new FsPermission((short) 0666)));
+        denied("bob", conf, "bob changing the times of alice's file", b -> b.setTimes(notes, 1L, 1L));
+
+        // Others (carol, in no group) cannot even traverse.
+        String why = refused("carol", conf, c -> c.getFileStatus(notes));
+        check(why != null && why.contains("access=EXECUTE"), "carol cannot traverse alice's 750 directory (" + why + ")");
+
+        // The sticky / : bob may create there, but not remove alice's /java.
+        as("bob", conf, b -> {
+            check(b.mkdirs(new Path("/bob")), "bob creates /bob in the sticky, world-writable /");
+            check(b.delete(new Path("/bob"), true), "bob deletes his own /bob");
+        });
+        why = refused("bob", conf, b -> b.delete(new Path("/java"), true));
+        check(why != null && (why.contains("sticky bit") || why.contains("access=")), "bob deleting alice's /java is refused (" + why + ")");
+
+        // The superuser may do anything.
+        as("hdfs", conf, su -> {
+            try (FSDataInputStream in = su.open(notes)) { in.readAllBytes(); }
+            su.setPermission(notes, new FsPermission((short) 0600));
+        });
+        check(fs.getFileStatus(notes).getPermission().toShort() == 0600, "the superuser reads and chmods any file");
+        denied("bob", conf, "bob reading alice's file after it is made 600", b -> b.open(notes).close());
     }
 
     /**
