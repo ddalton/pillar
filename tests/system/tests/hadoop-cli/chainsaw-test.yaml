@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: hadoop-cli
+spec:
+  description: >-
+    More of the hadoop fs command set, including the commands that must
+    fail. Not covered because Pillar does not implement them: -checksum,
+    fsck and the NameNode web UI.
+  steps:
+  - name: cluster
+    try:
+    - apply:
+        file: ../../common/pillar-cluster.yaml
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+  - name: commands
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          # Under set -e, "! cmd" does not stop the script when cmd succeeds.
+          fails() { if "$@"; then echo "FAIL: succeeded: $*"; exit 1; fi; }
+          hdfs dfs -mkdir -p /user/test/a/b
+          fails hdfs dfs -mkdir /user/test/a                            # exists, no -p
+          hdfs dfs -touchz /user/test/empty
+          [ "$(hdfs dfs -stat %b /user/test/empty)" = 0 ]
+          echo "some content" > /tmp/f.txt
+          hdfs dfs -put /tmp/f.txt /user/test/
+          fails hdfs dfs -put /tmp/f.txt /user/test/                    # exists, no -f
+          hdfs dfs -mv /user/test/f.txt /user/test/a/moved.txt
+          fails hdfs dfs -test -e /user/test/f.txt
+          [ "$(hdfs dfs -cat /user/test/a/moved.txt)" = "some content" ]
+          hdfs dfs -test -d /user/test/a
+          hdfs dfs -test -f /user/test/a/moved.txt
+          fails hdfs dfs -test -d /user/test/a/moved.txt
+          fails hdfs dfs -rmdir /user/test/a                            # not empty
+          hdfs dfs -rm -skipTrash /user/test/empty
+          hdfs dfs -count /user/test | awk '{ exit !($1 == 3 && $2 == 1 && $3 == 13) }'
+          hdfs dfs -du -s /user/test | awk '{ exit !($1 == 13) }'
+          hdfs dfs -ls -R /user/test | grep -q moved.txt
+          hdfs dfs -setrep 3 /user/test/a/moved.txt
+          hdfs dfs -df / | tail -1
+          hdfs dfs -rm -r -skipTrash /user/test/a
+          fails hdfs dfs -test -e /user/test/a/b
+          hdfs dfs -rmdir /user/test
+          fails hdfs dfs -cat /nonexistent                              # FileNotFound
+          echo PASS
+          SCRIPT

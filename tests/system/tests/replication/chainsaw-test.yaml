@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: replication
+spec:
+  description: >-
+    A file written with replication 3 lands on all three DataNodes (one
+    block file and one .meta checksum file per block on each), and
+    deleting it removes every replica.
+  steps:
+  - name: cluster
+    try:
+    - apply:
+        file: ../../common/pillar-cluster.yaml
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+  - name: write
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          head -c $((8 * 1048576)) /dev/urandom > /tmp/big.bin   # 8 blocks
+          hdfs dfs -put /tmp/big.bin /big.bin
+          [ "$(hdfs dfs -cat /big.bin | md5sum)" = "$(md5sum < /tmp/big.bin)" ]
+          SCRIPT
+  - name: every-datanode-holds-every-block
+    try:
+    - script:
+        content: |
+          set -eu
+          for i in 0 1 2; do
+            blocks=$(kubectl -n "$NAMESPACE" exec pillar-datanode-$i -- find /data -name 'blk_*' ! -name '*.meta' -path '*finalized*' | wc -l)
+            metas=$(kubectl -n "$NAMESPACE" exec pillar-datanode-$i -- find /data -name 'blk_*.meta' -path '*finalized*' | wc -l)
+            echo "pillar-datanode-$i: $blocks blocks, $metas .meta files"
+            [ "$blocks" -eq 8 ] && [ "$metas" -eq 8 ] || { echo "FAIL: expected 8 and 8"; exit 1; }
+          done
+  - name: delete-removes-replicas
+    try:
+    - script:
+        content: |
+          set -eu
+          kubectl -n "$NAMESPACE" exec hadoop-client -- hdfs dfs -rm -skipTrash /big.bin
+          for _ in $(seq 30); do
+            left=0
+            for i in 0 1 2; do
+              n=$(kubectl -n "$NAMESPACE" exec pillar-datanode-$i -- find /data -name 'blk_*' -path '*finalized*' | wc -l)
+              left=$((left + n))
+            done
+            [ "$left" -eq 0 ] && { echo "all replicas deleted"; exit 0; }
+            sleep 2
+          done
+          echo "FAIL: $left block files remain"; exit 1

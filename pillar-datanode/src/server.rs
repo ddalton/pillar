@@ -411,9 +411,21 @@ impl DataNode {
     pub async fn start(self: Arc<Self>) -> Result<()> {
         info!("Starting DataNode server");
 
-        // Register with NameNode
-        self.namenode_client.register().await
-            .map_err(|e| anyhow::anyhow!("Failed to register with NameNode: {}", e))?;
+        // Register with the NameNode, waiting for it if it is not up yet
+        // (in Kubernetes the pods start together). A volume that belongs to
+        // another namespace is fatal.
+        loop {
+            match self.namenode_client.register().await {
+                Ok(()) => break,
+                Err(e @ crate::grpc::namenode_client::NamenodeClientError::IncompatibleStorage(_)) => {
+                    return Err(anyhow::anyhow!("Refusing to join the NameNode: {}", e));
+                }
+                Err(e) => {
+                    warn!("Registration with the NameNode failed ({}); retrying in 2s", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
 
         // Send initial block report
         self.namenode_client.send_block_report().await

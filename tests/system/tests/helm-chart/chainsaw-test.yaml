@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: helm-chart
+spec:
+  description: >-
+    The Helm chart as shipped (NameNode on a PersistentVolume, three
+    DataNodes) serves the stock Hadoop client.
+  steps:
+  - name: install
+    try:
+    - script:
+        timeout: 6m
+        content: |
+          set -eu
+          helm install pillar ../../../../pillar-chart --namespace "$NAMESPACE" \
+            --set namenode.image.repository=pillar/namenode --set namenode.image.tag=system-test \
+            --set namenode.image.pullPolicy=Never --set namenode.persistence.size=1Gi \
+            --set datanode.image.repository=pillar/datanode --set datanode.image.tag=system-test \
+            --set datanode.image.pullPolicy=Never \
+            --set namenode.resources.requests.cpu=100m --set namenode.resources.requests.memory=256Mi \
+            --set datanode.resources.requests.cpu=100m --set datanode.resources.requests.memory=256Mi \
+            --wait --timeout 5m
+    - apply:
+        file: ../../common/hadoop-client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+    cleanup:
+    - script:
+        content: helm uninstall pillar --namespace "$NAMESPACE" --wait || true
+  - name: use
+    try:
+    - script:
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          head -c 2100000 /dev/urandom > /tmp/data.bin
+          hdfs dfs -mkdir -p /chart
+          hdfs dfs -put /tmp/data.bin /chart/data.bin
+          [ "$(hdfs dfs -cat /chart/data.bin | md5sum)" = "$(md5sum < /tmp/data.bin)" ]
+          echo PASS
+          SCRIPT

@@ -1,0 +1,127 @@
+# A Pillar cluster in the test's namespace: one NameNode with its namespace
+# on a PersistentVolume, three DataNodes. Images are loaded into kind by
+# kind.sh (imagePullPolicy: Never: a stale registry image cannot sneak in).
+apiVersion: v1
+kind: Service
+metadata:
+  name: pillar-namenode
+spec:
+  selector:
+    app: pillar-namenode
+  ports:
+  - name: rpc
+    port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pillar-namenode
+spec:
+  serviceName: pillar-namenode
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pillar-namenode
+  template:
+    metadata:
+      labels:
+        app: pillar-namenode
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: namenode
+        image: pillar/namenode:system-test
+        imagePullPolicy: Never
+        args:
+        - --rpc-addr=0.0.0.0:9000
+        - --http-addr=0.0.0.0:9870
+        - --etcd-endpoints=none
+        - --name-dir=/var/lib/pillar/name
+        - --replication=3
+        - --block-size-mb=1
+        ports:
+        - name: rpc
+          containerPort: 9000
+        readinessProbe:
+          tcpSocket:
+            port: rpc
+          periodSeconds: 2
+        volumeMounts:
+        - name: name
+          mountPath: /var/lib/pillar/name
+  volumeClaimTemplates:
+  - metadata:
+      name: name
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pillar-datanode
+spec:
+  clusterIP: None
+  selector:
+    app: pillar-datanode
+  ports:
+  - name: data
+    port: 50010
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pillar-datanode
+spec:
+  serviceName: pillar-datanode
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: pillar-datanode
+  template:
+    metadata:
+      labels:
+        app: pillar-datanode
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: datanode
+        image: pillar/datanode:system-test
+        imagePullPolicy: Never
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # Clients connect to the address a DataNode registers: the pod IP.
+        args:
+        - --namenode=pillar-namenode:9000
+        - --uuid=$(POD_NAME)
+        - --hostname=$(POD_IP)
+        - --volume-mount-point=/data
+        - --transport=tcp
+        ports:
+        - name: data
+          containerPort: 50010
+        readinessProbe:
+          tcpSocket:
+            port: data
+          periodSeconds: 2
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 1Gi

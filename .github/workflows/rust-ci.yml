@@ -1,0 +1,33 @@
+# Unit and integration tests, including the end-to-end suites that run a
+# NameNode, DataNodes and the hdfs-native client in process, and the stock
+# Apache Hadoop Java client against the built binaries.
+name: rust-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: install protoc (tonic-build)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace
+        run: cargo test --workspace
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Hadoop Java client interop (tests/interop/run-java-interop.sh)
+        run: tests/interop/run-java-interop.sh
