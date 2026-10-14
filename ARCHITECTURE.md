@@ -112,8 +112,8 @@ Based on design choices:
    - No GC pauses
    - Zero-cost abstractions
 
-2. **Block I/O:** 2-4x faster
-   - SPDK backend via Flint (373 MB/s vs 97 MB/s)
+2. **Block I/O:** (unmeasured against Java HDFS)
+   - SPDK backend via Flint
    - Async I/O with tokio
    - No JVM allocation overhead
 

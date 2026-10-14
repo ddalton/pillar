@@ -6,7 +6,7 @@ use tonic::transport::Server;
 use tracing::{info, error};
 
 use crate::metadata::{Namespace, BlockManager, EtcdMetadataStore};
-use crate::datanode::{DatanodeManager, HeartbeatMonitor, BlockPlacementPolicy};
+use crate::datanode::{DatanodeManager, BlockPlacementPolicy, ReplicationMonitor};
 use crate::grpc::{ClientNamenodeService, DatanodeProtocolService};
 
 /// Configuration for the NameNode
@@ -127,24 +127,31 @@ pub struct NameNode {
     block_manager: Arc<BlockManager>,
     datanode_manager: Arc<DatanodeManager>,
     placement_policy: Arc<BlockPlacementPolicy>,
-    heartbeat_monitor: Arc<HeartbeatMonitor>,
 }
 
 impl NameNode {
     pub async fn new(config: NameNodeConfig) -> Result<Self> {
         info!("Initializing NameNode with config: {:?}", config);
 
-        // Initialize etcd metadata store for HA
-        let metadata_store = Arc::new(
-            EtcdMetadataStore::new(config.etcd_endpoints.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))?
-        );
+        // Initialize etcd metadata store for HA. It is not yet consulted for
+        // namespace state, so "none" (or no endpoints) skips it, e.g. for
+        // local testing without etcd.
+        let etcd_disabled = config.etcd_endpoints.is_empty()
+            || config.etcd_endpoints.iter().all(|e| e.is_empty() || e == "none");
+        if etcd_disabled {
+            info!("Metadata store: etcd disabled");
+        } else {
+            let metadata_store = Arc::new(
+                EtcdMetadataStore::new(config.etcd_endpoints.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))?
+            );
 
-        metadata_store.initialize().await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize metadata store: {}", e))?;
+            metadata_store.initialize().await
+                .map_err(|e| anyhow::anyhow!("Failed to initialize metadata store: {}", e))?;
 
-        info!("Metadata store initialized with etcd: {:?}", config.etcd_endpoints);
+            info!("Metadata store initialized with etcd: {:?}", config.etcd_endpoints);
+        }
 
         // Initialize core components
         let namespace = Arc::new(Namespace::new());
@@ -154,7 +161,6 @@ impl NameNode {
             datanode_manager.clone(),
             config.default_replication,
         ));
-        let heartbeat_monitor = Arc::new(HeartbeatMonitor::new(datanode_manager.clone()));
 
         info!("NameNode core components initialized");
 
@@ -164,7 +170,6 @@ impl NameNode {
             block_manager,
             datanode_manager,
             placement_policy,
-            heartbeat_monitor,
         })
     }
 
@@ -172,11 +177,6 @@ impl NameNode {
     pub async fn start(self: Arc<Self>) -> Result<()> {
         info!("Starting NameNode server on {}", self.config.rpc_addr);
 
-        // Start heartbeat monitor in background
-        let heartbeat_monitor = self.heartbeat_monitor.clone();
-        tokio::spawn(async move {
-            heartbeat_monitor.start().await;
-        });
 
         // Create gRPC services
         let client_service = ClientNamenodeService::new(
@@ -205,18 +205,35 @@ impl NameNode {
         let client_service_arc = Arc::new(client_service);
         let datanode_service_arc = Arc::new(datanode_service);
 
-        // Create protocol servers
+        // Replication monitor: dead DataNodes and under-replicated blocks
+        // (replaces the old heartbeat monitor, which dropped dead nodes but
+        // left their replicas in the location map).
+        let replication_monitor = Arc::new(ReplicationMonitor::new(
+            self.namespace.clone(),
+            self.block_manager.clone(),
+            self.datanode_manager.clone(),
+            self.placement_policy.clone(),
+            datanode_service_arc.clone(),
+        ));
+        tokio::spawn(replication_monitor.start());
+
+        // Create protocol servers. Hadoop IPC clients get their own front end
+        // over the same ClientNamenodeService.
+        let ipc_server = Arc::new(ClientNamenodeProtocolServer::new(client_service_arc.clone()));
         let client_proto_server = ClientNamenodeProtocolServer::new(client_service_arc);
         let datanode_proto_server = DatanodeProtocolServer::new(datanode_service_arc);
 
-        info!("Starting high-performance gRPC server on {}", self.config.rpc_addr);
+        info!("Starting RPC server (Hadoop IPC + gRPC) on {}", self.config.rpc_addr);
+        let incoming = crate::ipc::bind_shared(self.config.rpc_addr, ipc_server).await?;
 
         // Build server with performance optimizations
         let server = tonic::transport::Server::builder()
             // High concurrency settings
             .concurrency_limit_per_connection(1024)
-            // Large message sizes for block transfers
-            .max_frame_size(Some(256 * 1024 * 1024)) // 256MB max frame
+            // HTTP/2 caps a frame at 2^24-1 octets; h2 panics on anything
+            // larger (the old 256 MiB value broke every gRPC connection).
+            // Messages larger than a frame are split across frames anyway.
+            .max_frame_size(Some(4 * 1024 * 1024))
             // Connection keep-alive
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .tcp_nodelay(true)
@@ -227,7 +244,7 @@ impl NameNode {
             // Add services
             .add_service(ClientNamenodeProtoServer::new(client_proto_server))
             .add_service(DatanodeProtoServer::new(datanode_proto_server))
-            .serve_with_shutdown(self.config.rpc_addr, async {
+            .serve_with_incoming_shutdown(incoming, async {
                 tokio::signal::ctrl_c().await.ok();
                 info!("Shutdown signal received");
             });

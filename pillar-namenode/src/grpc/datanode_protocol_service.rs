@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use tonic::{Request, Response, Status};
+use dashmap::DashMap;
+use tonic::Status;
 use tracing::{info, warn};
 
 use crate::datanode::DatanodeManager;
@@ -11,6 +12,8 @@ use crate::datanode::manager::StorageInfo;
 pub struct DatanodeProtocolService {
     datanode_manager: Arc<DatanodeManager>,
     block_manager: Arc<BlockManager>,
+    /// Commands waiting for each DataNode's next heartbeat, by uuid.
+    pending_commands: DashMap<String, Vec<DatanodeCommand>>,
 }
 
 impl DatanodeProtocolService {
@@ -21,6 +24,7 @@ impl DatanodeProtocolService {
         Self {
             datanode_manager,
             block_manager,
+            pending_commands: DashMap::new(),
         }
     }
 
@@ -86,12 +90,36 @@ impl DatanodeProtocolService {
             .heartbeat(uuid, storage, xceiver_count, failed_volumes)
             .map_err(|e| Status::internal(format!("Heartbeat failed: {}", e)))?;
 
-        // For now, return empty command list
-        // In full implementation, this would return commands like:
-        // - DNA_TRANSFER: replicate blocks
-        // - DNA_INVALIDATE: delete blocks
-        // - DNA_SHUTDOWN: shutdown datanode
-        Ok(Vec::new())
+        // Hand over whatever the replication monitor queued for this node,
+        // plus deletions of replicas whose blocks were removed.
+        let mut commands = self.take_commands(uuid);
+        let invalid = self.block_manager.take_invalidations(uuid);
+        if !invalid.is_empty() {
+            commands.push(DatanodeCommand::InvalidateBlocks { blocks: invalid });
+        }
+        Ok(commands)
+    }
+
+    /// Queue a command for `uuid`'s next heartbeat.
+    pub fn queue_command(&self, uuid: &str, command: DatanodeCommand) {
+        self.pending_commands.entry(uuid.to_string()).or_default().push(command);
+    }
+
+    /// Take the commands queued for `uuid`.
+    pub fn take_commands(&self, uuid: &str) -> Vec<DatanodeCommand> {
+        self.pending_commands.remove(uuid).map(|(_, v)| v).unwrap_or_default()
+    }
+
+    /// Number of DataNodes with commands waiting (for tests and metrics).
+    pub fn pending_command_count(&self, uuid: &str) -> usize {
+        self.pending_commands.get(uuid).map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn datanode_id(&self, uuid: &str) -> Result<DatanodeId, Status> {
+        self.datanode_manager
+            .get_datanode(uuid)
+            .map(|d| d.id)
+            .ok_or_else(|| Status::not_found(format!("Datanode not found: {}", uuid)))
     }
 
     /// Handle block report from datanode
@@ -100,31 +128,18 @@ impl DatanodeProtocolService {
         uuid: String,
         blocks: Vec<(u64, u64, u64)>, // (block_id, generation_stamp, num_bytes)
     ) -> Result<(), Status> {
-        let datanode_id = self.datanode_manager
-            .get_datanode(&uuid)
-            .ok_or_else(|| Status::not_found(format!("Datanode not found: {}", uuid)))?
-            .id;
+        let datanode_id = self.datanode_id(&uuid)?;
 
         info!("Received block report from {}: {} blocks", uuid, blocks.len());
 
         for (block_id, generation_stamp, num_bytes) in blocks {
-            let block = BlockId::new(block_id, generation_stamp);
-
-            // Report block to block manager
-            self.block_manager.report_block(
-                datanode_id.clone(),
-                block,
-                num_bytes,
-            );
-
-            // Add block to datanode's block list
-            let _ = self.datanode_manager.add_block_to_datanode(&uuid, block);
+            self.record_replica(&uuid, &datanode_id, BlockId::new(block_id, generation_stamp), num_bytes);
         }
 
         Ok(())
     }
 
-    /// Handle block received notification
+    /// Handle block received notification (incremental block report)
     pub async fn handle_block_received(
         &self,
         uuid: String,
@@ -132,24 +147,32 @@ impl DatanodeProtocolService {
         generation_stamp: u64,
         num_bytes: u64,
     ) -> Result<(), Status> {
-        let block = BlockId::new(block_id, generation_stamp);
-
-        let datanode_id = self.datanode_manager
-            .get_datanode(&uuid)
-            .ok_or_else(|| Status::not_found(format!("Datanode not found: {}", uuid)))?
-            .id;
-
-        // Add block location
-        self.block_manager.add_block_location(block, datanode_id);
-
-        // Add to datanode's block list
-        self.datanode_manager
-            .add_block_to_datanode(&uuid, block)
-            .map_err(|e| Status::internal(format!("Failed to add block: {}", e)))?;
-
-        info!("DataNode {} received block {}", uuid, block_id);
-
+        let datanode_id = self.datanode_id(&uuid)?;
+        self.record_replica(&uuid, &datanode_id, BlockId::new(block_id, generation_stamp), num_bytes);
+        info!("DataNode {} received block {} ({} bytes)", uuid, block_id, num_bytes);
         Ok(())
+    }
+
+    /// Handle block deleted notification (incremental block report)
+    pub async fn handle_block_deleted(
+        &self,
+        uuid: String,
+        block_id: u64,
+        generation_stamp: u64,
+    ) -> Result<(), Status> {
+        let datanode_id = self.datanode_id(&uuid)?;
+        let block = BlockId::new(block_id, generation_stamp);
+        self.block_manager.remove_block_location(&block, &datanode_id);
+        let _ = self.datanode_manager.remove_block_from_datanode(&uuid, &block);
+        info!("DataNode {} deleted block {}", uuid, block_id);
+        Ok(())
+    }
+
+    /// Record that `uuid` holds a finalized replica. `report_block`
+    /// de-duplicates locations, so repeated reports are idempotent.
+    fn record_replica(&self, uuid: &str, datanode_id: &DatanodeId, block: BlockId, num_bytes: u64) {
+        self.block_manager.report_block(datanode_id.clone(), block, num_bytes);
+        let _ = self.datanode_manager.add_block_to_datanode(uuid, block);
     }
 
     /// Handle error report from datanode
@@ -166,10 +189,10 @@ impl DatanodeProtocolService {
 /// Commands that NameNode can send to DataNode
 #[derive(Debug, Clone)]
 pub enum DatanodeCommand {
-    /// Transfer blocks to other datanodes (for replication)
+    /// Copy blocks to other datanodes (for replication). Each entry is a
+    /// block, its length, and the DataNodes that should receive it.
     TransferBlocks {
-        blocks: Vec<BlockId>,
-        targets: Vec<DatanodeId>,
+        transfers: Vec<(BlockId, u64, Vec<DatanodeId>)>,
     },
 
     /// Delete invalid blocks
@@ -236,6 +259,12 @@ mod tests {
             500_000_000,   // block_pool_used
         ).await.unwrap();
 
-        assert_eq!(commands.len(), 0); // No commands for now
+        assert_eq!(commands.len(), 0);
+
+        // A queued command is delivered once, on the next heartbeat.
+        service.queue_command("dn1", DatanodeCommand::InvalidateBlocks { blocks: vec![BlockId::new(1, 1)] });
+        let commands = service.handle_heartbeat("dn1", 1, 0, 1, 0).await.unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(service.handle_heartbeat("dn1", 1, 0, 1, 0).await.unwrap().is_empty());
     }
 }

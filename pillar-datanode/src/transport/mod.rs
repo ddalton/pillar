@@ -9,9 +9,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 pub mod tcp;
 pub mod selector;
+pub mod wire;
+pub mod hdfs_dtp;
 
 #[cfg(feature = "rdma")]
 pub mod rdma;
@@ -70,41 +73,22 @@ impl TransportType {
     }
 }
 
+/// A block's contents as a stream of chunks, in order. An `Err` aborts the
+/// transfer: the receiver discards what it has.
+pub type BlockChunks = mpsc::Receiver<std::io::Result<Bytes>>;
+
 /// Abstract data transport interface
 ///
 /// This trait abstracts over different transport protocols (TCP, RDMA) for block I/O.
 /// Each transport implementation provides both server-side (serving requests) and
-/// client-side (connecting to peers) functionality.
+/// client-side (connecting to peers) functionality. The wire format is in
+/// [`wire`].
 #[async_trait]
 pub trait DataTransport: Send + Sync {
-    /// Serve a read request from a client or peer DataNode (server side)
-    ///
-    /// This is called by the transport server when it receives a read request.
-    /// The implementation should read the block from storage and return it.
-    async fn serve_read_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        length: u64,
-    ) -> Result<Bytes>;
-
-    /// Serve a write request from a client or peer DataNode (server side)
-    ///
-    /// This is called by the transport server when it receives a write request.
-    /// The implementation should write the data to storage.
-    async fn serve_write_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()>;
-
     /// Read block data from a remote DataNode (client side)
     ///
-    /// This is used for block replication or client reads. The implementation
-    /// should connect to the peer DataNode and read the block.
+    /// Returns at most `length` bytes starting at `offset`: fewer when the
+    /// block ends first. Connections are pooled and reused.
     async fn read_from_peer(
         &self,
         peer_addr: &str,
@@ -114,18 +98,32 @@ pub trait DataTransport: Send + Sync {
         length: u64,
     ) -> Result<Bytes>;
 
-    /// Write block data to a remote DataNode (client side)
+    /// Stream a complete block to a remote DataNode in one session (client side)
     ///
-    /// This is used for block replication. The implementation should connect
-    /// to the peer DataNode and write the block.
+    /// The peer writes the chunks in order and finalizes the block when the
+    /// stream ends; once this returns `Ok`, the block is readable on the
+    /// peer. Returns the number of bytes the peer stored.
+    async fn send_block_to_peer(
+        &self,
+        peer_addr: &str,
+        block_id: u64,
+        gen_stamp: u64,
+        chunks: BlockChunks,
+    ) -> Result<u64>;
+
+    /// Write a complete block held in memory to a remote DataNode.
     async fn write_to_peer(
         &self,
         peer_addr: &str,
         block_id: u64,
         gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()>;
+        data: Bytes,
+    ) -> Result<u64> {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(Ok(data)).expect("fresh channel has room");
+        drop(tx);
+        self.send_block_to_peer(peer_addr, block_id, gen_stamp, rx).await
+    }
 
     /// Get the transport type identifier
     fn transport_type(&self) -> TransportType;

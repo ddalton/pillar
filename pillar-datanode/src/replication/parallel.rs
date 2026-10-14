@@ -16,23 +16,27 @@
 //! - Best for: medium blocks (<64MB) with RDMA-capable peers
 //!
 //! **Implementation:**
-//! - Spawn a tokio task for each target
-//! - Each task independently reads and writes the block
-//! - Wait for all tasks to complete (or fail)
+//! - Read the block from disk once, on a blocking thread
+//! - Fan each chunk out (zero-copy `Bytes`) to one streamed session per target
+//! - Wait for all sessions to complete (or fail)
 //! - Partial failures are handled gracefully
 
 use std::sync::Arc;
 use std::time::Instant;
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn, error};
 
 use super::{
-    BlockReplicator, ReplicationRequest, ReplicationResult, ReplicationError, Result,
-    ReplicationStrategy, TransportSelector, ReplicationTarget,
+    spawn_block_reader, BlockReplicator, ReplicationRequest, ReplicationResult, ReplicationError,
+    Result, ReplicationStrategy, TransportSelector,
 };
 use crate::storage::{BlockStorage, block_storage::BlockId};
 use crate::transport::DataTransport;
+
+/// Chunks buffered per target between the reader and the network session.
+const CHANNEL_DEPTH: usize = 4;
 
 /// Parallel replicator that transfers blocks concurrently to all targets
 pub struct ParallelReplicator {
@@ -54,71 +58,32 @@ impl ParallelReplicator {
         Self { chunk_size }
     }
 
-    /// Replicate a block to a single target (runs in a tokio task)
+    /// Stream the block to one target from the shared reader's channel
+    /// (runs in a tokio task)
     async fn replicate_to_target(
-        block_storage: Arc<BlockStorage>,
         transport: Arc<dyn DataTransport>,
         peer_addr: String,
         target_uuid: String,
         block_id: u64,
         gen_stamp: u64,
-        block_size: u64,
-        chunk_size: usize,
+        chunks: crate::transport::BlockChunks,
     ) -> Result<u64> {
-        debug!(
-            "Starting parallel replication of block {} to {} (size: {} bytes)",
-            block_id, peer_addr, block_size
-        );
+        debug!("Starting parallel replication of block {} to {}", block_id, peer_addr);
 
-        let mut total_bytes_written = 0u64;
-        let mut offset = 0u64;
-
-        // Read and write block in chunks
-        while offset < block_size {
-            let length = std::cmp::min(chunk_size as u64, block_size - offset);
-
-            // Read chunk from local storage
-            let block = BlockId::new(block_id, gen_stamp);
-            let data = block_storage
-                .read_block(&block, offset, length)
-                .map_err(|e| {
-                    error!(
-                        "Failed to read block {} at offset {} for target {}: {}",
-                        block_id, offset, target_uuid, e
-                    );
-                    e
-                })?;
-
-            // Write chunk to peer
-            transport
-                .write_to_peer(&peer_addr, block_id, gen_stamp, offset, &data)
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to write block {} to {} at offset {}: {}",
-                        block_id, peer_addr, offset, e
-                    );
-                    e
-                })?;
-
-            total_bytes_written += data.len() as u64;
-            offset += length;
-
-            debug!(
-                "Target {}: transferred chunk offset={}, length={}, total={}",
-                target_uuid,
-                offset - length,
-                length,
-                total_bytes_written
-            );
-        }
+        let written = transport
+            .send_block_to_peer(&peer_addr, block_id, gen_stamp, chunks)
+            .await
+            .map_err(|e| {
+                error!("Failed to send block {} to {} ({}): {}", block_id, peer_addr, target_uuid, e);
+                e
+            })?;
 
         debug!(
             "Completed parallel replication of block {} to {} ({} bytes)",
-            block_id, target_uuid, total_bytes_written
+            block_id, target_uuid, written
         );
 
-        Ok(total_bytes_written)
+        Ok(written)
     }
 }
 
@@ -170,6 +135,7 @@ impl BlockReplicator for ParallelReplicator {
 
         // Spawn concurrent replication tasks for all targets
         let mut tasks: Vec<JoinHandle<Result<(String, u64)>>> = Vec::new();
+        let mut outputs = Vec::new();
         let mut errors = Vec::new();
 
         for target in request.targets.iter() {
@@ -187,33 +153,28 @@ impl BlockReplicator for ParallelReplicator {
                 }
             };
 
-            // Clone data for the task
-            let storage_clone = block_storage.clone();
+            // Each target gets its own session fed from the shared reader.
+            let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
+            outputs.push(tx);
             let target_uuid = target.datanode_uuid.clone();
-            let chunk_size = self.chunk_size;
 
-            // Spawn task for this target
             let task = tokio::spawn(async move {
-                let result = Self::replicate_to_target(
-                    storage_clone,
-                    transport,
-                    addr.clone(),
-                    target_uuid.clone(),
-                    block_id,
-                    gen_stamp,
-                    actual_block_size,
-                    chunk_size,
-                )
-                .await;
-
-                match result {
-                    Ok(bytes) => Ok((target_uuid, bytes)),
-                    Err(e) => Err(e),
-                }
+                Self::replicate_to_target(transport, addr, target_uuid.clone(), block_id, gen_stamp, rx)
+                    .await
+                    .map(|bytes| (target_uuid, bytes))
             });
 
             tasks.push(task);
         }
+
+        // Read the block once and fan it out to every target.
+        let reader = spawn_block_reader(
+            block_storage.clone(),
+            BlockId::new(block_id, gen_stamp),
+            actual_block_size,
+            self.chunk_size,
+            outputs,
+        );
 
         debug!(
             "Spawned {} concurrent replication tasks for block {}",
@@ -254,6 +215,7 @@ impl BlockReplicator for ParallelReplicator {
             }
         }
 
+        reader.await.map_err(|e| ReplicationError::JoinError(e.to_string()))?;
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
         let result = ReplicationResult {

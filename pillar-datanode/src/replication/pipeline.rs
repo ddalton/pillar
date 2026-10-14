@@ -16,14 +16,18 @@
 use std::sync::Arc;
 use std::time::Instant;
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use tracing::{debug, warn, error};
 
 use super::{
-    BlockReplicator, ReplicationRequest, ReplicationResult, ReplicationError, Result,
-    ReplicationStrategy, TransportSelector,
+    spawn_block_reader, BlockReplicator, ReplicationRequest, ReplicationResult, ReplicationError,
+    Result, ReplicationStrategy, TransportSelector,
 };
 use crate::storage::{BlockStorage, block_storage::BlockId};
 use crate::transport::DataTransport;
+
+/// Chunks buffered between the disk reader and the network session.
+const CHANNEL_DEPTH: usize = 4;
 
 /// Pipeline replicator that transfers blocks sequentially to each target
 pub struct PipelineReplicator {
@@ -45,10 +49,10 @@ impl PipelineReplicator {
         Self { chunk_size }
     }
 
-    /// Replicate a block to a single target
+    /// Replicate a block to a single target in one streamed session
     async fn replicate_to_target(
         &self,
-        block_storage: &BlockStorage,
+        block_storage: &Arc<BlockStorage>,
         transport: Arc<dyn DataTransport>,
         peer_addr: &str,
         block_id: u64,
@@ -60,54 +64,30 @@ impl PipelineReplicator {
             block_id, peer_addr, block_size
         );
 
-        let mut total_bytes_written = 0u64;
-        let mut offset = 0u64;
+        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
+        let reader = spawn_block_reader(
+            block_storage.clone(),
+            BlockId::new(block_id, gen_stamp),
+            block_size,
+            self.chunk_size,
+            vec![tx],
+        );
 
-        // Read and write block in chunks
-        while offset < block_size {
-            let length = std::cmp::min(self.chunk_size as u64, block_size - offset);
-
-            // Read chunk from local storage
-            let block = BlockId::new(block_id, gen_stamp);
-            let data = block_storage
-                .read_block(&block, offset, length)
-                .map_err(|e| {
-                    error!(
-                        "Failed to read block {} at offset {}: {}",
-                        block_id, offset, e
-                    );
-                    e
-                })?;
-
-            // Write chunk to peer
-            transport
-                .write_to_peer(peer_addr, block_id, gen_stamp, offset, &data)
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to write block {} to {} at offset {}: {}",
-                        block_id, peer_addr, offset, e
-                    );
-                    e
-                })?;
-
-            total_bytes_written += data.len() as u64;
-            offset += length;
-
-            debug!(
-                "Transferred chunk: offset={}, length={}, total={}",
-                offset - length,
-                length,
-                total_bytes_written
-            );
-        }
+        let written = transport
+            .send_block_to_peer(peer_addr, block_id, gen_stamp, rx)
+            .await
+            .map_err(|e| {
+                error!("Failed to send block {} to {}: {}", block_id, peer_addr, e);
+                e
+            })?;
+        reader.await.map_err(|e| ReplicationError::JoinError(e.to_string()))?;
 
         debug!(
             "Completed pipeline replication of block {} to {} ({} bytes)",
-            block_id, peer_addr, total_bytes_written
+            block_id, peer_addr, written
         );
 
-        Ok(total_bytes_written)
+        Ok(written)
     }
 }
 

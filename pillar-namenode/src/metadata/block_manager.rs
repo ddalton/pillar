@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -79,13 +79,84 @@ pub struct BlockInfo {
     pub inode_id: u64,  // Which file this block belongs to
 }
 
+/// Compact handle for an interned datanode (index into [`DatanodeTable`]).
+type DnIndex = u32;
+
+/// Interning table for datanode identities referenced by replica locations.
+///
+/// Each replica is stored as a 4-byte [`DnIndex`] instead of a full
+/// `DatanodeId` (several heap-allocated strings). Indexes are keyed by
+/// datanode UUID and never reused; if a datanode re-registers with new
+/// addresses, its entry is updated in place so all replicas see the new
+/// address.
+struct DatanodeTable {
+    by_uuid: DashMap<String, DnIndex>,
+    entries: RwLock<Vec<Arc<DatanodeId>>>,
+}
+
+impl DatanodeTable {
+    fn new() -> Self {
+        Self {
+            by_uuid: DashMap::new(),
+            entries: RwLock::new(Vec::new()),
+        }
+    }
+
+    fn read_entries(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<DatanodeId>>> {
+        self.entries.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_entries(&self) -> std::sync::RwLockWriteGuard<'_, Vec<Arc<DatanodeId>>> {
+        self.entries.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Intern a datanode, returning its compact index.
+    fn intern(&self, datanode: &DatanodeId) -> DnIndex {
+        if let Some(idx) = self.by_uuid.get(&datanode.uuid).map(|e| *e.value()) {
+            // Refresh the stored identity if the datanode's addresses changed.
+            let stale = **self.read_entries().get(idx as usize).expect("interned index") != *datanode;
+            if stale {
+                self.write_entries()[idx as usize] = Arc::new(datanode.clone());
+            }
+            return idx;
+        }
+
+        // Lock order: by_uuid shard, then entries. Nothing takes them in the
+        // opposite order.
+        match self.by_uuid.entry(datanode.uuid.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let mut entries = self.write_entries();
+                let idx = DnIndex::try_from(entries.len()).expect("too many datanodes");
+                entries.push(Arc::new(datanode.clone()));
+                drop(entries);
+                e.insert(idx);
+                idx
+            }
+        }
+    }
+
+    /// Index of an already-interned datanode, by UUID.
+    fn index_of(&self, uuid: &str) -> Option<DnIndex> {
+        self.by_uuid.get(uuid).map(|e| *e.value())
+    }
+
+    fn resolve_all(&self, indexes: &[DnIndex]) -> Vec<Arc<DatanodeId>> {
+        let entries = self.read_entries();
+        indexes.iter().map(|&i| entries[i as usize].clone()).collect()
+    }
+}
+
 /// BlockManager manages block allocation and replica placement
 pub struct BlockManager {
     /// All blocks: block_id -> BlockInfo
     blocks: DashMap<BlockId, BlockInfo>,
 
-    /// Block locations: block_id -> Vec<DatanodeId>
-    block_locations: DashMap<BlockId, Vec<DatanodeId>>,
+    /// Block locations: block_id -> compact datanode indexes (see [`DatanodeTable`])
+    block_locations: DashMap<BlockId, Vec<DnIndex>>,
+
+    /// Interned datanode identities referenced by `block_locations`
+    datanode_table: DatanodeTable,
 
     /// File to blocks mapping: inode_id -> Vec<BlockId>
     file_blocks: DashMap<u64, Vec<BlockId>>,
@@ -98,6 +169,10 @@ pub struct BlockManager {
 
     /// Default block size (128 MB)
     default_block_size: u64,
+
+    /// Replicas of removed blocks still on DataNodes: uuid -> blocks to
+    /// delete, handed out with that DataNode's next heartbeat.
+    pending_invalidations: DashMap<String, Vec<BlockId>>,
 }
 
 impl BlockManager {
@@ -105,10 +180,12 @@ impl BlockManager {
         Self {
             blocks: DashMap::new(),
             block_locations: DashMap::new(),
+            datanode_table: DatanodeTable::new(),
             file_blocks: DashMap::new(),
             next_block_id: AtomicU64::new(1),
             next_generation_stamp: AtomicU64::new(1000),
             default_block_size: 128 * 1024 * 1024, // 128 MB
+            pending_invalidations: DashMap::new(),
         }
     }
 
@@ -138,23 +215,55 @@ impl BlockManager {
 
     /// Get block locations (which datanodes have this block)
     pub fn get_block_locations(&self, block_id: &BlockId) -> Option<Vec<DatanodeId>> {
-        self.block_locations
-            .get(block_id)
-            .map(|entry| entry.value().clone())
+        self.get_block_locations_shared(block_id)
+            .map(|locs| locs.iter().map(|dn| (**dn).clone()).collect())
     }
 
-    /// Add a block location (datanode has a replica of this block)
+    /// Like [`BlockManager::get_block_locations`] but returns shared handles,
+    /// avoiding a deep copy of each `DatanodeId`.
+    pub fn get_block_locations_shared(&self, block_id: &BlockId) -> Option<Vec<Arc<DatanodeId>>> {
+        // Copy the (small) index list out so no map guard is held while resolving.
+        let indexes = self.block_locations.get(block_id).map(|e| e.value().clone())?;
+        Some(self.datanode_table.resolve_all(&indexes))
+    }
+
+    /// Number of known replicas of a block.
+    pub fn get_replica_count(&self, block_id: &BlockId) -> usize {
+        self.block_locations.get(block_id).map(|e| e.value().len()).unwrap_or(0)
+    }
+
+    /// Whether the given datanode (by UUID) is a known location of the block.
+    pub fn has_block_location(&self, block_id: &BlockId, datanode_uuid: &str) -> bool {
+        match self.datanode_table.index_of(datanode_uuid) {
+            Some(idx) => self.block_locations
+                .get(block_id)
+                .map(|e| e.value().contains(&idx))
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Add a block location (datanode has a replica of this block).
+    /// Adding the same datanode twice is a no-op.
     pub fn add_block_location(&self, block_id: BlockId, datanode: DatanodeId) {
-        self.block_locations
-            .entry(block_id)
-            .or_insert_with(Vec::new)
-            .push(datanode);
+        self.add_location_index(block_id, self.datanode_table.intern(&datanode));
     }
 
-    /// Remove a block location
+    fn add_location_index(&self, block_id: BlockId, idx: DnIndex) {
+        let mut locations = self.block_locations
+            .entry(block_id)
+            .or_insert_with(Vec::new);
+        if !locations.contains(&idx) {
+            locations.push(idx);
+        }
+    }
+
+    /// Remove a block location (matched by datanode UUID)
     pub fn remove_block_location(&self, block_id: &BlockId, datanode: &DatanodeId) {
-        if let Some(mut locations) = self.block_locations.get_mut(block_id) {
-            locations.retain(|dn| dn != datanode);
+        if let Some(idx) = self.datanode_table.index_of(&datanode.uuid) {
+            if let Some(mut locations) = self.block_locations.get_mut(block_id) {
+                locations.retain(|&i| i != idx);
+            }
         }
     }
 
@@ -185,25 +294,72 @@ impl BlockManager {
         }
 
         // Add location if not already present
-        let mut locations = self.block_locations
-            .entry(block_id)
-            .or_insert_with(Vec::new);
+        self.add_location_index(block_id, self.datanode_table.intern(&datanode));
+    }
 
-        if !locations.contains(&datanode) {
-            locations.push(datanode);
+    /// Queue deletion of `block`'s known replicas, before its locations are
+    /// forgotten.
+    fn invalidate_replicas(&self, block_id: &BlockId) {
+        for dn in self.get_block_locations_shared(block_id).unwrap_or_default() {
+            self.pending_invalidations.entry(dn.uuid.clone()).or_default().push(*block_id);
         }
+    }
+
+    /// Replicas a DataNode should delete (blocks removed from the namespace).
+    pub fn take_invalidations(&self, datanode_uuid: &str) -> Vec<BlockId> {
+        self.pending_invalidations.remove(datanode_uuid).map(|(_, v)| v).unwrap_or_default()
+    }
+
+    /// Every block with its owning inode, length and known replica holders
+    /// (for the replication monitor's scan).
+    pub fn blocks_snapshot(&self) -> Vec<(BlockId, u64, u64, Vec<Arc<DatanodeId>>)> {
+        let infos: Vec<(BlockId, u64, u64)> =
+            self.blocks.iter().map(|e| (e.block_id, e.inode_id, e.num_bytes)).collect();
+        infos
+            .into_iter()
+            .map(|(id, inode, len)| (id, inode, len, self.get_block_locations_shared(&id).unwrap_or_default()))
+            .collect()
     }
 
     /// Delete all blocks for a file
     pub fn delete_file_blocks(&self, inode_id: u64) -> Vec<BlockId> {
         if let Some((_, blocks)) = self.file_blocks.remove(&inode_id) {
             for block_id in &blocks {
+                self.invalidate_replicas(block_id);
                 self.blocks.remove(block_id);
                 self.block_locations.remove(block_id);
             }
             blocks
         } else {
             Vec::new()
+        }
+    }
+
+    /// Forget a single block (e.g. abandoned, or dropped by truncate).
+    pub fn remove_block(&self, block_id: &BlockId) -> Option<BlockInfo> {
+        self.invalidate_replicas(block_id);
+        let info = self.blocks.remove(block_id).map(|(_, info)| info);
+        self.block_locations.remove(block_id);
+        if let Some(info) = &info {
+            if let Some(mut file_blocks) = self.file_blocks.get_mut(&info.inode_id) {
+                file_blocks.retain(|b| b != block_id);
+            }
+        }
+        info
+    }
+
+    /// Re-home all blocks of `from_inode` onto the end of `to_inode` (concat).
+    pub fn move_file_blocks(&self, from_inode: u64, to_inode: u64) {
+        if from_inode == to_inode {
+            return;
+        }
+        if let Some((_, moved)) = self.file_blocks.remove(&from_inode) {
+            for block_id in &moved {
+                if let Some(mut info) = self.blocks.get_mut(block_id) {
+                    info.inode_id = to_inode;
+                }
+            }
+            self.file_blocks.entry(to_inode).or_default().extend(moved);
         }
     }
 
@@ -297,5 +453,83 @@ mod tests {
         bm.remove_block_location(&block, &dn1);
         let locations = bm.get_block_locations(&block).unwrap();
         assert_eq!(locations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_block_locations_are_interned_and_deduplicated() {
+        let bm = BlockManager::new();
+        let b1 = bm.allocate_block(100).await.unwrap();
+        let b2 = bm.allocate_block(100).await.unwrap();
+
+        let dn1 = DatanodeId::new("dn1".to_string(), "host1".to_string(), 9000);
+        let dn2 = DatanodeId::new("dn2".to_string(), "host2".to_string(), 9000);
+
+        // Duplicate adds/reports of the same datanode are ignored.
+        bm.add_block_location(b1, dn1.clone());
+        bm.add_block_location(b1, dn1.clone());
+        bm.report_block(dn1.clone(), b1, 10);
+        bm.report_block(dn2.clone(), b1, 10);
+        bm.report_block(dn1.clone(), b2, 10);
+        assert_eq!(bm.get_replica_count(&b1), 2);
+        assert_eq!(bm.get_block_locations(&b1).unwrap(), vec![dn1.clone(), dn2.clone()]);
+        assert!(bm.has_block_location(&b1, "dn2"));
+        assert!(!bm.has_block_location(&b2, "dn2"));
+        assert!(!bm.has_block_location(&b1, "unknown"));
+
+        // Both blocks share one interned identity for dn1.
+        let a = bm.get_block_locations_shared(&b1).unwrap();
+        let b = bm.get_block_locations_shared(&b2).unwrap();
+        assert!(Arc::ptr_eq(&a[0], &b[0]));
+
+        // Re-registration with a new address is reflected for every replica.
+        let mut dn1_moved = dn1.clone();
+        dn1_moved.hostname = "host1-new".to_string();
+        dn1_moved.data_port = 9866;
+        bm.report_block(dn1_moved.clone(), b2, 10);
+        assert_eq!(bm.get_block_locations(&b1).unwrap()[0], dn1_moved);
+        assert_eq!(bm.get_block_locations(&b2).unwrap(), vec![dn1_moved.clone()]);
+
+        // Removal matches by UUID, even with a stale DatanodeId.
+        bm.remove_block_location(&b1, &dn1);
+        assert_eq!(bm.get_block_locations(&b1).unwrap(), vec![dn2.clone()]);
+
+        // Locations follow a generation-stamp bump.
+        let b1_new = BlockId::new(b1.block_id, b1.generation_stamp + 100);
+        bm.update_generation_stamp(b1, b1_new);
+        assert!(bm.get_block_locations(&b1).is_none());
+        assert_eq!(bm.get_block_locations(&b1_new).unwrap(), vec![dn2]);
+    }
+
+    #[tokio::test]
+    async fn test_remove_and_move_blocks() {
+        let bm = BlockManager::new();
+        let a1 = bm.allocate_block(1).await.unwrap();
+        let a2 = bm.allocate_block(1).await.unwrap();
+        let c1 = bm.allocate_block(2).await.unwrap();
+        bm.add_block_location(a2, DatanodeId::new("dn1".to_string(), "h".to_string(), 1));
+
+        assert_eq!(bm.remove_block(&a2).unwrap().inode_id, 1);
+        assert!(bm.get_block_info(&a2).is_none());
+        assert!(bm.get_block_locations(&a2).is_none());
+        assert_eq!(bm.get_file_blocks(1).unwrap(), vec![a1]);
+
+        bm.move_file_blocks(2, 1);
+        assert_eq!(bm.get_file_blocks(1).unwrap(), vec![a1, c1]);
+        assert!(bm.get_file_blocks(2).is_none());
+        assert_eq!(bm.get_block_info(&c1).unwrap().inode_id, 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_block_queues_its_replicas_for_deletion() {
+        let bm = BlockManager::new();
+        let b = bm.allocate_block(7).await.unwrap();
+        bm.report_block(DatanodeId::new("dn1".into(), "h1".into(), 1), b, 10);
+        bm.report_block(DatanodeId::new("dn2".into(), "h2".into(), 1), b, 10);
+        assert_eq!(bm.blocks_snapshot().len(), 1);
+        assert_eq!(bm.delete_file_blocks(7), vec![b]);
+        assert_eq!(bm.take_invalidations("dn1"), vec![b]);
+        assert_eq!(bm.take_invalidations("dn2"), vec![b]);
+        assert!(bm.take_invalidations("dn1").is_empty());
+        assert!(bm.blocks_snapshot().is_empty());
     }
 }

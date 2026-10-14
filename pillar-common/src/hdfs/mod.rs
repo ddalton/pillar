@@ -1,6 +1,7 @@
 // HDFS core abstractions and utilities
 
 pub mod block;
+pub mod block_list;
 pub mod inode;
 pub mod namespace;
 pub mod replica;

@@ -188,6 +188,60 @@ impl ReplicationResult {
     }
 }
 
+/// Read a finalized block once, on a blocking thread, and send each chunk
+/// to every sender in `outputs` (one per target's transfer session).
+///
+/// Chunks are `Bytes`, so fanning out is a reference-count bump, not a
+/// copy. A target whose session has ended (its receiver dropped) is
+/// skipped from then on; reading stops when no target is left. A read
+/// error is delivered to every remaining target, which aborts their
+/// sessions so no peer finalizes a short block. The bounded channels
+/// pace the reader to the slowest live target.
+pub(crate) fn spawn_block_reader(
+    block_storage: Arc<BlockStorage>,
+    block: crate::storage::block_storage::BlockId,
+    block_size: u64,
+    chunk_size: usize,
+    mut outputs: Vec<tokio::sync::mpsc::Sender<std::io::Result<Bytes>>>,
+) -> tokio::task::JoinHandle<u64> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let fail = |outputs: &mut Vec<tokio::sync::mpsc::Sender<std::io::Result<Bytes>>>, e: std::io::Error| {
+            for tx in outputs.drain(..) {
+                let _ = tx.blocking_send(Err(std::io::Error::new(e.kind(), e.to_string())));
+            }
+        };
+        let mut file = match block_storage.open_for_read(&block, 0, block_size) {
+            Ok((f, len)) if len == block_size => f,
+            Ok((_, len)) => {
+                let e = std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("block {} holds {} bytes, {} expected", block.block_id, len, block_size),
+                );
+                fail(&mut outputs, e);
+                return 0;
+            }
+            Err(e) => {
+                fail(&mut outputs, std::io::Error::other(e.to_string()));
+                return 0;
+            }
+        };
+        let mut read = 0u64;
+        while read < block_size && !outputs.is_empty() {
+            let n = (chunk_size as u64).min(block_size - read) as usize;
+            let mut buf = bytes::BytesMut::zeroed(n);
+            if let Err(e) = file.read_exact(&mut buf) {
+                fail(&mut outputs, e);
+                return read;
+            }
+            let chunk = buf.freeze();
+            outputs.retain(|tx| tx.blocking_send(Ok(chunk.clone())).is_ok());
+            read += n as u64;
+        }
+        read
+    })
+}
+
 /// Transport selection function type
 pub type TransportSelector = Arc<dyn Fn(&ReplicationTarget) -> Option<(Arc<dyn DataTransport>, String)> + Send + Sync>;
 

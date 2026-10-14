@@ -1,0 +1,438 @@
+//! Pillar's DataNode block-transfer protocol, shared by the TCP and RDMA
+//! (currently TCP-fallback) transports.
+//!
+//! This is Pillar's own DataNode-to-DataNode protocol, not Hadoop's
+//! DataTransferProtocol. Integers are big-endian.
+//!
+//! A connection carries any number of requests, one after another, so
+//! clients can keep connections open and reuse them.
+//!
+//! ```text
+//! request    op(u8) block_id(u64) gen_stamp(u64) offset(u64) length(u64)   33 octets
+//!
+//! READ  (op 81)  reply: status(u8)=0 len(u64) <len octets>      len = min(length, size - offset)
+//!                       status(u8)≠0 msg_len(u16) <msg>
+//!
+//! WRITE (op 80)  offset and length are 0 (reserved); the request is
+//!                followed by packets and an end marker:
+//!                packet: len(u32, 1..=MAX_PACKET) <len octets>
+//!                end:    len(u32) = 0
+//!                reply:  status(u8)=0 stored(u64) | status(u8)≠0 msg_len(u16) <msg>
+//! ```
+//!
+//! A WRITE carries a complete block in one session. The receiver writes
+//! the packets sequentially into one open temp file and finalizes the block
+//! when the end marker arrives, so the block is readable as soon as the
+//! sender sees `status = 0`. Packets are not acknowledged one by one; TCP
+//! flow control provides backpressure. A sender that fails part-way closes
+//! the connection without an end marker, and the receiver discards the
+//! partial block.
+//!
+//! Disk I/O runs on blocking threads connected to the socket by bounded
+//! channels, so disk and network overlap in both directions.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use bytes::{Buf, Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tracing::{debug, warn};
+
+use super::{BlockChunks, DataTransferOp, Result, TransportError};
+use crate::storage::block_storage::{BlockId, BlockStorage, BlockStorageError};
+
+/// Largest WRITE packet accepted; bounds per-connection memory.
+pub const MAX_PACKET: usize = 4 * 1024 * 1024;
+
+/// Size of the chunks a READ reply is streamed in.
+pub const READ_CHUNK: usize = 1024 * 1024;
+
+/// Chunks buffered between the disk thread and the socket.
+const PIPE_DEPTH: usize = 4;
+
+/// Idle connections kept per peer by [`ConnPool`].
+const MAX_IDLE_PER_PEER: usize = 8;
+
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_ERROR: u8 = 1;
+pub const STATUS_NOT_FOUND: u8 = 2;
+
+const HEADER_LEN: usize = 33;
+
+/// A decoded request header.
+#[derive(Debug, Clone, Copy)]
+pub struct Header {
+    pub op: u8,
+    pub block_id: u64,
+    pub gen_stamp: u64,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl Header {
+    fn encode(&self) -> [u8; HEADER_LEN] {
+        let mut b = [0u8; HEADER_LEN];
+        b[0] = self.op;
+        b[1..9].copy_from_slice(&self.block_id.to_be_bytes());
+        b[9..17].copy_from_slice(&self.gen_stamp.to_be_bytes());
+        b[17..25].copy_from_slice(&self.offset.to_be_bytes());
+        b[25..33].copy_from_slice(&self.length.to_be_bytes());
+        b
+    }
+
+    fn decode(op: u8, rest: &[u8; HEADER_LEN - 1]) -> Self {
+        let u = |i: usize| u64::from_be_bytes(rest[i..i + 8].try_into().unwrap());
+        Header { op, block_id: u(0), gen_stamp: u(8), offset: u(16), length: u(24) }
+    }
+}
+
+/// TCP_NODELAY on every data socket: requests and replies are single
+/// writes, and Nagle + delayed ACK would otherwise add ~40 ms to small
+/// requests on a reused connection.
+pub fn tune(socket: &TcpStream) {
+    if let Err(e) = socket.set_nodelay(true) {
+        warn!("set_nodelay failed: {}", e);
+    }
+}
+
+pub async fn connect(peer_addr: &str) -> Result<TcpStream> {
+    let socket = TcpStream::connect(peer_addr).await.map_err(|e| {
+        TransportError::ConnectionError(format!("Failed to connect to {}: {}", peer_addr, e))
+    })?;
+    tune(&socket);
+    Ok(socket)
+}
+
+// ------------------------------------------------------------------ server
+
+/// Serve requests on one connection until the peer closes it.
+pub async fn serve_connection<S>(mut socket: S, storage: Arc<BlockStorage>, peer: SocketAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        let op = match socket.read_u8().await {
+            Ok(op) => op,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // Hadoop DataTransferProtocol: a 2-byte version whose first octet
+        // is 0, never a Pillar op code.
+        if op == 0 {
+            super::hdfs_dtp::serve(&mut socket, &storage, peer).await?;
+            continue;
+        }
+        let mut rest = [0u8; HEADER_LEN - 1];
+        socket.read_exact(&mut rest).await?;
+        let h = Header::decode(op, &rest);
+
+        match DataTransferOp::from_u8(op) {
+            Some(DataTransferOp::ReadBlock) => serve_read(&mut socket, &storage, h).await?,
+            Some(DataTransferOp::WriteBlock) => {
+                // A failed write leaves unread packets on the connection, so
+                // it cannot be reused: reply and close.
+                if !serve_write(&mut socket, &storage, h, peer).await? {
+                    return Ok(());
+                }
+            }
+            other => {
+                let msg = format!("operation {:?} ({}) not supported", other, op);
+                reply_error(&mut socket, STATUS_ERROR, &msg).await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn reply_error<S: AsyncWrite + Unpin>(socket: &mut S, status: u8, msg: &str) -> Result<()> {
+    let msg = &msg.as_bytes()[..msg.len().min(u16::MAX as usize)];
+    let mut b = Vec::with_capacity(3 + msg.len());
+    b.push(status);
+    b.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    b.extend_from_slice(msg);
+    socket.write_all(&b).await?;
+    socket.flush().await?;
+    Ok(())
+}
+
+async fn serve_read<S>(socket: &mut S, storage: &Arc<BlockStorage>, h: Header) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let block = BlockId::new(h.block_id, h.gen_stamp);
+    let opened = {
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.open_for_read(&block, h.offset, h.length))
+            .await
+            .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+    };
+    let (file, len) = match opened {
+        Ok(v) => v,
+        Err(BlockStorageError::BlockNotFound(_)) => {
+            return reply_error(socket, STATUS_NOT_FOUND, &format!("block {} not found", h.block_id)).await;
+        }
+        Err(e) => return reply_error(socket, STATUS_ERROR, &e.to_string()).await,
+    };
+
+    let mut head = [0u8; 9];
+    head[0] = STATUS_OK;
+    head[1..].copy_from_slice(&len.to_be_bytes());
+    socket.write_all(&head).await?;
+
+    let mut chunks = spawn_file_reader(file, len, READ_CHUNK);
+    let mut sent = 0u64;
+    while let Some(chunk) = chunks.recv().await {
+        // A disk error after the header is out cannot be reported in-band;
+        // returning closes the connection and the client sees a short read.
+        let chunk = chunk?;
+        sent += chunk.len() as u64;
+        socket.write_all(&chunk).await?;
+    }
+    socket.flush().await?;
+    if sent != len {
+        return Err(TransportError::ProtocolError(format!(
+            "block {}: sent {} of {} bytes",
+            h.block_id, sent, len
+        )));
+    }
+    debug!("Served {} bytes of block {}", len, h.block_id);
+    Ok(())
+}
+
+/// Read `len` bytes from `file` on a blocking thread, as a stream of chunks.
+pub fn spawn_file_reader(mut file: std::fs::File, len: u64, chunk: usize) -> BlockChunks {
+    let (tx, rx) = mpsc::channel(PIPE_DEPTH);
+    tokio::task::spawn_blocking(move || {
+        let mut left = len;
+        while left > 0 {
+            let n = (chunk as u64).min(left) as usize;
+            let mut buf = BytesMut::zeroed(n);
+            let r = file.read_exact(&mut buf).map(|_| buf.freeze());
+            let failed = r.is_err();
+            if tx.blocking_send(r).is_err() || failed {
+                return;
+            }
+            left -= n as u64;
+        }
+    });
+    rx
+}
+
+/// Receive a WRITE session. Returns whether the connection can be reused.
+async fn serve_write<S>(socket: &mut S, storage: &Arc<BlockStorage>, h: Header, peer: SocketAddr) -> Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let block = BlockId::new(h.block_id, h.gen_stamp);
+    let file = {
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || storage.begin_write(&block))
+            .await
+            .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+    };
+    let file = match file {
+        Ok(f) => f,
+        Err(e) => {
+            reply_error(socket, STATUS_ERROR, &e.to_string()).await?;
+            return Ok(false);
+        }
+    };
+
+    // Socket -> channel -> blocking disk writer, so the next packet is read
+    // while the previous one is being written.
+    let (tx, mut rx) = mpsc::channel::<Bytes>(PIPE_DEPTH);
+    let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut file = file;
+        let mut written = 0u64;
+        while let Some(packet) = rx.blocking_recv() {
+            file.write_all(&packet)?;
+            written += packet.len() as u64;
+        }
+        file.flush()?;
+        Ok(written)
+    });
+
+    let received: Result<()> = async {
+        loop {
+            let len = socket.read_u32().await? as usize;
+            if len == 0 {
+                return Ok(());
+            }
+            if len > MAX_PACKET {
+                return Err(TransportError::ProtocolError(format!("packet of {} bytes exceeds {}", len, MAX_PACKET)));
+            }
+            let mut buf = BytesMut::zeroed(len);
+            socket.read_exact(&mut buf).await?;
+            if tx.send(buf.freeze()).await.is_err() {
+                // The disk writer stopped; its error is reported below.
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    drop(tx);
+    let written = writer.await.map_err(|e| TransportError::ProtocolError(e.to_string()))?;
+
+    let outcome = match (received, written) {
+        (Ok(()), Ok(n)) => {
+            let storage = storage.clone();
+            tokio::task::spawn_blocking(move || storage.finalize_block(&block))
+                .await
+                .map_err(|e| TransportError::ProtocolError(e.to_string()))?
+                .map(|stored| (stored, n))
+                .map_err(|e| e.to_string())
+        }
+        (Err(e), _) => Err(format!("receive failed: {}", e)),
+        (_, Err(e)) => Err(format!("disk write failed: {}", e)),
+    };
+
+    match outcome {
+        Ok((stored, _)) => {
+            let mut b = [0u8; 9];
+            b[0] = STATUS_OK;
+            b[1..].copy_from_slice(&stored.to_be_bytes());
+            socket.write_all(&b).await?;
+            socket.flush().await?;
+            debug!("Received block {} ({} bytes) from {}", h.block_id, stored, peer);
+            Ok(true)
+        }
+        Err(msg) => {
+            storage.abort_write(&block);
+            warn!("Write of block {} from {} failed: {}", h.block_id, peer, msg);
+            // Best effort: the peer may already be gone.
+            let _ = reply_error(socket, STATUS_ERROR, &msg).await;
+            Ok(false)
+        }
+    }
+}
+
+// ------------------------------------------------------------------ client
+
+async fn read_status<S: AsyncRead + Unpin>(socket: &mut S, block_id: u64) -> Result<u64> {
+    let status = socket.read_u8().await?;
+    if status == STATUS_OK {
+        return Ok(socket.read_u64().await?);
+    }
+    let n = socket.read_u16().await? as usize;
+    let mut msg = vec![0u8; n];
+    socket.read_exact(&mut msg).await?;
+    let msg = String::from_utf8_lossy(&msg).into_owned();
+    Err(match status {
+        STATUS_NOT_FOUND => TransportError::BlockNotFound(block_id),
+        _ => TransportError::ProtocolError(msg),
+    })
+}
+
+/// READ on an open connection.
+pub async fn read_block<S>(socket: &mut S, block_id: u64, gen_stamp: u64, offset: u64, length: u64) -> Result<Bytes>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let h = Header { op: DataTransferOp::ReadBlock.to_u8(), block_id, gen_stamp, offset, length };
+    socket.write_all(&h.encode()).await?;
+    socket.flush().await?;
+    let len = read_status(socket, block_id).await?;
+    if len > length {
+        return Err(TransportError::ProtocolError(format!("peer sent {} bytes, {} requested", len, length)));
+    }
+    let mut data = BytesMut::zeroed(len as usize);
+    socket.read_exact(&mut data).await?;
+    Ok(data.freeze())
+}
+
+/// WRITE session on an open connection: stream `chunks` as one block.
+///
+/// An `Err` chunk aborts the session without an end marker, so the peer
+/// discards what it received.
+pub async fn send_block<S>(socket: &mut S, block_id: u64, gen_stamp: u64, mut chunks: BlockChunks) -> Result<u64>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let h = Header { op: DataTransferOp::WriteBlock.to_u8(), block_id, gen_stamp, offset: 0, length: 0 };
+    socket.write_all(&h.encode()).await?;
+    let mut sent = 0u64;
+    while let Some(chunk) = chunks.recv().await {
+        let mut chunk = chunk?;
+        while !chunk.is_empty() {
+            let part = chunk.split_to(chunk.len().min(MAX_PACKET));
+            sent += part.len() as u64;
+            let len = (part.len() as u32).to_be_bytes();
+            // One buffer chain, so the length prefix and payload go out together.
+            socket.write_all_buf(&mut Buf::chain(&len[..], part)).await?;
+        }
+    }
+    socket.write_all(&0u32.to_be_bytes()).await?;
+    socket.flush().await?;
+    let stored = read_status(socket, block_id).await?;
+    if stored != sent {
+        return Err(TransportError::ProtocolError(format!(
+            "peer stored {} bytes of block {}, {} sent",
+            stored, block_id, sent
+        )));
+    }
+    Ok(stored)
+}
+
+/// Idle connections to peers, reused across requests.
+#[derive(Default)]
+pub struct ConnPool {
+    idle: Mutex<HashMap<String, Vec<TcpStream>>>,
+}
+
+impl ConnPool {
+    /// An idle connection to `peer`, if one is pooled.
+    pub fn take(&self, peer: &str) -> Option<TcpStream> {
+        self.idle.lock().unwrap().get_mut(peer).and_then(Vec::pop)
+    }
+
+    /// Return a connection after a request that left it clean.
+    pub fn put(&self, peer: &str, socket: TcpStream) {
+        let mut idle = self.idle.lock().unwrap();
+        let v = idle.entry(peer.to_string()).or_default();
+        if v.len() < MAX_IDLE_PER_PEER {
+            v.push(socket);
+        }
+    }
+
+    /// READ through the pool. A pooled connection may have been closed by
+    /// the peer while idle, so a failure on one is retried once on a fresh
+    /// connection (READ is idempotent).
+    pub async fn read_block(&self, peer: &str, block_id: u64, gen_stamp: u64, offset: u64, length: u64) -> Result<Bytes> {
+        if let Some(mut s) = self.take(peer) {
+            match read_block(&mut s, block_id, gen_stamp, offset, length).await {
+                Ok(data) => {
+                    self.put(peer, s);
+                    return Ok(data);
+                }
+                Err(e @ TransportError::BlockNotFound(_)) => {
+                    // The peer answered cleanly: the connection is fine.
+                    self.put(peer, s);
+                    return Err(e);
+                }
+                // The peer answered but the stream may hold unread bytes.
+                Err(e @ TransportError::ProtocolError(_)) => return Err(e),
+                Err(e) => debug!("pooled connection to {} failed ({}); reconnecting", peer, e),
+            }
+        }
+        let mut s = connect(peer).await?;
+        let r = read_block(&mut s, block_id, gen_stamp, offset, length).await;
+        if matches!(r, Ok(_) | Err(TransportError::BlockNotFound(_))) {
+            self.put(peer, s);
+        }
+        r
+    }
+
+    /// WRITE session on a fresh connection (a session consumes its chunk
+    /// stream, so it cannot be retried on a stale pooled one); the
+    /// connection is pooled afterwards for reuse by reads.
+    pub async fn send_block(&self, peer: &str, block_id: u64, gen_stamp: u64, chunks: BlockChunks) -> Result<u64> {
+        let mut s = connect(peer).await?;
+        let stored = send_block(&mut s, block_id, gen_stamp, chunks).await?;
+        self.put(peer, s);
+        Ok(stored)
+    }
+}

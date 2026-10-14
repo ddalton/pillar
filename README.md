@@ -8,18 +8,20 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
 
 ### Key Features
 
-- **🚀 High Performance**: 3-5x faster than Java HDFS
+- **🚀 High Performance**: designed to outrun Java HDFS (see [Performance](#performance) for what has been measured)
   - Lock-free data structures (DashMap, AtomicU64)
   - Zero garbage collection pauses
-  - SPDK-backed storage via Flint (373 MB/s vs 97 MB/s)
+  - SPDK-backed storage via Flint
   - **RDMA support** for client-to-DataNode and inter-DataNode communication
   - Heterogeneous clusters (mixed RDMA/TCP DataNodes)
   - Auto-fallback to TCP when RDMA unavailable
   - Pure Rust - no glibc or OpenSSL dependencies
 
-- **🔌 Drop-in Replacement**: 100% compatible with Hadoop ecosystem
-  - Works with `hadoop fs` CLI
-  - Compatible with Spark, Hive, Flink, Presto
+- **🔌 Hadoop wire compatible**: stock HDFS clients connect unchanged
+  - NameNode speaks Hadoop IPC (`hdfs://namenode:9000`); DataNodes speak
+    Hadoop DataTransferProtocol, including 3-node write pipelines
+  - Tested with the Apache Hadoop 3.5.0 Java client and hdfs-native
+    (see [Hadoop client compatibility](#hadoop-client-compatibility))
   - Implements official Apache Hadoop protobuf protocols
 
 - **☸️ Kubernetes Native**: Designed for cloud-native deployments
@@ -249,7 +251,6 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - NameNode gRPC client (registration, heartbeat, block reports)
   - ClientDatanodeProtocol service
   - Lock-free block metadata cache (DashMap)
-  - 373 MB/s throughput via Flint SPDK backend
 
 - [x] **Phase 4:** Helm Chart & Deployment
   - Complete Helm chart with all components
@@ -292,16 +293,52 @@ See [tests/system/README.md](tests/system/README.md) for comprehensive testing d
   - Auto-fallback to TCP when RDMA unavailable
   - See [RDMA_IMPLEMENTATION_PLAN.md](RDMA_IMPLEMENTATION_PLAN.md) for details
 
+## Hadoop client compatibility
+
+Verified end to end against an in-process / local cluster (NameNode + 3
+DataNodes):
+
+- `tests/interop/run-java-interop.sh` — the stock **Apache Hadoop 3.5.0**
+  Java client (`DFSClient`, the code behind `hadoop fs`): `mkdirs -p`,
+  multi-block write through a 3-DataNode pipeline, sequential and
+  positional reads, `copyFromLocalFile` (`-put`) and read back (`-cat`),
+  `listStatus`, rename, `FileAlreadyExistsException`, recursive delete.
+- `pillar-datanode/tests/hdfs_client.rs` — the independent
+  [hdfs-native](https://crates.io/crates/hdfs-native) client: the same
+  operations, plus a DataNode crash with re-replication and replica
+  cleanup after delete.
+
+Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
+append, hflush/hsync recovery, pipeline recovery after a DataNode fails
+mid-write, block checksum (`-checksum`), short-circuit reads, erasure
+coding, and namespace persistence (the NameNode keeps metadata in memory;
+etcd is not yet consulted). The KUTTL suites in `tests/system` have not
+been re-run against these changes.
+
 ## Performance
 
-Preliminary benchmarks show:
+Loopback benchmark of the DataNode TCP data path: one 128 MiB block
+replicated from one DataNode to others on the same host, then read back
+and byte-compared.
 
-| Operation | Java HDFS | Pillar | Improvement |
-|-----------|-----------|--------|-------------|
-| Metadata ops (ls, stat) | 100 ops/s | 400 ops/s | **4x faster** |
-| Sequential read | 100 MB/s | 373 MB/s | **3.7x faster** |
-| Sequential write | 90 MB/s | 350 MB/s | **3.9x faster** |
-| Memory usage | 2GB (JVM) | 200MB | **10x less** |
+| Operation | Throughput |
+|-----------|------------|
+| Block write, pipeline, 1 target | 1.7–2.2 GB/s |
+| Block write, pipeline, 2 targets | 1.9–2.2 GB/s |
+| Block write, parallel, 2 targets | 1.1–1.8 GB/s |
+| Block write, overlapped, 2 targets | 2.4–2.5 GB/s |
+| Block read (whole block) | 2.2–3.4 GB/s |
+| 4 KiB read latency (mean of 200) | ~100 µs |
+
+Write figures count bytes delivered to all targets. Measured on Apple
+Silicon (macOS), release build, two runs; block files were in the page
+cache. Loopback measures protocol and copy overhead only — not disk or
+network bandwidth — and these numbers are not a comparison with Java HDFS,
+which has not been benchmarked. Reproduce with:
+
+```sh
+cargo test --release -p pillar-datanode --test data_path -- --ignored --nocapture --test-threads=1
+```
 
 ## License
 

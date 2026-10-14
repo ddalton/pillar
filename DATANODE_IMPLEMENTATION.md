@@ -47,7 +47,6 @@ The Pillar DataNode provides complete HDFS block storage functionality with nati
            │ Flint CSI Volume   │
            │ /mnt/pillar-data   │
            │ SPDK backend       │
-           │ 373 MB/s reads     │
            └────────────────────┘
 ```
 
@@ -143,57 +142,51 @@ impl VolumeManager {
 - Health checks with write tests
 - Block pool isolation
 
-### 3. Data Transfer Server (`pillar-datanode/src/storage/data_transfer.rs`)
+### 3. Data Transfer (`pillar-datanode/src/transport/wire.rs`)
 
-TCP server implementing HDFS Data Transfer Protocol.
+Pillar's own block-transfer protocol between DataNodes, used by the TCP
+transport (`transport/tcp.rs`) and by the RDMA transport, whose data
+currently moves over TCP. It is **not** Hadoop's DataTransferProtocol: a
+Hadoop client cannot talk to it.
 
-**Protocol Operations:**
-```rust
-pub enum DataTransferOp {
-    ReadBlock = 81,   // Read block data
-    WriteBlock = 80,  // Write block data
-    ReplaceBlock = 82,
-    CopyBlock = 83,
-    BlockChecksum = 84,
-}
+**Wire format** (integers big-endian; a connection carries any number of
+requests, one after another):
+
+```
+request   [1: op] [8: block_id] [8: generation_stamp] [8: offset] [8: length]
+
+READ  (op 81)
+  reply   [1: status=0] [8: len] [len bytes]        len = min(length, size - offset)
+          [1: status≠0] [2: msg_len] [msg]          2 = not found, 1 = other error
+
+WRITE (op 80)  offset/length reserved (0); a complete block in one session:
+  packets [4: len, 1..=4 MiB] [len bytes] ...
+  end     [4: 0]
+  reply   [1: status=0] [8: bytes stored]  |  [1: status≠0] [2: msg_len] [msg]
 ```
 
-**Wire Protocol (Simplified):**
+**Behaviour:**
+- A WRITE streams the whole block over one connection: the receiver writes
+  packets sequentially into one open temp file and finalizes the block at
+  the end marker, so it is readable as soon as the sender gets `status=0`.
+  There is one acknowledgement per block; TCP flow control paces the sender.
+- A sender that fails part-way closes the connection without the end
+  marker; the receiver deletes the partial block. A block that is already
+  finalized is never overwritten.
+- READ replies are clamped to the block, so the server's memory use is
+  bounded by the block rather than by the requested length.
+- Disk I/O runs on blocking threads connected to the socket by bounded
+  channels, overlapping disk and network in both directions.
+- TCP_NODELAY on all data sockets; clients pool connections per peer
+  (reads retry once on a stale pooled connection).
 
-**Read Block:**
+**Measuring:** `pillar-datanode/tests/data_path.rs` checks every replicator
+end to end (block replicated → read back → byte-compared); its `#[ignore]`d
+`throughput_*` tests are a loopback benchmark:
+
 ```
-Client → DataNode:
-  [1 byte: opcode=81]
-  [8 bytes: block_id]
-  [8 bytes: generation_stamp]
-  [8 bytes: offset]
-  [8 bytes: length]
-
-DataNode → Client:
-  [1 byte: status (0=success)]
-  [8 bytes: data_length]
-  [N bytes: block_data]
+cargo test --release -p pillar-datanode --test data_path -- --ignored --nocapture --test-threads=1
 ```
-
-**Write Block:**
-```
-Client → DataNode:
-  [1 byte: opcode=80]
-  [8 bytes: block_id]
-  [8 bytes: generation_stamp]
-  [8 bytes: offset]
-  [8 bytes: length]
-  [N bytes: block_data]
-
-DataNode → Client:
-  [1 byte: status (0=success)]
-```
-
-**Features:**
-- Asynchronous TCP server using Tokio
-- Concurrent connection handling
-- Zero-copy I/O for performance
-- Automatic block creation on first write
 
 ### 4. NameNode Client (`pillar-datanode/src/grpc/namenode_client.rs`)
 
@@ -340,31 +333,11 @@ spec:
 
 ## Performance
 
-### Block I/O Performance
-
-| Operation | Throughput | Latency (p50) | Latency (p99) |
-|-----------|------------|---------------|---------------|
-| Sequential Read | 373 MB/s | 2ms | 5ms |
-| Sequential Write | 350 MB/s | 3ms | 8ms |
-| Random Read | 180 MB/s | 5ms | 15ms |
-| Random Write | 150 MB/s | 8ms | 20ms |
-
-### Metadata Operations
-
-| Operation | Latency (p50) | Throughput |
-|-----------|---------------|------------|
-| Create Block | ~1ms | 1,000 ops/sec |
-| Finalize Block | ~2ms | 500 ops/sec |
-| Get Block Metadata | ~0.1ms | 10,000 ops/sec |
-
-### Resource Usage
-
-| Resource | Typical | Peak |
-|----------|---------|------|
-| CPU | 10-20% | 60% |
-| Memory | 100 MB | 500 MB |
-| Disk I/O | Variable | 373 MB/s |
-| Network | Variable | 1 Gbps+ |
+No end-to-end disk or network benchmarks have been run yet. The only
+measurements are the loopback data-path numbers in the README's
+Performance section (`tests/data_path.rs`), which measure protocol and
+copy overhead, not storage or network bandwidth. The targets in
+`NEXT_STEPS.md` (e.g. ~350 MB/s sequential I/O) remain targets.
 
 ## Data Flow Examples
 

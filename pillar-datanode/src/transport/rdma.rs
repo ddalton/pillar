@@ -1,107 +1,120 @@
 //! RDMA-based data transport implementation using ibverbs
 //!
 //! This module implements the RDMA transport layer for high-performance block I/O
-//! using the ibverbs crate, which provides Rust bindings to libibverbs.
+//! using the `ibverbs` crate (0.9), which provides Rust bindings to libibverbs.
 //!
-//! ## RDMA Architecture
+//! ## Current status
 //!
-//! The implementation uses RDMA verbs for zero-copy data transfer:
-//! - **Queue Pairs (QP)**: Connection endpoints for RDMA operations
-//! - **Protection Domains (PD)**: Memory isolation and access control
-//! - **Memory Regions (MR)**: Registered memory for DMA access
-//! - **Completion Queues (CQ)**: Asynchronous operation completion notifications
+//! Block data currently moves over TCP using the shared wire protocol
+//! (`transport/wire.rs`); see `RDMA_IMPLEMENTATION_PLAN.md`. The verbs
+//! resources below (device context, protection domain, registered buffer pool,
+//! queue-pair setup, SEND/RECV posting and completion polling) are the
+//! scaffolding the RDMA data path will be built on. They are initialised by
+//! [`RdmaTransport::new`] but are not yet used to move block data.
 //!
-//! ## Operation Types
+//! ## RDMA Architecture (ibverbs 0.9 model)
 //!
-//! - **SEND/RECV**: Two-sided operations (both endpoints involved)
-//! - **READ/WRITE**: One-sided operations (only initiator CPU involved)
-//!
-//! For block transfers, we use SEND/RECV for control messages and READ/WRITE
-//! for bulk data transfer when performance is critical.
+//! - **Context / Protection Domain (PD)**: opened once per transport. Every
+//!   other verbs object borrows from these, so they are given a `'static`
+//!   lifetime (see [`RdmaContext`]).
+//! - **Memory Regions (MR)**: `MemoryRegion<u8>` owns its registered buffer
+//!   (allocated by `ProtectionDomain::allocate`). Buffers are pooled to keep
+//!   registration off the data path.
+//! - **Queue Pairs (QP)**: a QP is created as a `PreparedQueuePair`, its
+//!   `QueuePairEndpoint` is exchanged with the peer out of band (over any
+//!   byte stream, e.g. TCP), and `handshake` moves it to RTS.
+//! - **Completion Queues (CQ)**: one CQ per connection serves both the send
+//!   and the receive queue; completions are demultiplexed by `wr_id`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::{RwLock, Mutex};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ibverbs::{
+    ibv_qp_type, ibv_wc, CompletionQueue, Context, MemoryRegion, ProtectionDomain, QueuePair,
+    QueuePairEndpoint,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::storage::block_storage::{BlockStorage, BlockId};
-use super::{DataTransport, DataTransferOp, Result, TransportError, TransportType};
+use super::wire::{self, ConnPool};
+use super::{BlockChunks, DataTransport, Result, TransportError, TransportType};
+use crate::storage::block_storage::BlockStorage;
 
-// Import ibverbs types when RDMA feature is enabled
-#[cfg(feature = "rdma")]
-use ibverbs::*;
+/// How long to wait for a single work completion before giving up.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on the size of a serialized `QueuePairEndpoint` during the handshake.
+const MAX_ENDPOINT_MSG: u32 = 4096;
+
+fn verbs_err(what: &str, e: impl std::fmt::Display) -> TransportError {
+    TransportError::RdmaError(format!("{}: {}", what, e))
+}
 
 /// RDMA transport configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // only `listen_addr` is used until the RDMA data path lands
 pub struct RdmaConfig {
     pub listen_addr: SocketAddr,
     pub queue_depth: u32,
+    /// Requested inline-data size. ibverbs 0.9 does not expose
+    /// `max_inline_data` on its `QueuePairBuilder` (it is fixed at 0), so this
+    /// is currently informational only.
     pub max_inline_data: u32,
     pub buffer_pool_size: usize,
 }
 
-/// RDMA device context and resources
+/// RDMA device context and protection domain.
 ///
-/// Manages the RDMA device, protection domain, and shared resources.
-/// All RDMA operations require a context to be initialized first.
-#[cfg(feature = "rdma")]
+/// In ibverbs 0.9 a `ProtectionDomain<'ctx>` borrows its `Context`, and queue
+/// pairs / completion queues borrow those in turn. The context and PD are
+/// therefore leaked to obtain `'static` references: they are created once per
+/// transport and live for the lifetime of the DataNode process, and leaking
+/// them avoids self-referential structs. (The device is closed by the OS at
+/// process exit.)
 struct RdmaContext {
-    context: Arc<Context>,
-    pd: Arc<ProtectionDomain<'static>>,
+    context: &'static Context,
+    pd: &'static ProtectionDomain<'static>,
     device_name: String,
 }
 
-#[cfg(feature = "rdma")]
 impl RdmaContext {
-    /// Initialize RDMA device context
+    /// Open the first available RDMA device and allocate a protection domain.
     ///
-    /// This opens the first available RDMA device and creates a protection domain.
-    /// In production, you may want to select a specific device by name.
+    /// In production you may want to select a specific device by name.
     fn new() -> Result<Self> {
-        // Get list of available RDMA devices
-        let devices = ibverbs::devices()
-            .map_err(|e| TransportError::ProtocolError(
-                format!("Failed to query RDMA devices: {:?}", e)
-            ))?;
+        let devices = ibverbs::devices().map_err(|e| verbs_err("Failed to query RDMA devices", e))?;
 
-        if devices.is_empty() {
-            return Err(TransportError::ProtocolError(
-                "No RDMA devices found. Ensure RDMA hardware is installed and drivers are loaded.".to_string()
-            ));
-        }
+        let device = devices.get(0).ok_or_else(|| {
+            TransportError::RdmaError(
+                "No RDMA devices found. Ensure RDMA hardware is installed and drivers are loaded."
+                    .to_string(),
+            )
+        })?;
 
-        // Open the first available device
-        let device = &devices[0];
-        let device_name = device.name()
-            .map_err(|e| TransportError::ProtocolError(
-                format!("Failed to get device name: {:?}", e)
-            ))?;
+        let device_name = device
+            .name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unnamed>".to_string());
 
         info!("Opening RDMA device: {}", device_name);
 
-        let context = device.open()
-            .map_err(|e| TransportError::ProtocolError(
-                format!("Failed to open RDMA device {}: {:?}", device_name, e)
-            ))?;
+        // `open` also queries port 1 and fails unless the port is ACTIVE/ARMED.
+        let context = device
+            .open()
+            .map_err(|e| verbs_err(&format!("Failed to open RDMA device {}", device_name), e))?;
+        let context: &'static Context = Box::leak(Box::new(context));
 
-        let context = Arc::new(context);
-
-        // Create protection domain
-        // Safety: We're passing a valid context
-        let pd = unsafe {
-            ProtectionDomain::new(&context)
-                .map_err(|e| TransportError::ProtocolError(
-                    format!("Failed to create protection domain: {:?}", e)
-                ))?
-        };
-
-        let pd = Arc::new(pd);
+        let pd = context
+            .alloc_pd()
+            .map_err(|e| verbs_err("Failed to allocate protection domain", e))?;
+        let pd: &'static ProtectionDomain<'static> = Box::leak(Box::new(pd));
 
         info!("RDMA device {} initialized with protection domain", device_name);
 
@@ -111,356 +124,338 @@ impl RdmaContext {
             device_name,
         })
     }
+
+    /// Pick a GID table index for global routing (required for RoCE).
+    ///
+    /// `QueuePairBuilder::set_gid_index` indexes `Context::gid_table()` and
+    /// `PreparedQueuePair::endpoint` asserts that the entry at that position
+    /// carries the same `gid_index`, so only such entries are eligible.
+    fn gid_index(&self) -> Option<u32> {
+        self.context
+            .gid_table()
+            .iter()
+            .enumerate()
+            .find(|(pos, entry)| entry.gid_index == *pos as u32)
+            .map(|(pos, _)| pos as u32)
+    }
 }
 
-/// RDMA memory buffer with registered memory region
+/// Pool of pre-registered RDMA buffers.
 ///
-/// Represents a buffer that has been registered with the RDMA device for DMA access.
-/// The buffer is pinned in memory and can be used for zero-copy transfers.
-#[cfg(feature = "rdma")]
-struct RdmaBuffer {
-    data: Vec<u8>,
-    mr: MemoryRegion<'static>,
-}
-
-#[cfg(feature = "rdma")]
-impl RdmaBuffer {
-    /// Create and register a new RDMA buffer
-    fn new(pd: &Arc<ProtectionDomain<'static>>, size: usize) -> Result<Self> {
-        let mut data = vec![0u8; size];
-
-        // Register memory region with RDMA device
-        // Safety: We're registering a valid buffer that we own
-        let mr = unsafe {
-            MemoryRegion::new(
-                pd,
-                NonNull::new(data.as_mut_ptr()).unwrap(),
-                size,
-                // Allow local and remote read/write access
-                ibverbs::MemoryRegionAccess::LOCAL_WRITE |
-                ibverbs::MemoryRegionAccess::REMOTE_READ |
-                ibverbs::MemoryRegionAccess::REMOTE_WRITE,
-            )
-            .map_err(|e| TransportError::ProtocolError(
-                format!("Failed to register memory region: {:?}", e)
-            ))?
-        };
-
-        Ok(Self { data, mr })
-    }
-
-    /// Get the buffer data
-    fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Get mutable buffer data
-    fn data_mut(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
-    /// Get the memory region
-    fn mr(&self) -> &MemoryRegion<'static> {
-        &self.mr
-    }
-}
-
-/// RDMA memory buffer pool
-///
-/// Manages a pool of pre-allocated and registered RDMA buffers.
-/// This avoids the overhead of allocating and registering buffers on every I/O operation.
+/// `MemoryRegion<u8>` owns its buffer, so a pooled buffer *is* its memory
+/// region. Pre-registering avoids the cost of `ibv_reg_mr` on every I/O.
+#[allow(dead_code)] // not on the data path yet; see module docs
 struct RdmaMemoryPool {
-    #[cfg(feature = "rdma")]
-    buffers: Arc<Mutex<Vec<RdmaBuffer>>>,
-    #[cfg(not(feature = "rdma"))]
-    _phantom: std::marker::PhantomData<()>,
+    buffers: Mutex<Vec<MemoryRegion<u8>>>,
     buffer_size: usize,
     pool_size: usize,
 }
 
+#[allow(dead_code)] // not on the data path yet; see module docs
 impl RdmaMemoryPool {
-    #[cfg(feature = "rdma")]
-    fn new(pd: &Arc<ProtectionDomain<'static>>, pool_size: usize, buffer_size: usize) -> Result<Self> {
-        info!("Creating RDMA memory pool: {} buffers of {} bytes", pool_size, buffer_size);
+    fn new(pd: &ProtectionDomain<'_>, pool_size: usize, buffer_size: usize) -> Result<Self> {
+        info!(
+            "Creating RDMA memory pool: {} buffers of {} bytes",
+            pool_size, buffer_size
+        );
 
         let mut buffers = Vec::with_capacity(pool_size);
-
-        // Pre-allocate and register all buffers
         for i in 0..pool_size {
-            match RdmaBuffer::new(pd, buffer_size) {
-                Ok(buf) => buffers.push(buf),
+            match pd.allocate::<u8>(buffer_size) {
+                Ok(mr) => buffers.push(mr),
                 Err(e) => {
-                    warn!("Failed to allocate RDMA buffer {}/{}: {}", i + 1, pool_size, e);
+                    warn!(
+                        "Failed to allocate RDMA buffer {}/{}: {}",
+                        i + 1,
+                        pool_size,
+                        e
+                    );
                     break;
                 }
             }
         }
 
         if buffers.is_empty() {
-            return Err(TransportError::ProtocolError(
-                "Failed to allocate any RDMA buffers".to_string()
+            return Err(TransportError::RdmaError(
+                "Failed to allocate any RDMA buffers".to_string(),
             ));
         }
 
         info!("Allocated {} RDMA buffers", buffers.len());
 
         Ok(Self {
-            buffers: Arc::new(Mutex::new(buffers)),
+            buffers: Mutex::new(buffers),
             buffer_size,
             pool_size,
         })
     }
 
-    #[cfg(not(feature = "rdma"))]
-    fn new(_pool_size: usize, buffer_size: usize) -> Result<Self> {
-        Ok(Self {
-            _phantom: std::marker::PhantomData,
-            buffer_size,
-            pool_size: _pool_size,
-        })
+    fn get_buffer(&self) -> Result<MemoryRegion<u8>> {
+        self.buffers
+            .lock()
+            .unwrap()
+            .pop()
+            .ok_or_else(|| TransportError::RdmaError("RDMA buffer pool exhausted".to_string()))
     }
 
-    #[cfg(feature = "rdma")]
-    async fn get_buffer(&self) -> Result<RdmaBuffer> {
-        let mut buffers = self.buffers.lock().await;
-
-        if let Some(buf) = buffers.pop() {
-            Ok(buf)
-        } else {
-            Err(TransportError::ProtocolError(
-                "RDMA buffer pool exhausted".to_string()
-            ))
-        }
-    }
-
-    #[cfg(not(feature = "rdma"))]
-    async fn get_buffer(&self) -> Result<Vec<u8>> {
-        Ok(vec![0u8; self.buffer_size])
-    }
-
-    #[cfg(feature = "rdma")]
-    async fn return_buffer(&self, buffer: RdmaBuffer) {
-        let mut buffers = self.buffers.lock().await;
-        if buffers.len() < self.pool_size {
+    /// Return a buffer to the pool. Only call this once no work request
+    /// referencing the buffer is outstanding (the `RdmaConnection` send/recv
+    /// helpers only hand buffers back after their completion was reaped).
+    fn return_buffer(&self, buffer: MemoryRegion<u8>) {
+        let mut buffers = self.buffers.lock().unwrap();
+        if buffers.len() < self.pool_size && buffer.len() == self.buffer_size {
             buffers.push(buffer);
         }
     }
 
-    #[cfg(not(feature = "rdma"))]
-    async fn return_buffer(&self, _buffer: Vec<u8>) {
-        // No-op for non-RDMA builds
+    fn available(&self) -> usize {
+        self.buffers.lock().unwrap().len()
     }
 }
 
-/// RDMA connection to a peer DataNode
+/// Write a `QueuePairEndpoint` as a length-prefixed JSON frame.
+async fn write_endpoint<S: AsyncWrite + Unpin>(stream: &mut S, ep: &QueuePairEndpoint) -> Result<()> {
+    let buf = serde_json::to_vec(ep)
+        .map_err(|e| TransportError::ProtocolError(format!("encode QP endpoint: {}", e)))?;
+    stream.write_u32(buf.len() as u32).await?;
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Read a `QueuePairEndpoint` written by [`write_endpoint`].
+async fn read_endpoint<S: AsyncRead + Unpin>(stream: &mut S) -> Result<QueuePairEndpoint> {
+    let len = stream.read_u32().await?;
+    if len > MAX_ENDPOINT_MSG {
+        return Err(TransportError::ProtocolError(format!(
+            "QP endpoint message too large: {} bytes",
+            len
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf).await?;
+    serde_json::from_slice(&buf)
+        .map_err(|e| TransportError::ProtocolError(format!("decode QP endpoint: {}", e)))
+}
+
+/// An established RC queue pair to a peer DataNode.
 ///
-/// Manages a Queue Pair (QP) for RDMA operations with a specific peer.
-/// In RDMA, each connection has a QP for sending/receiving data.
-#[cfg(feature = "rdma")]
+/// The QP borrows its completion queue. ibverbs 0.9 expresses that with
+/// lifetimes, so the CQ is boxed (stable address) and the borrow is extended
+/// to `'static`. **Field order matters:** `qp` is declared before `cq` so it is
+/// dropped (`ibv_destroy_qp`) before the CQ it references (`ibv_destroy_cq`).
+#[allow(dead_code)] // not on the data path yet; see module docs
 struct RdmaConnection {
     peer_addr: String,
-    qp: Arc<QueuePair<'static>>,
-    send_cq: Arc<CompletionQueue<'static>>,
-    recv_cq: Arc<CompletionQueue<'static>>,
+    remote: QueuePairEndpoint,
+    /// `post_send`/`post_receive` take `&mut QueuePair`; posting never blocks.
+    qp: Mutex<QueuePair<'static>>,
+    cq: Box<CompletionQueue<'static>>,
+    /// Completions reaped by one waiter on behalf of another, keyed by `wr_id`.
+    stash: Mutex<HashMap<u64, ibv_wc>>,
+    next_wr_id: AtomicU64,
 }
 
-#[cfg(not(feature = "rdma"))]
-struct RdmaConnection {
-    peer_addr: String,
-    _tcp_socket: Option<TcpStream>,
-}
-
-#[cfg(feature = "rdma")]
+#[allow(dead_code)] // not on the data path yet; see module docs
 impl RdmaConnection {
-    /// Create a new RDMA connection to a peer
-    async fn connect(
+    /// Create an RC queue pair and connect it to the peer.
+    ///
+    /// The QP endpoints (QPN, LID, optional GID) are exchanged over `stream`,
+    /// which can be any reliable byte stream to the peer (e.g. a TCP
+    /// connection). Both sides run this same function.
+    async fn establish<S: AsyncRead + AsyncWrite + Unpin>(
         peer_addr: &str,
-        context: &Arc<RdmaContext>,
+        ctx: &RdmaContext,
         queue_depth: u32,
+        stream: &mut S,
     ) -> Result<Self> {
         debug!("Establishing RDMA connection to {}", peer_addr);
 
-        // Create completion queues for send and receive operations
-        let send_cq = unsafe {
-            CompletionQueue::new(&context.context, queue_depth as i32, std::ptr::null_mut())
-                .map_err(|e| TransportError::ConnectionError(
-                    format!("Failed to create send CQ: {:?}", e)
-                ))?
-        };
+        let queue_depth = queue_depth.max(1);
+        // One CQ serves both the send and receive queues.
+        let cq_entries = i32::try_from(queue_depth.saturating_mul(2)).unwrap_or(i32::MAX);
+        let cq = Box::new(
+            ctx.context
+                .create_cq(cq_entries, 0)
+                .map_err(|e| verbs_err("Failed to create completion queue", e))?,
+        );
+        // SAFETY: the CQ lives on the heap and is never moved out of its Box.
+        // The only borrower is the QP created below, which is always dropped
+        // before `cq`: as a local (declared after `cq`) and as a field of
+        // `RdmaConnection` (declared before `cq`).
+        let cq_ref: &'static CompletionQueue<'static> =
+            unsafe { &*(cq.as_ref() as *const CompletionQueue<'static>) };
 
-        let recv_cq = unsafe {
-            CompletionQueue::new(&context.context, queue_depth as i32, std::ptr::null_mut())
-                .map_err(|e| TransportError::ConnectionError(
-                    format!("Failed to create recv CQ: {:?}", e)
-                ))?
-        };
+        let mut builder = ctx.pd.create_qp(cq_ref, cq_ref, ibv_qp_type::IBV_QPT_RC);
+        builder
+            .set_max_send_wr(queue_depth)
+            .set_max_recv_wr(queue_depth)
+            .allow_remote_rw();
+        if let Some(idx) = ctx.gid_index() {
+            builder.set_gid_index(idx);
+        }
+        let prepared = builder
+            .build()
+            .map_err(|e| verbs_err("Failed to create queue pair", e))?;
 
-        let send_cq = Arc::new(send_cq);
-        let recv_cq = Arc::new(recv_cq);
+        let local = prepared.endpoint();
+        write_endpoint(stream, &local).await?;
+        let remote = read_endpoint(stream).await?;
+        debug!("RDMA QP endpoints: local={:?} remote={:?}", local, remote);
 
-        // Create queue pair
-        let mut qp_init_attr = QueuePairInitAttr::default();
-        qp_init_attr.send_cq = &send_cq;
-        qp_init_attr.recv_cq = &recv_cq;
-        qp_init_attr.cap.max_send_wr = queue_depth;
-        qp_init_attr.cap.max_recv_wr = queue_depth;
-        qp_init_attr.cap.max_send_sge = 1;
-        qp_init_attr.cap.max_recv_sge = 1;
-        qp_init_attr.qp_type = QueuePairType::RC; // Reliable Connection
+        // INIT -> RTR -> RTS
+        let qp = prepared
+            .handshake(remote)
+            .map_err(|e| verbs_err("QP handshake failed", e))?;
 
-        let qp = unsafe {
-            QueuePair::new(&context.pd, &qp_init_attr)
-                .map_err(|e| TransportError::ConnectionError(
-                    format!("Failed to create queue pair: {:?}", e)
-                ))?
-        };
-
-        let qp = Arc::new(qp);
-
-        // TODO: Complete QP state transitions (INIT -> RTR -> RTS)
-        // This requires connection parameter exchange with the peer
-        // For now, we'll note this is where RDMA CM or manual exchange would happen
-
-        info!("RDMA connection established to {}", peer_addr);
+        info!(
+            "RDMA connection established to {} (local QPN {}, remote QPN {})",
+            peer_addr, local.num, remote.num
+        );
 
         Ok(Self {
             peer_addr: peer_addr.to_string(),
-            qp,
-            send_cq,
-            recv_cq,
+            remote,
+            qp: Mutex::new(qp),
+            cq,
+            stash: Mutex::new(HashMap::new()),
+            next_wr_id: AtomicU64::new(1),
         })
     }
 
-    /// Post an RDMA SEND operation
-    async fn post_send(&self, data: &[u8], mr: &MemoryRegion<'static>) -> Result<()> {
-        let mut sge = ibverbs::ScatterGatherElement::default();
-        sge.addr = data.as_ptr() as u64;
-        sge.length = data.len() as u32;
-        sge.lkey = mr.lkey();
-
-        let mut send_wr = ibverbs::SendWorkRequest::default();
-        send_wr.sg_list = &mut sge;
-        send_wr.num_sge = 1;
-        send_wr.opcode = ibverbs::WorkRequestOpcode::Send;
-
-        unsafe {
-            self.qp.post_send(&send_wr, std::ptr::null_mut())
-                .map_err(|e| TransportError::ProtocolError(
-                    format!("Failed to post SEND: {:?}", e)
-                ))?;
-        }
-
-        debug!("RDMA SEND posted to {} ({} bytes)", self.peer_addr, data.len());
-        Ok(())
+    fn next_wr_id(&self) -> u64 {
+        self.next_wr_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Post an RDMA RECV operation
-    async fn post_recv(&self, buffer: &mut [u8], mr: &MemoryRegion<'static>) -> Result<()> {
-        let mut sge = ibverbs::ScatterGatherElement::default();
-        sge.addr = buffer.as_ptr() as u64;
-        sge.length = buffer.len() as u32;
-        sge.lkey = mr.lkey();
-
-        let mut recv_wr = ibverbs::ReceiveWorkRequest::default();
-        recv_wr.sg_list = &mut sge;
-        recv_wr.num_sge = 1;
-
-        unsafe {
-            self.qp.post_recv(&recv_wr, std::ptr::null_mut())
-                .map_err(|e| TransportError::ProtocolError(
-                    format!("Failed to post RECV: {:?}", e)
-                ))?;
+    /// SEND the first `len` bytes of `mr` and wait for its completion.
+    ///
+    /// The buffer is moved into the operation and handed back once the work
+    /// completion has been reaped, which is what ibverbs requires before an
+    /// MR may be reused or dropped. If the caller's future is cancelled, the
+    /// blocking poll task keeps ownership until the completion arrives.
+    async fn send(self: &Arc<Self>, mut mr: MemoryRegion<u8>, len: usize) -> Result<MemoryRegion<u8>> {
+        if len == 0 || len > mr.len() {
+            return Err(TransportError::RdmaError(format!(
+                "invalid SEND length {} for {}-byte buffer",
+                len,
+                mr.len()
+            )));
         }
+        let wr_id = self.next_wr_id();
+        // SAFETY: `mr` is not touched again until its completion is reaped in
+        // `wait_completion`, which owns it until then.
+        unsafe { self.qp.lock().unwrap().post_send(&mut mr, ..len, wr_id) }
+            .map_err(|e| verbs_err("Failed to post SEND", e))?;
+        debug!("RDMA SEND posted to {} ({} bytes)", self.peer_addr, len);
 
+        let (mr, _) = self.clone().wait_completion(wr_id, mr, "SEND").await?;
+        Ok(mr)
+    }
+
+    /// Post a RECV into `mr` and wait for a message to land in it.
+    /// Returns the buffer and the number of bytes received.
+    async fn recv(self: &Arc<Self>, mut mr: MemoryRegion<u8>) -> Result<(MemoryRegion<u8>, usize)> {
+        let wr_id = self.next_wr_id();
+        // SAFETY: as in `send`.
+        unsafe { self.qp.lock().unwrap().post_receive(&mut mr, .., wr_id) }
+            .map_err(|e| verbs_err("Failed to post RECV", e))?;
         debug!("RDMA RECV posted from {}", self.peer_addr);
-        Ok(())
+
+        self.clone().wait_completion(wr_id, mr, "RECV").await
     }
 
-    /// Wait for completion on send queue
-    async fn wait_send_completion(&self) -> Result<()> {
-        let mut wc = ibverbs::WorkCompletion::default();
-
-        loop {
-            let num = unsafe {
-                self.send_cq.poll(&mut wc, 1)
-                    .map_err(|e| TransportError::ProtocolError(
-                        format!("Failed to poll send CQ: {:?}", e)
-                    ))?
-            };
-
-            if num > 0 {
-                if wc.status != ibverbs::WorkCompletionStatus::Success {
-                    return Err(TransportError::ProtocolError(
-                        format!("SEND operation failed: {:?}", wc.status)
-                    ));
-                }
-                return Ok(());
+    /// Wait for the completion of `wr_id` on a blocking thread, so tokio
+    /// worker threads are never spun.
+    async fn wait_completion(
+        self: Arc<Self>,
+        wr_id: u64,
+        mr: MemoryRegion<u8>,
+        op: &'static str,
+    ) -> Result<(MemoryRegion<u8>, usize)> {
+        tokio::task::spawn_blocking(move || match self.poll_completion(wr_id) {
+            Ok(wc) => match wc.error() {
+                None => Ok((mr, wc.len())),
+                Some((status, vendor_err)) => Err(TransportError::RdmaError(format!(
+                    "{} to {} failed: status {} (vendor_err {})",
+                    op, self.peer_addr, status, vendor_err
+                ))),
+            },
+            Err(e) => {
+                // The work request may still be outstanding, so the HCA may
+                // still DMA into/out of this buffer. Deregistering or freeing
+                // it would be unsound; leak it instead.
+                std::mem::forget(mr);
+                Err(e)
             }
-
-            // Yield to avoid busy-waiting
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// Wait for completion on receive queue
-    async fn wait_recv_completion(&self) -> Result<usize> {
-        let mut wc = ibverbs::WorkCompletion::default();
-
-        loop {
-            let num = unsafe {
-                self.recv_cq.poll(&mut wc, 1)
-                    .map_err(|e| TransportError::ProtocolError(
-                        format!("Failed to poll recv CQ: {:?}", e)
-                    ))?
-            };
-
-            if num > 0 {
-                if wc.status != ibverbs::WorkCompletionStatus::Success {
-                    return Err(TransportError::ProtocolError(
-                        format!("RECV operation failed: {:?}", wc.status)
-                    ));
-                }
-                return Ok(wc.byte_len as usize);
-            }
-
-            // Yield to avoid busy-waiting
-            tokio::task::yield_now().await;
-        }
-    }
-}
-
-#[cfg(not(feature = "rdma"))]
-impl RdmaConnection {
-    async fn connect(peer_addr: &str) -> Result<Self> {
-        debug!("Establishing RDMA connection to {} (simulated)", peer_addr);
-
-        let socket = TcpStream::connect(peer_addr).await
-            .map_err(|e| TransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", peer_addr, e)
-            ))?;
-
-        Ok(Self {
-            peer_addr: peer_addr.to_string(),
-            _tcp_socket: Some(socket),
         })
+        .await
+        .map_err(|e| TransportError::RdmaError(format!("completion task failed: {}", e)))?
+    }
+
+    /// Blocking poll for the completion of `wr_id`, with backoff: a short
+    /// spin, then yielding, then sleeping with exponentially growing delay.
+    fn poll_completion(&self, wr_id: u64) -> Result<ibv_wc> {
+        let deadline = Instant::now() + COMPLETION_TIMEOUT;
+        let mut completions = [ibv_wc::default(); 16];
+        let mut attempt: u32 = 0;
+        let mut sleep = Duration::from_micros(10);
+
+        loop {
+            {
+                // Hold the stash lock while polling so a completion for another
+                // waiter is always either in the CQ or in the stash.
+                let mut stash = self.stash.lock().unwrap();
+                if let Some(wc) = stash.remove(&wr_id) {
+                    return Ok(wc);
+                }
+                let polled = self
+                    .cq
+                    .poll(&mut completions)
+                    .map_err(|e| verbs_err("Failed to poll CQ", e))?;
+                let mut found = None;
+                for wc in polled.iter() {
+                    if wc.wr_id() == wr_id {
+                        found = Some(*wc);
+                    } else {
+                        stash.insert(wc.wr_id(), *wc);
+                    }
+                }
+                if let Some(wc) = found {
+                    return Ok(wc);
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(TransportError::RdmaError(format!(
+                    "timed out waiting for completion of wr_id {} on connection to {}",
+                    wr_id, self.peer_addr
+                )));
+            }
+
+            attempt += 1;
+            if attempt < 64 {
+                std::hint::spin_loop();
+            } else if attempt < 128 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(sleep);
+                sleep = (sleep * 2).min(Duration::from_millis(1));
+            }
+        }
     }
 }
 
-/// RDMA connection pool for peer DataNodes
+/// RDMA connections to peer DataNodes, keyed by peer address.
+#[allow(dead_code)] // not on the data path yet; see module docs
 struct RdmaConnectionPool {
-    #[cfg(feature = "rdma")]
     connections: RwLock<HashMap<String, Arc<RdmaConnection>>>,
-    #[cfg(feature = "rdma")]
     context: Arc<RdmaContext>,
-    #[cfg(feature = "rdma")]
     queue_depth: u32,
-    #[cfg(not(feature = "rdma"))]
-    connections: RwLock<HashMap<String, Arc<RdmaConnection>>>,
     max_connections: usize,
 }
 
+#[allow(dead_code)] // not on the data path yet; see module docs
 impl RdmaConnectionPool {
-    #[cfg(feature = "rdma")]
     fn new(context: Arc<RdmaContext>, queue_depth: u32, max_connections: usize) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
@@ -470,57 +465,53 @@ impl RdmaConnectionPool {
         }
     }
 
-    #[cfg(not(feature = "rdma"))]
-    fn new(max_connections: usize) -> Self {
-        Self {
-            connections: RwLock::new(HashMap::new()),
-            max_connections,
-        }
+    async fn get(&self, peer_addr: &str) -> Option<Arc<RdmaConnection>> {
+        self.connections.read().await.get(peer_addr).cloned()
     }
 
-    async fn get_or_create(&self, peer_addr: &str) -> Result<Arc<RdmaConnection>> {
-        // Check if connection exists
-        {
-            let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(peer_addr) {
-                return Ok(conn.clone());
-            }
+    /// Return the pooled connection to `peer_addr`, or establish one by
+    /// exchanging QP endpoints over `stream`.
+    ///
+    /// The caller supplies the out-of-band stream: the DataNode's data port
+    /// currently speaks only the TCP wire protocol, which has no QP-handshake
+    /// message yet, so there is no default control channel to dial.
+    async fn get_or_establish<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        peer_addr: &str,
+        stream: &mut S,
+    ) -> Result<Arc<RdmaConnection>> {
+        if let Some(conn) = self.get(peer_addr).await {
+            return Ok(conn);
         }
 
-        // Create new connection
-        #[cfg(feature = "rdma")]
         let conn = Arc::new(
-            RdmaConnection::connect(peer_addr, &self.context, self.queue_depth).await?
+            RdmaConnection::establish(peer_addr, &self.context, self.queue_depth, stream).await?,
         );
 
-        #[cfg(not(feature = "rdma"))]
-        let conn = Arc::new(RdmaConnection::connect(peer_addr).await?);
-
-        // Store in pool
-        {
-            let mut connections = self.connections.write().await;
-            if connections.len() >= self.max_connections {
-                warn!("RDMA connection pool full, evicting oldest connection");
-                // TODO: Implement LRU eviction
-            }
-            connections.insert(peer_addr.to_string(), conn.clone());
+        let mut connections = self.connections.write().await;
+        if connections.len() >= self.max_connections {
+            warn!("RDMA connection pool full, evicting oldest connection");
+            // TODO: Implement LRU eviction
         }
-
+        connections.insert(peer_addr.to_string(), conn.clone());
         Ok(conn)
     }
 }
 
 /// RDMA-based data transport
 ///
-/// This implements the DataTransport trait using RDMA verbs for both server-side
-/// (serving requests) and client-side (connecting to peers) operations.
+/// This implements the DataTransport trait for both server-side (serving
+/// requests) and client-side (connecting to peers) operations.
 pub struct RdmaTransport {
     block_storage: Arc<BlockStorage>,
     config: RdmaConfig,
-    #[cfg(feature = "rdma")]
     context: Arc<RdmaContext>,
+    #[allow(dead_code)] // not on the data path yet; see module docs
     memory_pool: Arc<RdmaMemoryPool>,
+    #[allow(dead_code)] // not on the data path yet; see module docs
     connection_pool: Arc<RdmaConnectionPool>,
+    /// Pooled TCP connections for the interim TCP data path.
+    tcp_pool: ConnPool,
 }
 
 impl RdmaTransport {
@@ -532,32 +523,22 @@ impl RdmaTransport {
         buffer_pool_size: usize,
     ) -> Result<Self> {
         info!("Initializing RDMA transport on {}", listen_addr);
-        info!("RDMA config: queue_depth={}, max_inline={}, buffers={}",
-              queue_depth, max_inline_data, buffer_pool_size);
+        info!(
+            "RDMA config: queue_depth={}, max_inline={}, buffers={}",
+            queue_depth, max_inline_data, buffer_pool_size
+        );
 
-        // Initialize RDMA device context
-        #[cfg(feature = "rdma")]
         let context = Arc::new(RdmaContext::new()?);
 
-        // Create memory pool with buffers sized for typical blocks
+        // Buffers sized for typical block chunks
         let buffer_size = 1024 * 1024; // 1MB buffers
+        let memory_pool = Arc::new(RdmaMemoryPool::new(context.pd, buffer_pool_size, buffer_size)?);
 
-        #[cfg(feature = "rdma")]
-        let memory_pool = Arc::new(RdmaMemoryPool::new(&context.pd, buffer_pool_size, buffer_size)?);
-
-        #[cfg(not(feature = "rdma"))]
-        let memory_pool = Arc::new(RdmaMemoryPool::new(buffer_pool_size, buffer_size)?);
-
-        // Create connection pool
-        #[cfg(feature = "rdma")]
         let connection_pool = Arc::new(RdmaConnectionPool::new(
             context.clone(),
             queue_depth,
             256, // Max 256 peer connections
         ));
-
-        #[cfg(not(feature = "rdma"))]
-        let connection_pool = Arc::new(RdmaConnectionPool::new(256));
 
         Ok(Self {
             block_storage,
@@ -567,157 +548,18 @@ impl RdmaTransport {
                 max_inline_data,
                 buffer_pool_size,
             },
-            #[cfg(feature = "rdma")]
             context,
             memory_pool,
             connection_pool,
+            tcp_pool: ConnPool::default(),
         })
-    }
-
-    /// Handle a single RDMA connection (server side)
-    ///
-    /// Note: In a full RDMA implementation, this would use RDMA CM (Connection Manager)
-    /// to accept incoming connections. For now, we use TCP for connection setup and
-    /// then switch to RDMA for data transfer.
-    async fn handle_connection(&self, mut socket: TcpStream, peer_addr: SocketAddr) -> Result<()> {
-        debug!("Handling RDMA connection from {}", peer_addr);
-
-        // Read operation code (1 byte)
-        let mut op_code_buf = [0u8; 1];
-        socket.read_exact(&mut op_code_buf).await?;
-
-        let op = DataTransferOp::from_u8(op_code_buf[0])
-            .ok_or_else(|| TransportError::ProtocolError(
-                format!("Unknown operation code: {}", op_code_buf[0])
-            ))?;
-
-        debug!("RDMA operation: {:?}", op);
-
-        match op {
-            DataTransferOp::ReadBlock => {
-                self.handle_rdma_read(&mut socket).await?;
-            }
-            DataTransferOp::WriteBlock => {
-                self.handle_rdma_write(&mut socket).await?;
-            }
-            _ => {
-                warn!("Operation {:?} not yet implemented over RDMA", op);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle RDMA read request (server side)
-    async fn handle_rdma_read(&self, socket: &mut TcpStream) -> Result<()> {
-        // Read request header
-        let mut buf = [0u8; 32];
-        socket.read_exact(&mut buf).await?;
-
-        let block_id = u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let gen_stamp = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let offset = u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-        let length = u64::from_be_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
-
-        debug!("RDMA read request: block={}, offset={}, length={}", block_id, offset, length);
-
-        // Read block from storage
-        let data = self.serve_read_request(block_id, gen_stamp, offset, length).await?;
-
-        // Send data via RDMA or TCP fallback
-        #[cfg(feature = "rdma")]
-        {
-            // TODO: Use RDMA SEND for production
-            // For now, use TCP as fallback during development
-            socket.write_u8(0).await?;
-            socket.write_u64(data.len() as u64).await?;
-            socket.write_all(&data).await?;
-            socket.flush().await?;
-        }
-
-        #[cfg(not(feature = "rdma"))]
-        {
-            socket.write_u8(0).await?;
-            socket.write_u64(data.len() as u64).await?;
-            socket.write_all(&data).await?;
-            socket.flush().await?;
-        }
-
-        info!("Sent {} bytes for block {} via RDMA", data.len(), block_id);
-
-        Ok(())
-    }
-
-    /// Handle RDMA write request (server side)
-    async fn handle_rdma_write(&self, socket: &mut TcpStream) -> Result<()> {
-        // Read request header
-        let mut buf = [0u8; 32];
-        socket.read_exact(&mut buf).await?;
-
-        let block_id = u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let gen_stamp = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let offset = u64::from_be_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
-        let length = u64::from_be_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
-
-        debug!("RDMA write request: block={}, offset={}, length={}", block_id, offset, length);
-
-        // Read data via RDMA or TCP fallback
-        let mut data = vec![0u8; length as usize];
-        socket.read_exact(&mut data).await?;
-
-        // Write to storage
-        self.serve_write_request(block_id, gen_stamp, offset, &data).await?;
-
-        // Send success response
-        socket.write_u8(0).await?;
-        socket.flush().await?;
-
-        info!("Received {} bytes for block {} via RDMA", data.len(), block_id);
-
-        Ok(())
     }
 }
 
 #[async_trait]
 impl DataTransport for RdmaTransport {
-    async fn serve_read_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        length: u64,
-    ) -> Result<Bytes> {
-        let block = BlockId::new(block_id, gen_stamp);
-
-        // Read block data from storage
-        let data = self.block_storage.read_block(&block, offset, length)
-            .map_err(|_| TransportError::BlockNotFound(block_id))?;
-
-        Ok(data)
-    }
-
-    async fn serve_write_request(
-        &self,
-        block_id: u64,
-        gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        let block = BlockId::new(block_id, gen_stamp);
-
-        // Create block if it doesn't exist
-        if self.block_storage.get_block_metadata(block_id).is_none() {
-            self.block_storage.create_block(block)
-                .map_err(|e| TransportError::ProtocolError(format!("Failed to create block: {}", e)))?;
-        }
-
-        // Write block data to storage
-        self.block_storage.write_block(&block, offset, data)
-            .map_err(|e| TransportError::ProtocolError(format!("Failed to write block: {}", e)))?;
-
-        Ok(())
-    }
-
+    // Data moves over TCP with the shared wire protocol until RDMA
+    // READ/WRITE is implemented (RDMA_IMPLEMENTATION_PLAN.md).
     async fn read_from_peer(
         &self,
         peer_addr: &str,
@@ -726,93 +568,19 @@ impl DataTransport for RdmaTransport {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        debug!("Reading block {} from peer {} via RDMA", block_id, peer_addr);
-
-        // Get or create connection to peer
-        let _conn = self.connection_pool.get_or_create(peer_addr).await?;
-
-        // Use TCP fallback for now
-        // TODO: Implement RDMA READ for production
-        let mut socket = TcpStream::connect(peer_addr).await
-            .map_err(|e| TransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", peer_addr, e)
-            ))?;
-
-        // Send read block operation
-        socket.write_u8(DataTransferOp::ReadBlock.to_u8()).await?;
-
-        // Send block request
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&block_id.to_be_bytes());
-        buf[8..16].copy_from_slice(&gen_stamp.to_be_bytes());
-        buf[16..24].copy_from_slice(&offset.to_be_bytes());
-        buf[24..32].copy_from_slice(&length.to_be_bytes());
-        socket.write_all(&buf).await?;
-        socket.flush().await?;
-
-        // Read response
-        let status = socket.read_u8().await?;
-        if status != 0 {
-            return Err(TransportError::ProtocolError(
-                format!("Read failed with status: {}", status)
-            ));
-        }
-
-        let data_len = socket.read_u64().await?;
-        let mut data = vec![0u8; data_len as usize];
-        socket.read_exact(&mut data).await?;
-
-        debug!("Read {} bytes from peer {} via RDMA", data.len(), peer_addr);
-
-        Ok(Bytes::from(data))
+        debug!("Reading block {} from peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
+        self.tcp_pool.read_block(peer_addr, block_id, gen_stamp, offset, length).await
     }
 
-    async fn write_to_peer(
+    async fn send_block_to_peer(
         &self,
         peer_addr: &str,
         block_id: u64,
         gen_stamp: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        debug!("Writing block {} to peer {} via RDMA", block_id, peer_addr);
-
-        // Get or create connection to peer
-        let _conn = self.connection_pool.get_or_create(peer_addr).await?;
-
-        // Use TCP fallback for now
-        // TODO: Implement RDMA WRITE for production
-        let mut socket = TcpStream::connect(peer_addr).await
-            .map_err(|e| TransportError::ConnectionError(
-                format!("Failed to connect to {}: {}", peer_addr, e)
-            ))?;
-
-        // Send write block operation
-        socket.write_u8(DataTransferOp::WriteBlock.to_u8()).await?;
-
-        // Send block request
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&block_id.to_be_bytes());
-        buf[8..16].copy_from_slice(&gen_stamp.to_be_bytes());
-        buf[16..24].copy_from_slice(&offset.to_be_bytes());
-        buf[24..32].copy_from_slice(&(data.len() as u64).to_be_bytes());
-        socket.write_all(&buf).await?;
-
-        // Send data
-        socket.write_all(data).await?;
-        socket.flush().await?;
-
-        // Read response
-        let status = socket.read_u8().await?;
-        if status != 0 {
-            return Err(TransportError::ProtocolError(
-                format!("Write failed with status: {}", status)
-            ));
-        }
-
-        debug!("Wrote {} bytes to peer {} via RDMA", data.len(), peer_addr);
-
-        Ok(())
+        chunks: BlockChunks,
+    ) -> Result<u64> {
+        debug!("Sending block {} to peer {} (RDMA transport, TCP data path)", block_id, peer_addr);
+        self.tcp_pool.send_block(peer_addr, block_id, gen_stamp, chunks).await
     }
 
     fn transport_type(&self) -> TransportType {
@@ -824,12 +592,11 @@ impl DataTransport for RdmaTransport {
     }
 
     async fn health_check(&self) -> Result<()> {
-        #[cfg(feature = "rdma")]
-        {
-            // Check RDMA device is still accessible
-            debug!("RDMA health check: device {} OK", self.context.device_name);
-        }
-
+        debug!(
+            "RDMA health check: device {} OK, {} registered buffers available",
+            self.context.device_name,
+            self.memory_pool.available()
+        );
         Ok(())
     }
 
@@ -839,7 +606,6 @@ impl DataTransport for RdmaTransport {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
 
         info!("RDMA data transfer server listening on {}", self.config.listen_addr);
-        #[cfg(feature = "rdma")]
         info!("RDMA device: {}", self.context.device_name);
 
         loop {
@@ -847,9 +613,10 @@ impl DataTransport for RdmaTransport {
                 Ok((socket, peer_addr)) => {
                     debug!("Accepted RDMA connection from {}", peer_addr);
 
-                    let server = self.clone();
+                    wire::tune(&socket);
+                    let storage = self.block_storage.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = server.handle_connection(socket, peer_addr).await {
+                        if let Err(e) = wire::serve_connection(socket, storage, peer_addr).await {
                             warn!("Error handling RDMA connection from {}: {}", peer_addr, e);
                         }
                     });
@@ -865,8 +632,8 @@ impl DataTransport for RdmaTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_rdma_transport_creation() {
@@ -880,70 +647,36 @@ mod tests {
         let block_storage = Arc::new(BlockStorage::new(&finalized_dir, &tmp_dir).unwrap());
         let addr = "127.0.0.1:50011".parse().unwrap();
 
-        // This test will fail if no RDMA hardware is present
-        // In CI/CD, you would skip this test or use mock hardware
-        let result = RdmaTransport::new(block_storage, addr, 128, 256, 1024);
-
-        #[cfg(feature = "rdma")]
-        {
-            // With RDMA feature enabled, this requires actual hardware
-            match result {
-                Ok(transport) => {
-                    assert_eq!(transport.transport_type(), TransportType::Rdma);
-                    assert_eq!(transport.listen_addr(), "127.0.0.1:50011");
-                }
-                Err(e) => {
-                    // Expected to fail in environments without RDMA hardware
-                    println!("RDMA init failed (expected without hardware): {}", e);
-                }
+        // Requires RDMA hardware; without it, initialisation fails cleanly.
+        match RdmaTransport::new(block_storage, addr, 128, 256, 16) {
+            Ok(transport) => {
+                assert_eq!(transport.transport_type(), TransportType::Rdma);
+                assert_eq!(transport.listen_addr(), "127.0.0.1:50011");
+                assert!(transport.health_check().await.is_ok());
             }
-        }
-
-        #[cfg(not(feature = "rdma"))]
-        {
-            // Without RDMA feature, should still work (TCP fallback)
-            let transport = result.unwrap();
-            assert_eq!(transport.transport_type(), TransportType::Rdma);
-            assert_eq!(transport.listen_addr(), "127.0.0.1:50011");
+            Err(e) => {
+                println!("RDMA init failed (expected without hardware): {}", e);
+            }
         }
     }
 
     #[tokio::test]
-    async fn test_rdma_transport_health_check() {
-        let temp_dir = TempDir::new().unwrap();
-        let finalized_dir = temp_dir.path().join("finalized");
-        let tmp_dir = temp_dir.path().join("tmp");
-
-        fs::create_dir_all(&finalized_dir).unwrap();
-        fs::create_dir_all(&tmp_dir).unwrap();
-
-        let block_storage = Arc::new(BlockStorage::new(&finalized_dir, &tmp_dir).unwrap());
-        let addr = "127.0.0.1:50012".parse().unwrap();
-
-        let result = RdmaTransport::new(block_storage, addr, 128, 256, 1024);
-
-        #[cfg(not(feature = "rdma"))]
-        {
-            let transport = result.unwrap();
-            assert!(transport.health_check().await.is_ok());
-        }
-
-        #[cfg(feature = "rdma")]
-        {
-            if let Ok(transport) = result {
-                assert!(transport.health_check().await.is_ok());
-            }
-        }
+    async fn test_endpoint_exchange_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let ep = QueuePairEndpoint {
+            num: 0x1234,
+            lid: 7,
+            gid: None,
+        };
+        write_endpoint(&mut a, &ep).await.unwrap();
+        let got = read_endpoint(&mut b).await.unwrap();
+        assert_eq!(got, ep);
     }
 
-    #[test]
-    fn test_memory_pool_creation() {
-        // Test memory pool creation (without RDMA feature)
-        #[cfg(not(feature = "rdma"))]
-        {
-            let pool = RdmaMemoryPool::new(1024, 1024 * 1024).unwrap();
-            assert_eq!(pool.pool_size, 1024);
-            assert_eq!(pool.buffer_size, 1024 * 1024);
-        }
+    #[tokio::test]
+    async fn test_endpoint_rejects_oversized_frame() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_u32(MAX_ENDPOINT_MSG + 1).await.unwrap();
+        assert!(read_endpoint(&mut b).await.is_err());
     }
 }
