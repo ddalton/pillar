@@ -12,6 +12,8 @@ import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.AclEntry;
+import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
@@ -265,6 +267,7 @@ public class HdfsInterop {
         rescuer.close();
 
         permissionChecks(conf, fs);
+        aclChecks(conf, fs);
         // bob's renamed.bin is in alice's /java: hers to delete with it.
         check(fs.delete(new Path("/java"), true), "recursive delete");
         check(!fs.exists(new Path("/java")), "gone after delete");
@@ -272,9 +275,56 @@ public class HdfsInterop {
         try (FSDataOutputStream out = fs.create(KEEP)) {
             out.write(keepData());
         }
+        fs.modifyAclEntries(KEEP, AclEntry.parseAclSpec("user:carol:r--", true));
         check(fs.getFileStatus(KEEP).getLen() == keepData().length, "wrote " + KEEP + " for the restart check");
         fs.close();
         System.out.println("ALL OK");
+    }
+
+    /** POSIX ACLs: named users, the mask, default ACLs, and who may change them. */
+    static void aclChecks(Configuration conf, FileSystem fs) throws Exception {
+        Path proj = new Path("/java/proj");
+        fs.mkdirs(proj);
+        fs.setPermission(proj, new FsPermission((short) 0750));
+        denied("carol", conf, "carol listing alice's 750 directory", c -> c.listStatus(proj));
+
+        // A named user entry: carol may list it.
+        fs.modifyAclEntries(proj, AclEntry.parseAclSpec("user:carol:r-x", true));
+        AclStatus st = fs.getAclStatus(proj);
+        check(st.getEntries().toString().contains("user:carol:r-x") && st.getEntries().toString().contains("group::r-x"),
+              "getAclStatus lists the named entry and the owning group (" + st.getEntries() + ")");
+        check(fs.getFileStatus(proj).hasAcl(), "the directory's status says it has an ACL (ls shows +)");
+        as("carol", conf, c -> check(c.listStatus(proj).length == 0, "carol lists the directory through her ACL entry"));
+        denied("bob", conf, "bob (not the owner) changing the ACL", b -> b.modifyAclEntries(proj, AclEntry.parseAclSpec("user:bob:rwx", true)));
+
+        // A default ACL: what is created in the directory gets carol rw-.
+        fs.modifyAclEntries(proj, AclEntry.parseAclSpec("default:user:carol:rw-", true));
+        Path data = new Path(proj, "data.txt");
+        try (FSDataOutputStream out = fs.create(data)) { out.write("v1\n".getBytes()); }
+        check(fs.getAclStatus(data).getEntries().toString().contains("user:carol:rw-"), "a new file inherits the default ACL");
+        as("carol", conf, c -> {
+            try (FSDataOutputStream out = c.append(data)) { out.write("carol\n".getBytes()); }
+            try (FSDataInputStream in = c.open(data)) {
+                check(new String(in.readAllBytes()).equals("v1\ncarol\n"), "carol reads and appends through the inherited entry");
+            }
+        });
+
+        // The mask limits named entries.
+        fs.modifyAclEntries(data, AclEntry.parseAclSpec("mask::r--", true));
+        check(fs.getFileStatus(data).getPermission().getGroupAction() == FsAction.READ, "the mask shows as the group bits");
+        denied("carol", conf, "carol writing once the mask is r--", c -> c.append(data).close());
+
+        // Only directories have default ACLs.
+        String why = "";
+        try { fs.modifyAclEntries(data, AclEntry.parseAclSpec("default:user:carol:r--", true)); }
+        catch (Exception e) { why = e.getMessage().split("\n")[0]; }
+        check(why.contains("only directories may have a default ACL"), "a default ACL on a file is refused (" + why + ")");
+
+        // removeAcl: back to the mode alone.
+        fs.removeAcl(proj);
+        check(!fs.getFileStatus(proj).hasAcl() && fs.getFileStatus(proj).getPermission().toShort() == 0750,
+              "removeAcl leaves the 750 mode");
+        denied("carol", conf, "carol listing after removeAcl", c -> c.listStatus(proj));
     }
 
     /** What bob, in alice's group, may and may not do to alice's files. */
@@ -388,6 +438,7 @@ public class HdfsInterop {
             in.readFully(back);
         }
         check(Arrays.equals(back, data), "after restart: content is byte-identical");
+        check(fs.getAclStatus(KEEP).getEntries().toString().contains("user:carol:r--"), "after restart: the file's ACL is kept");
         check(!fs.exists(new Path("/java")), "after restart: deleted tree stays deleted");
 
         Path more = new Path("/keep/after.txt");

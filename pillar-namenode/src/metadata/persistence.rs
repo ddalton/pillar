@@ -162,6 +162,7 @@ impl MetadataStore for SqliteMetadataStore {
                 children: if is_dir != 0 { Some(dashmap::DashMap::new()) } else { None },
                 blocks: if is_dir == 0 { Some(Vec::new()) } else { None },
                 under_construction: None,
+                acl: Vec::new(),
             })
         }).map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {

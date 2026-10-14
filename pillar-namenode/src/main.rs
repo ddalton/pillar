@@ -1,6 +1,7 @@
 mod metadata;
 mod datanode;
 mod grpc;
+mod acl;
 mod ipc;
 mod permission;
 mod proxy_users;
@@ -73,6 +74,10 @@ struct Args {
     /// Enforce permissions (HDFS dfs.permissions.enabled; default true).
     #[clap(long, action = clap::ArgAction::Set)]
     permissions: Option<bool>,
+
+    /// Allow ACL operations (HDFS dfs.namenode.acls.enabled; default true).
+    #[clap(long, action = clap::ArgAction::Set)]
+    acls: Option<bool>,
 
     /// The superuser, who passes every permission check (default hdfs).
     #[clap(long)]
@@ -155,6 +160,9 @@ async fn main() -> Result<()> {
     }
     if let Some(on) = args.permissions {
         config.permissions.enabled = on;
+    }
+    if let Some(on) = args.acls {
+        config.permissions.acls = on;
     }
     if let Some(u) = args.superuser {
         config.permissions.superuser = u;
