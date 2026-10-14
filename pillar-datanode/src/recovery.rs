@@ -14,7 +14,9 @@
 
 use tracing::{info, warn};
 
-use pillar_common::hdfs::block_token::{mode, BlockTokenVerifier};
+use pillar_common::hdfs::block_token::mode;
+
+use crate::storage::block_storage::BlockStorage;
 
 use crate::transport::wire;
 
@@ -39,12 +41,13 @@ pub struct Recovered {
     pub delete: bool,
 }
 
-/// `tokens` mints the block access tokens the other DataNodes ask for.
-pub async fn recover(b: &RecoveringBlock, tokens: &BlockTokenVerifier) -> Result<Recovered, String> {
+/// `storage` mints the block access tokens the other DataNodes ask for,
+/// and secures the connections to them as this DataNode requires.
+pub async fn recover(b: &RecoveringBlock, storage: &BlockStorage) -> Result<Recovered, String> {
     // Every replica of the pipeline that is current.
     let mut replicas = Vec::new();
     for (uuid, addr) in &b.targets {
-        match wire::replica_info(addr, b.block_id, tokens.mint(b.block_id, mode::READ)).await {
+        match wire::replica_info(storage, addr, b.block_id, storage.tokens.mint(b.block_id, mode::READ)).await {
             Ok(Some((finalized, gs, len))) if gs >= b.generation_stamp => replicas.push((uuid, addr, finalized, len)),
             Ok(Some((_, gs, _))) => info!("Block {} on {} is stale (stamp {})", b.block_id, uuid, gs),
             Ok(None) => info!("Block {}: {} has no replica", b.block_id, uuid),
@@ -64,7 +67,7 @@ pub async fn recover(b: &RecoveringBlock, tokens: &BlockTokenVerifier) -> Result
         if !usable {
             continue;
         }
-        match wire::recover_replica(addr, b.block_id, b.new_generation_stamp, length, tokens.mint(b.block_id, mode::WRITE)).await {
+        match wire::recover_replica(storage, addr, b.block_id, b.new_generation_stamp, length, storage.tokens.mint(b.block_id, mode::WRITE)).await {
             Ok(_) => holders.push(uuid.clone()),
             Err(e) => warn!("Block {}: recovering the replica on {} failed: {}", b.block_id, uuid, e),
         }

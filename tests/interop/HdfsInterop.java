@@ -70,6 +70,9 @@ public class HdfsInterop {
         conf.set("fs.defaultFS", args[0]);
         conf.set("dfs.replication", "3");
         conf.setLong("dfs.blocksize", 1L << 20);
+        // Encrypted data transfer: offer AES/CTR (else SASL wrapping only).
+        String suites = System.getenv("DATA_CIPHER_SUITES");
+        if (suites != null && !suites.isEmpty()) conf.set("dfs.encrypt.data.transfer.cipher.suites", suites);
         FileSystem fs = FileSystem.get(conf);
         if (args.length > 1 && args[1].equals("verify")) {
             verifyAfterRestart(fs);

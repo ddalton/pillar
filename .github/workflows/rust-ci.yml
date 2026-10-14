@@ -33,9 +33,17 @@ jobs:
         run: tests/interop/run-java-interop.sh
       - name: Hadoop Java client interop with block access tokens
         run: BLOCK_TOKENS=1 tests/interop/run-java-interop.sh
+      - name: Hadoop Java client interop with encrypted data transfer (AES/CTR)
+        run: ENCRYPT=aes tests/interop/run-java-interop.sh
+      - name: Hadoop Java client interop with encrypted data transfer (SASL RC4)
+        run: ENCRYPT=rc4 tests/interop/run-java-interop.sh
       - name: install MIT krb5 (a throwaway KDC for the Kerberos interop)
         run: sudo apt-get install -y krb5-kdc krb5-admin-server
       - name: Hadoop Java client with Kerberos (tests/interop/run-java-kerberos.sh)
         run: tests/interop/run-java-kerberos.sh
       - name: Hadoop Java client with Kerberos and RPC privacy
         run: RPC_PROTECTION=privacy tests/interop/run-java-kerberos.sh
+      - name: Hadoop Java client with Kerberos and data transfer protection (privacy, integrity)
+        run: |
+          DATA_PROTECTION=privacy tests/interop/run-java-kerberos.sh
+          DATA_PROTECTION=integrity tests/interop/run-java-kerberos.sh

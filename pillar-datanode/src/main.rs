@@ -84,6 +84,17 @@ struct Args {
     #[clap(long)]
     rpc_protection: Option<pillar_common::sasl::Protection>,
 
+    /// Encrypt data transfer (dfs.encrypt.data.transfer): every connection
+    /// to the data port must authenticate and encrypt (AES/CTR when the
+    /// client offers it).
+    #[clap(long)]
+    encrypt_data_transfer: bool,
+
+    /// SASL on the data port with block tokens (dfs.data.transfer.protection):
+    /// authentication, integrity, privacy (comma separated for several).
+    #[clap(long)]
+    data_transfer_protection: Option<pillar_common::sasl::Protection>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     log_level: String,
@@ -141,6 +152,10 @@ async fn main() -> Result<()> {
     }
     if let Some(p) = args.rpc_protection {
         config.rpc_protection = p;
+    }
+    config.encrypt_data_transfer |= args.encrypt_data_transfer;
+    if args.data_transfer_protection.is_some() {
+        config.data_transfer_protection = args.data_transfer_protection;
     }
 
     #[cfg(feature = "rdma")]

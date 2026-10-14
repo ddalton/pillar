@@ -15,6 +15,7 @@ pub mod tcp;
 pub mod selector;
 pub mod wire;
 pub mod hdfs_dtp;
+pub mod sasl;
 
 #[cfg(feature = "rdma")]
 pub mod rdma;

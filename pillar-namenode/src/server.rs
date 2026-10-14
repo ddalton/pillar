@@ -73,6 +73,9 @@ pub struct NameNodeConfig {
     /// Block access tokens (HDFS dfs.block.access.token.enable); always on
     /// with Kerberos.
     pub block_access_tokens: bool,
+    /// Clients encrypt data transfer (HDFS dfs.encrypt.data.transfer;
+    /// needs block access tokens, which it turns on).
+    pub encrypt_data_transfer: bool,
 
     /// A DataNode silent this long is stale, and this long dead (HDFS
     /// defaults: 30 s, 10.5 min).
@@ -108,6 +111,7 @@ impl Default for NameNodeConfig {
             permissions: Default::default(),
             proxy_users: None,
             block_access_tokens: false,
+            encrypt_data_transfer: false,
             datanode_stale_interval: std::time::Duration::from_secs(30),
             datanode_dead_interval: std::time::Duration::from_secs(630),
             lease_soft_limit: crate::metadata::lease_manager::DEFAULT_SOFT_LIMIT,
@@ -184,6 +188,9 @@ impl NameNodeConfig {
                 Ok(g) => config.permissions.groups = g,
                 Err(e) => tracing::warn!("NAMENODE_USER_GROUPS: {}", e),
             }
+        }
+        if let Ok(val) = env::var("NAMENODE_ENCRYPT_DATA_TRANSFER") {
+            config.encrypt_data_transfer = val == "true";
         }
         if let Ok(val) = env::var("NAMENODE_PROXY_USERS") {
             config.proxy_users = Some(val);
@@ -388,7 +395,11 @@ impl NameNode {
         // Block access tokens: minted for clients, keys sent to DataNodes,
         // rolled on schedule.
         let kerberos_configured = self.config.kerberos_keytab.is_some();
-        if self.config.block_access_tokens || kerberos_configured {
+        if self.config.encrypt_data_transfer {
+            client_service_arc.set_encrypt_data_transfer(true);
+            info!("Data transfer is encrypted (clients get data encryption keys)");
+        }
+        if self.config.block_access_tokens || kerberos_configured || self.config.encrypt_data_transfer {
             use pillar_common::hdfs::block_token::{BlockTokenSecretManager, DEFAULT_KEY_UPDATE_INTERVAL, DEFAULT_TOKEN_LIFETIME};
             let manager = Arc::new(BlockTokenSecretManager::new(
                 &self.identity.block_pool_id,

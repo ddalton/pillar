@@ -32,6 +32,8 @@ pub struct ClientNamenodeService {
     recovering: dashmap::DashMap<u64, Recovering>,
     /// Mints block access tokens, when they are enabled.
     block_tokens: std::sync::OnceLock<Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>>,
+    /// Clients must encrypt data transfer (getServerDefaults), once set.
+    encrypt_data_transfer: std::sync::OnceLock<bool>,
     /// Permission enforcement, once configured (off until then).
     permissions: std::sync::OnceLock<crate::permission::Permissions>,
 }
@@ -71,6 +73,7 @@ impl ClientNamenodeService {
             recovering: dashmap::DashMap::new(),
             block_tokens: std::sync::OnceLock::new(),
             permissions: std::sync::OnceLock::new(),
+            encrypt_data_transfer: std::sync::OnceLock::new(),
         }
     }
 
@@ -108,6 +111,20 @@ impl ClientNamenodeService {
     /// Issue block access tokens with `manager`.
     pub fn set_block_tokens(&self, manager: Arc<pillar_common::hdfs::block_token::BlockTokenSecretManager>) {
         let _ = self.block_tokens.set(manager);
+    }
+
+    /// Tell clients to encrypt data transfer (HDFS dfs.encrypt.data.transfer).
+    pub fn set_encrypt_data_transfer(&self, on: bool) {
+        let _ = self.encrypt_data_transfer.set(on);
+    }
+
+    pub fn encrypt_data_transfer(&self) -> bool {
+        self.encrypt_data_transfer.get().copied().unwrap_or(false)
+    }
+
+    /// A data encryption key for a client; `None` without block tokens.
+    pub fn data_encryption_key(&self) -> Option<pillar_proto::hdfs::DataEncryptionKeyProto> {
+        self.block_tokens.get().map(|m| m.data_encryption_key())
     }
 
     /// A block access token for `user` to `block_id` with `modes`; empty

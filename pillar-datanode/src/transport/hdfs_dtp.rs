@@ -64,7 +64,6 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -646,12 +645,12 @@ where
     }
 
     // Set up the rest of the pipeline before answering the upstream.
-    let mut mirror: Option<TcpStream> = None;
+    let mut mirror: Option<super::sasl::DataStream> = None;
     let mut first_bad_link = String::new();
     let mut connect_status = Status::Success;
     if let Some(next) = op.targets.first() {
         let addr = format!("{}:{}", next.id.ip_addr, next.id.xfer_port);
-        match connect_mirror(&addr, &op).await {
+        match connect_mirror(storage, &addr, &op).await {
             Ok((s, Status::Success, _)) => mirror = Some(s),
             Ok((_, status, bad)) => {
                 connect_status = status;
@@ -733,7 +732,7 @@ where
     let (upstream_rx, mut upstream_tx) = tokio::io::split(socket);
     let (mirror_rx, mirror_tx) = match mirror {
         Some(m) => {
-            let (r, w) = m.into_split();
+            let (r, w) = tokio::io::split(m);
             (Some(r), Some(w))
         }
         None => (None, None),
@@ -1026,7 +1025,7 @@ async fn send_replica(storage: &Arc<BlockStorage>, op: &OpTransferBlockProto) ->
     };
     let checksum = replica_checksum(&meta_path);
 
-    let mut s = super::wire::connect(&format!("{}:{}", target.id.ip_addr, target.id.xfer_port)).await?;
+    let mut s = super::wire::connect_secure(&format!("{}:{}", target.id.ip_addr, target.id.xfer_port), storage, b.block_id).await?;
     let mut header = op.header.clone();
     header.base_header.block.generation_stamp = id.generation_stamp;
     header.base_header.block.num_bytes = Some(len);
@@ -1073,8 +1072,8 @@ async fn send_replica(storage: &Arc<BlockStorage>, op: &OpTransferBlockProto) ->
 
 /// Connect to the next DataNode and forward the WRITE_BLOCK op with the
 /// remaining targets; returns its connect-ack status and firstBadLink.
-async fn connect_mirror(addr: &str, op: &OpWriteBlockProto) -> Result<(TcpStream, Status, String)> {
-    let mut s = super::wire::connect(addr).await?;
+async fn connect_mirror(storage: &BlockStorage, addr: &str, op: &OpWriteBlockProto) -> Result<(super::sasl::DataStream, Status, String)> {
+    let mut s = super::wire::connect_secure(addr, storage, op.header.base_header.block.block_id).await?;
     let mut fwd = op.clone();
     fwd.targets = op.targets.iter().skip(1).cloned().collect::<Vec<DatanodeInfoProto>>();
     fwd.target_storage_types = op.target_storage_types.iter().skip(1).copied().collect();
