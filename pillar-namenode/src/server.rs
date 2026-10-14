@@ -5,7 +5,7 @@ use anyhow::Result;
 use tonic::transport::Server;
 use tracing::{info, error};
 
-use crate::metadata::{Namespace, BlockManager, EtcdMetadataStore};
+use crate::metadata::{Namespace, BlockManager, EditLog, EtcdMetadataStore};
 use crate::datanode::{DatanodeManager, BlockPlacementPolicy, ReplicationMonitor};
 use crate::grpc::{ClientNamenodeService, DatanodeProtocolService};
 
@@ -38,6 +38,16 @@ pub struct NameNodeConfig {
 
     /// Stale datanode interval (milliseconds)
     pub stale_datanode_interval: Option<u64>,
+
+    /// Where the namespace is persisted (fsimage + edit log), HDFS
+    /// `dfs.namenode.name.dir`. `None` keeps it in memory only.
+    pub name_dir: Option<PathBuf>,
+
+    /// Checkpoint after this many transactions...
+    pub checkpoint_txns: u64,
+
+    /// ...or this long after the last checkpoint, if anything changed.
+    pub checkpoint_period: std::time::Duration,
 }
 
 impl Default for NameNodeConfig {
@@ -52,6 +62,9 @@ impl Default for NameNodeConfig {
             service_handler_count: None,
             heartbeat_recheck_interval: None,
             stale_datanode_interval: None,
+            name_dir: None,
+            checkpoint_txns: 1_000_000,
+            checkpoint_period: std::time::Duration::from_secs(3600),
         }
     }
 }
@@ -92,6 +105,12 @@ impl NameNodeConfig {
             }
         }
 
+        if let Ok(val) = env::var("NAMENODE_NAME_DIR") {
+            if !val.is_empty() {
+                config.name_dir = Some(PathBuf::from(val));
+            }
+        }
+
         if let Ok(val) = env::var("NAMENODE_HANDLER_COUNT") {
             if let Ok(count) = val.parse() {
                 config.handler_count = Some(count);
@@ -127,6 +146,7 @@ pub struct NameNode {
     block_manager: Arc<BlockManager>,
     datanode_manager: Arc<DatanodeManager>,
     placement_policy: Arc<BlockPlacementPolicy>,
+    edit_log: Arc<EditLog>,
 }
 
 impl NameNode {
@@ -153,9 +173,31 @@ impl NameNode {
             info!("Metadata store initialized with etcd: {:?}", config.etcd_endpoints);
         }
 
-        // Initialize core components
-        let namespace = Arc::new(Namespace::new());
+        // Initialize core components, recovering the namespace if it is
+        // persisted.
         let block_manager = Arc::new(BlockManager::new());
+        let (namespace, edit_log) = match &config.name_dir {
+            Some(dir) => {
+                let (log, recovered) = EditLog::open(dir)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to load namespace from {}: {}", dir.display(), e))?;
+                recovered.restore_blocks(&block_manager).await;
+                info!(
+                    "Namespace loaded from {}: {} inodes, {} blocks, transaction {}",
+                    dir.display(),
+                    recovered.namespace.inode_count(),
+                    block_manager.get_total_blocks(),
+                    recovered.txid
+                );
+                (recovered.namespace, log)
+            }
+            None => {
+                tracing::warn!("No name directory: the namespace is kept in memory and lost on restart");
+                (Namespace::new(), EditLog::in_memory())
+            }
+        };
+        let namespace = Arc::new(namespace);
+        let edit_log = Arc::new(edit_log);
         let datanode_manager = Arc::new(DatanodeManager::new());
         let placement_policy = Arc::new(BlockPlacementPolicy::new(
             datanode_manager.clone(),
@@ -170,6 +212,7 @@ impl NameNode {
             block_manager,
             datanode_manager,
             placement_policy,
+            edit_log,
         })
     }
 
@@ -184,7 +227,18 @@ impl NameNode {
             self.block_manager.clone(),
             self.datanode_manager.clone(),
             self.placement_policy.clone(),
-        );
+        )
+        .with_edit_log(self.edit_log.clone());
+
+        if self.edit_log.is_durable() {
+            tokio::spawn(run_checkpoints(
+                self.edit_log.clone(),
+                self.namespace.clone(),
+                self.block_manager.clone(),
+                self.config.checkpoint_txns,
+                self.config.checkpoint_period,
+            ));
+        }
 
         let datanode_service = DatanodeProtocolService::new(
             self.datanode_manager.clone(),
@@ -284,6 +338,29 @@ impl NameNode {
             total_remaining: self.datanode_manager.get_total_remaining(),
             num_live_datanodes: self.datanode_manager.get_num_live_datanodes(),
             total_blocks: self.block_manager.get_total_blocks(),
+        }
+    }
+}
+
+/// Fold the edit log into a new fsimage after `txns` transactions, or
+/// after `period` if anything changed, so restarts replay a bounded log.
+async fn run_checkpoints(
+    log: Arc<EditLog>,
+    namespace: Arc<Namespace>,
+    blocks: Arc<BlockManager>,
+    txns: u64,
+    period: std::time::Duration,
+) {
+    let check = period.min(std::time::Duration::from_secs(10));
+    let mut last = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(check).await;
+        let since = log.txns_since_checkpoint();
+        if since >= txns.max(1) || (since > 0 && last.elapsed() >= period) {
+            if let Err(e) = log.checkpoint(&namespace, &blocks).await {
+                error!("Checkpoint failed: {}", e);
+            }
+            last = tokio::time::Instant::now();
         }
     }
 }

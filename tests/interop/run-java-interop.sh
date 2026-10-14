@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run the stock Apache Hadoop Java client (DFSClient, the code behind
 # `hadoop fs`) against a local Pillar cluster: a NameNode and three
-# DataNodes on 127.0.0.1, no etcd.
+# DataNodes on 127.0.0.1, no etcd. Midway the NameNode is killed with
+# SIGKILL and restarted on the same name directory; the Java client then
+# reads back what it wrote before the crash.
 #
 #   tests/interop/run-java-interop.sh            # needs a JDK (11+) and curl
 #
@@ -34,10 +36,13 @@ fetch "commons-logging/commons-logging/1.2/commons-logging-1.2.jar"
 (cd "$ROOT" && cargo build -q -p pillar-namenode -p pillar-datanode --bins)
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
 
-"$BIN/pillar-namenode" --rpc-addr 127.0.0.1:19000 --http-addr 127.0.0.1:19870 \
-    --etcd-endpoints none --replication 3 --block-size-mb 1 >"$WORK/nn.log" 2>&1 &
-echo $! >"$WORK/nn.pid"
-for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19000) 2>/dev/null && break; sleep 0.2; done
+start_namenode() { # log file
+    "$BIN/pillar-namenode" --rpc-addr 127.0.0.1:19000 --http-addr 127.0.0.1:19870 \
+        --etcd-endpoints none --replication 3 --block-size-mb 1 --name-dir "$WORK/name" >"$1" 2>&1 &
+    echo $! >"$WORK/nn.pid"
+    for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/19000) 2>/dev/null && break; sleep 0.2; done
+}
+start_namenode "$WORK/nn.log"
 for i in 0 1 2; do
     mkdir -p "$WORK/dn$i"
     "$BIN/pillar-datanode" --namenode 127.0.0.1:19000 --uuid "dn$i" --hostname 127.0.0.1 \
@@ -49,11 +54,29 @@ for _ in $(seq 50); do [ "$(grep -c 'Registered datanode' "$WORK/nn.log")" -ge 3
 sleep 1 # first heartbeats carry capacity
 
 cd "$HERE"
-if HADOOP_USER_NAME=hdfs java -cp "$CACHE/*" HdfsInterop.java hdfs://127.0.0.1:19000 2>&1 \
-        | grep -vE '^(SLF4J|WARNING)|^$'; then
-    echo "Java interop passed (Hadoop $HADOOP_VERSION)"
-else
-    echo "Java interop FAILED; logs:" >&2
+java_client() { # [mode]
+    HADOOP_USER_NAME=hdfs java -cp "$CACHE/*" HdfsInterop.java hdfs://127.0.0.1:19000 "$@" 2>&1 \
+        | grep -vE '^(SLF4J|WARNING)|^$'
+}
+fail() {
+    echo "Java interop FAILED ($1); logs:" >&2
     tail -n 30 "$WORK"/*.log >&2
     exit 1
-fi
+}
+
+java_client || fail "before restart"
+
+# Crash the NameNode and bring it back on the same name directory. The
+# DataNodes keep running; their next heartbeat is answered with a register
+# command, and they re-register and send full block reports.
+kill -9 "$(cat "$WORK/nn.pid")"
+wait "$(cat "$WORK/nn.pid")" 2>/dev/null || true
+start_namenode "$WORK/nn-restarted.log"
+for _ in $(seq 100); do
+    [ "$(grep -c 'Received block report' "$WORK/nn-restarted.log")" -ge 3 ] && break
+    sleep 0.2
+done
+grep -q 'Namespace loaded' "$WORK/nn-restarted.log" || fail "namespace not loaded"
+
+java_client verify || fail "after restart"
+echo "Java interop passed (Hadoop $HADOOP_VERSION), including a NameNode crash and restart"

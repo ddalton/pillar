@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
@@ -48,7 +49,7 @@ impl FsPermission {
 }
 
 /// Block information for a file
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockInfo {
     pub block_id: u64,
     pub generation_stamp: u64,
@@ -243,9 +244,11 @@ impl Namespace {
     }
 
     /// Atomically link a new inode at `path`, failing if the name exists.
+    /// `id` is the inode id to use (edit-log replay); `None` allocates one.
     async fn insert_child(
         &self,
         path: &str,
+        id: Option<u64>,
         make_inode: impl FnOnce(u64, String) -> INode,
     ) -> Result<u64> {
         let (parent_components, name) = Self::split_parent(path)?;
@@ -271,7 +274,16 @@ impl Namespace {
                 Err(NamespaceError::PathAlreadyExists(path.to_string()))
             }
             dashmap::mapref::entry::Entry::Vacant(slot) => {
-                let inode_id = self.allocate_inode_id();
+                let inode_id = match id {
+                    Some(id) => {
+                        if self.inodes.contains_key(&id) {
+                            return Err(NamespaceError::InvalidPath(format!("inode {} already exists", id)));
+                        }
+                        self.next_inode_id.fetch_max(id + 1, Ordering::SeqCst);
+                        id
+                    }
+                    None => self.allocate_inode_id(),
+                };
                 let inode = make_inode(inode_id, name.to_string());
                 self.inodes.insert(inode_id, Arc::new(RwLock::new(inode)));
                 slot.insert(inode_id);
@@ -283,7 +295,7 @@ impl Namespace {
 
     /// Create a directory
     pub async fn mkdir(&self, path: &str, owner: String, group: String, permissions: FsPermission) -> Result<u64> {
-        self.insert_child(path, |inode_id, name| {
+        self.insert_child(path, None, |inode_id, name| {
             let mut inode = INode::new_dir(inode_id, name, owner, group);
             inode.permissions = permissions;
             inode
@@ -301,12 +313,17 @@ impl Namespace {
         replication: u16,
         block_size: u64,
     ) -> Result<u64> {
-        self.insert_child(path, |inode_id, name| {
+        self.insert_child(path, None, |inode_id, name| {
             let mut inode = INode::new_file(inode_id, name, owner, group, replication, block_size);
             inode.permissions = permissions;
             inode
         })
         .await
+    }
+
+    /// Link `inode` at `path`, keeping its id (edit-log replay).
+    pub async fn add_inode_at(&self, path: &str, inode: INode) -> Result<u64> {
+        self.insert_child(path, Some(inode.id), |_, name| INode { name, ..inode }).await
     }
 
     /// Delete a file or directory
@@ -513,6 +530,61 @@ impl Namespace {
     /// Total number of inodes, including the root
     pub fn inode_count(&self) -> usize {
         self.inodes.len()
+    }
+
+    /// The id the next new inode will get.
+    pub fn next_inode_id(&self) -> u64 {
+        self.next_inode_id.load(Ordering::SeqCst)
+    }
+
+    /// Every inode reachable from the root, parents before children (an
+    /// fsimage). Consistent only if no mutation runs meanwhile, i.e. under
+    /// the edit log's writer lock.
+    pub async fn records(&self) -> Vec<crate::metadata::edit_log::InodeRecord> {
+        let mut out = Vec::with_capacity(self.inodes.len());
+        let mut queue = VecDeque::from([(self.root_id, 0u64)]);
+        while let Some((id, parent)) = queue.pop_front() {
+            let Some(inode) = self.inode_arc(id) else { continue };
+            let inode = inode.read().await;
+            if let Some(children) = &inode.children {
+                queue.extend(children.iter().map(|e| (*e.value(), id)));
+            }
+            out.push(crate::metadata::edit_log::InodeRecord::from_inode(&inode, parent));
+        }
+        out
+    }
+
+    /// Rebuild a namespace from [`Namespace::records`] output.
+    pub fn from_records(
+        records: Vec<crate::metadata::edit_log::InodeRecord>,
+        next_inode_id: u64,
+    ) -> std::result::Result<Self, String> {
+        let mut records = records.into_iter();
+        let root = records.next().ok_or("image has no root inode")?;
+        if root.parent != 0 || !root.is_dir {
+            return Err(format!("image root is not a directory: {:?}", root.name));
+        }
+        let root_id = root.id;
+        let mut max_id = root_id;
+        let mut inodes: HashMap<u64, INode> = HashMap::new();
+        inodes.insert(root_id, root.into_inode());
+        for r in records {
+            let (id, parent, name) = (r.id, r.parent, r.name.clone());
+            let parent = inodes.get(&parent).ok_or_else(|| format!("inode {} has unknown parent {}", id, parent))?;
+            let children = parent.children.as_ref().ok_or_else(|| format!("parent of inode {} is a file", id))?;
+            if children.insert(name, id).is_some() {
+                return Err(format!("duplicate name under inode {}", r.parent));
+            }
+            if inodes.insert(id, r.into_inode()).is_some() {
+                return Err(format!("duplicate inode {}", id));
+            }
+            max_id = max_id.max(id);
+        }
+        Ok(Self {
+            inodes: inodes.into_iter().map(|(id, inode)| (id, Arc::new(RwLock::new(inode)))).collect(),
+            root_id,
+            next_inode_id: AtomicU64::new(next_inode_id.max(max_id + 1)),
+        })
     }
 }
 

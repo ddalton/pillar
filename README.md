@@ -47,7 +47,7 @@ Pillar implements the official Apache Hadoop HDFS protocols, providing 100% wire
 │ - Metadata management         - Block storage              │
 │ - Block allocation            - High-perf I/O              │
 │ - Namespace tree              - Persistent volumes         │
-│ - Persists to etcd            - Optional RDMA support      │
+│ - fsimage + edit log on a PV  - Optional RDMA support      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,22 +90,16 @@ After building, binaries will be in `target/release/`:
 
 ### Standalone Mode (Development)
 
-Note: For development, you need a running etcd instance:
+The NameNode persists its namespace in `--name-dir` (see
+[Namespace persistence](#namespace-persistence)); etcd is not needed.
 
 ```bash
-# Start etcd (in one terminal)
-docker run -d --name etcd \
-  -p 2379:2379 \
-  -e ALLOW_NONE_AUTHENTICATION=yes \
-  quay.io/coreos/etcd:v3.5.11 \
-  etcd --listen-client-urls http://0.0.0.0:2379 \
-  --advertise-client-urls http://localhost:2379
-
-# Start NameNode (in another terminal)
+# Start NameNode (in one terminal)
 ./target/release/pillar-namenode \
   --rpc-addr 0.0.0.0:9000 \
   --http-addr 0.0.0.0:9870 \
-  --etcd-endpoints localhost:2379 \
+  --etcd-endpoints none \
+  --name-dir /tmp/pillar/name \
   --replication 3 \
   --block-size-mb 128
 
@@ -302,18 +296,49 @@ DataNodes):
   Java client (`DFSClient`, the code behind `hadoop fs`): `mkdirs -p`,
   multi-block write through a 3-DataNode pipeline, sequential and
   positional reads, `copyFromLocalFile` (`-put`) and read back (`-cat`),
-  `listStatus`, rename, `FileAlreadyExistsException`, recursive delete.
+  `listStatus`, rename, create with overwrite, `FileAlreadyExistsException`,
+  recursive delete; then the NameNode is killed with SIGKILL, restarted on
+  the same name directory, and the client reads back what it wrote.
 - `pillar-datanode/tests/hdfs_client.rs` — the independent
   [hdfs-native](https://crates.io/crates/hdfs-native) client: the same
   operations, plus a DataNode crash with re-replication and replica
   cleanup after delete.
+- `pillar-datanode/tests/namenode_restart.rs` — two NameNode crashes and
+  restarts under hdfs-native: files, renames and deletes survive, DataNodes
+  re-register and report their replicas, new writes get fresh block ids.
 
 Not supported yet: Kerberos / SASL / block tokens (SIMPLE auth only),
 append, hflush/hsync recovery, pipeline recovery after a DataNode fails
 mid-write, block checksum (`-checksum`), short-circuit reads, erasure
-coding, and namespace persistence (the NameNode keeps metadata in memory;
-etcd is not yet consulted). The KUTTL suites in `tests/system` have not
-been re-run against these changes.
+coding, and NameNode HA (etcd is not consulted). The KUTTL suites in
+`tests/system` have not been re-run against these changes.
+
+## Namespace persistence
+
+The NameNode keeps the namespace in memory and makes every change durable
+before answering, the way HDFS does (`dfs.namenode.name.dir`):
+
+- Each change is appended to an **edit log** in `--name-dir` and fsynced
+  before the client gets its reply. Concurrent changes share one fsync
+  (group commit).
+- The log is periodically folded into an **fsimage** (every 1,000,000
+  transactions or hourly, if anything changed), so a restart replays only
+  recent edits. The two newest images are kept.
+- On startup the NameNode loads the newest image and replays the edits
+  after it. A torn last record (a crash mid-write; never acknowledged) is
+  dropped; corruption anywhere else stops startup.
+- Block **locations** are not persisted: DataNodes are told to re-register
+  when they heartbeat a NameNode that does not know them, and send a full
+  block report.
+- A lock file stops two NameNodes from using the same directory.
+
+Without `--name-dir` the namespace is in memory only and lost on restart
+(the NameNode logs a warning). The Helm chart mounts a PersistentVolume
+there by default (`namenode.persistence`).
+
+Measured on an Apple-silicon laptop SSD, file creates per second: 250 for a
+single client (each waits for its own fsync), about 12,600 with 64
+concurrent clients, and 300,000–400,000 without a name directory.
 
 ## Performance
 

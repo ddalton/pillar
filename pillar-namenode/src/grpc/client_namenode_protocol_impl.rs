@@ -159,14 +159,18 @@ impl client_namenode_protocol_server::ClientNamenodeProtocol for ClientNamenodeP
 
         info!("create: {} (replication={}, blocksize={})", path, replication, block_size);
 
+        // CreateFlagProto: CREATE = 0x01, OVERWRITE = 0x02, APPEND = 0x04.
+        let overwrite = req.create_flag & 0x02 != 0;
         match self.service
-            .handle_create(
+            .handle_create_with(
                 &path,
                 "hdfs".to_string(),
                 "supergroup".to_string(),
                 masked.perm as u16,
                 replication,
                 block_size,
+                req.create_parent,
+                overwrite,
             )
             .await
         {

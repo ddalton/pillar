@@ -2,7 +2,8 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
-use crate::metadata::{Namespace, BlockManager};
+use crate::metadata::{Namespace, BlockManager, EditLog, EditOp, EditTxn};
+use crate::metadata::edit_log::InodeRecord;
 use crate::metadata::namespace::{FsPermission, INode};
 use crate::metadata::block_manager::{BlockId, DatanodeId};
 use crate::datanode::{DatanodeManager, BlockPlacementPolicy};
@@ -13,6 +14,8 @@ pub struct ClientNamenodeService {
     block_manager: Arc<BlockManager>,
     datanode_manager: Arc<DatanodeManager>,
     placement_policy: Arc<BlockPlacementPolicy>,
+    /// Every namespace change is a transaction in this log.
+    edits: Arc<EditLog>,
 }
 
 impl ClientNamenodeService {
@@ -27,7 +30,25 @@ impl ClientNamenodeService {
             block_manager,
             datanode_manager,
             placement_policy,
+            edits: Arc::new(EditLog::in_memory()),
         }
+    }
+
+    /// Log namespace changes to `edits` (default: an in-memory log).
+    pub fn with_edit_log(mut self, edits: Arc<EditLog>) -> Self {
+        self.edits = edits;
+        self
+    }
+
+    async fn begin(&self) -> Result<EditTxn<'_>, Status> {
+        self.edits.begin().await.map_err(edit_status)
+    }
+
+    /// The record logged for a new inode.
+    async fn inode_record(&self, id: u64) -> InodeRecord {
+        let inode = self.namespace.get_inode(id).expect("inode just created");
+        let inode = inode.read().await;
+        InodeRecord::from_inode(&inode, 0)
     }
 
     /// Get file/directory info
@@ -95,10 +116,13 @@ impl ClientNamenodeService {
         group: String,
         permissions: u16,
     ) -> Result<(), Status> {
-        self.namespace
+        let mut tx = self.begin().await?;
+        let id = self.namespace
             .mkdir(path, owner, group, FsPermission::new(permissions))
             .await
             .map_err(namespace_status)?;
+        tx.log(EditOp::AddInode { path: path.to_string(), inode: self.inode_record(id).await });
+        tx.commit().await.map_err(edit_status)?;
 
         info!("Created directory: {}", path);
 
@@ -164,7 +188,42 @@ impl ClientNamenodeService {
         replication: u16,
         block_size: u64,
     ) -> Result<(), Status> {
-        self.namespace
+        self.handle_create_with(path, owner, group, permissions, replication, block_size, false, false).await
+    }
+
+    /// HDFS `create`: `create_parent` makes missing ancestors (as
+    /// `mkdirs -p`); `overwrite` (CreateFlag.OVERWRITE) replaces an existing
+    /// file, deleting it and creating the new one in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_create_with(
+        &self,
+        path: &str,
+        owner: String,
+        group: String,
+        permissions: u16,
+        replication: u16,
+        block_size: u64,
+        create_parent: bool,
+        overwrite: bool,
+    ) -> Result<(), Status> {
+        if create_parent {
+            if let Some((parent, _)) = path.trim_end_matches('/').rsplit_once('/') {
+                if !parent.is_empty() {
+                    self.handle_mkdirs(parent, owner.clone(), group.clone(), 0o755, true).await?;
+                }
+            }
+        }
+        let mut tx = self.begin().await?;
+        if let Ok(existing) = self.namespace.lookup(path).await {
+            if existing.read().await.is_dir {
+                return Err(Status::already_exists(format!("{} is a directory", path)));
+            }
+            if !overwrite {
+                return Err(Status::already_exists(format!("{} already exists", path)));
+            }
+            self.delete_in(&mut tx, path, false).await?;
+        }
+        let id = self.namespace
             .create_file(
                 path,
                 owner,
@@ -174,7 +233,9 @@ impl ClientNamenodeService {
                 block_size,
             )
             .await
-            .map_err(|e| Status::already_exists(format!("Failed to create file: {}", e)))?;
+            .map_err(namespace_status)?;
+        tx.log(EditOp::AddInode { path: path.to_string(), inode: self.inode_record(id).await });
+        tx.commit().await.map_err(edit_status)?;
 
         info!("Created file: {}", path);
 
@@ -183,13 +244,30 @@ impl ClientNamenodeService {
 
     /// Delete a file or directory
     pub async fn handle_delete(&self, path: &str, recursive: bool) -> Result<bool, Status> {
+        let mut tx = self.begin().await?;
+        self.delete_in(&mut tx, path, recursive).await?;
+        tx.commit().await.map_err(edit_status)?;
+        Ok(true)
+    }
+
+    /// Delete `path` and release its blocks, logging it in `tx`.
+    async fn delete_in(&self, tx: &mut EditTxn<'_>, path: &str, recursive: bool) -> Result<(), Status> {
         let removed = self.namespace
             .delete_and_collect(path, recursive)
             .await
             .map_err(|e| Status::internal(format!("Failed to delete: {}", e)))?;
 
-        // Release block-manager state for every removed file (including
-        // descendants of a recursively deleted directory).
+        self.release_blocks(&removed);
+
+        tx.log(EditOp::Delete { path: path.to_string() });
+        info!("Deleted: {} ({} inodes)", path, removed.len());
+
+        Ok(())
+    }
+
+    /// Release block-manager state for every removed file (including
+    /// descendants of a recursively deleted directory).
+    fn release_blocks(&self, removed: &[crate::metadata::namespace::RemovedInode]) {
         for inode in removed.iter().filter(|inode| !inode.is_dir) {
             for block in &inode.blocks {
                 self.block_manager
@@ -197,18 +275,17 @@ impl ClientNamenodeService {
             }
             self.block_manager.delete_file_blocks(inode.id);
         }
-
-        info!("Deleted: {} ({} inodes)", path, removed.len());
-
-        Ok(true)
     }
 
     /// Rename a file or directory (atomic operation)
     pub async fn handle_rename(&self, src: &str, dst: &str) -> Result<bool, Status> {
+        let mut tx = self.begin().await?;
         self.namespace
             .rename(src, dst)
             .await
             .map_err(namespace_status)?;
+        tx.log(EditOp::Rename { src: src.to_string(), dst: dst.to_string(), overwrite: false });
+        tx.commit().await.map_err(edit_status)?;
 
         info!("Renamed: {} -> {}", src, dst);
 
@@ -349,6 +426,7 @@ impl ClientNamenodeService {
             .choose_targets(Some(replication))
             .map_err(|e| Status::resource_exhausted(format!("Failed to choose targets: {}", e)))?;
 
+        let mut tx = self.begin().await?;
         let mut inode_guard = inode.write().await;
 
         if inode_guard.is_dir {
@@ -362,11 +440,15 @@ impl ClientNamenodeService {
             .map_err(|e| Status::internal(format!("Failed to allocate block: {}", e)))?;
 
         // Add block to inode
-        inode_guard.add_block(crate::metadata::namespace::BlockInfo {
+        let block = crate::metadata::namespace::BlockInfo {
             block_id: block_id.block_id,
             generation_stamp: block_id.generation_stamp,
             num_bytes: 0,
-        });
+        };
+        inode_guard.add_block(block.clone());
+        tx.log(EditOp::AddBlock { inode: inode_guard.id, block });
+        drop(inode_guard);
+        tx.commit().await.map_err(edit_status)?;
 
         info!("Allocated block {} for file: {}", block_id.block_id, path);
 
@@ -383,16 +465,23 @@ impl ClientNamenodeService {
     /// unless `overwrite` is set, in which case a destination file (or empty
     /// directory) is replaced.
     pub async fn handle_rename2(&self, src: &str, dst: &str, overwrite: bool) -> Result<(), Status> {
-        if let Ok(existing) = self.namespace.lookup(dst).await {
+        let mut tx = self.begin().await?;
+        let replaced = self.namespace.lookup(dst).await.is_ok();
+        if replaced {
             if !overwrite {
                 return Err(Status::already_exists(format!("rename destination {} already exists", dst)));
             }
             // Non-recursive: a non-empty destination directory is refused,
-            // as in HDFS.
-            let _ = existing;
-            self.handle_delete(dst, false).await?;
+            // as in HDFS. Logged as one op below, so a crash can't leave
+            // the destination deleted but the source not moved.
+            let removed = self.namespace.delete_and_collect(dst, false).await.map_err(namespace_status)?;
+            self.release_blocks(&removed);
         }
-        self.handle_rename(src, dst).await.map(|_| ())
+        self.namespace.rename(src, dst).await.map_err(namespace_status)?;
+        tx.log(EditOp::Rename { src: src.to_string(), dst: dst.to_string(), overwrite: replaced });
+        tx.commit().await.map_err(edit_status)?;
+        info!("Renamed: {} -> {}{}", src, dst, if replaced { " (replaced)" } else { "" });
+        Ok(())
     }
 
     /// Record the final length of a block the client finished writing
@@ -400,17 +489,25 @@ impl ClientNamenodeService {
     /// the sum of its blocks.
     pub async fn handle_commit_block(&self, path: &str, block_id: u64, num_bytes: u64) -> Result<(), Status> {
         let inode = self.namespace.lookup(path).await.map_err(namespace_status)?;
+        let mut tx = self.begin().await?;
         let mut guard = inode.write().await;
+        let inode_id = guard.id;
         let block = guard
             .blocks
             .as_mut()
             .and_then(|bs| bs.iter_mut().find(|b| b.block_id == block_id))
             .ok_or_else(|| Status::invalid_argument(format!("block {} is not part of {}", block_id, path)))?;
+        // complete() is retried until a replica is reported; don't log
+        // (and fsync) the same length each time.
+        if block.num_bytes == num_bytes {
+            return Ok(());
+        }
         block.num_bytes = num_bytes;
         let id = crate::metadata::block_manager::BlockId::new(block.block_id, block.generation_stamp);
         drop(guard);
         let _ = self.block_manager.update_block_size(&id, num_bytes);
-        Ok(())
+        tx.log(EditOp::CommitBlock { inode: inode_id, block_id, num_bytes });
+        tx.commit().await.map_err(edit_status)
     }
 
     /// Complete a file (finalize writes)
@@ -498,7 +595,9 @@ impl ClientNamenodeService {
             .await
             .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
 
+        let mut tx = self.begin().await?;
         let mut inode_guard = inode.write().await;
+        let inode_id = inode_guard.id;
 
         if let Some(blocks) = &mut inode_guard.blocks {
             let mut abandoned = Vec::new();
@@ -513,10 +612,14 @@ impl ClientNamenodeService {
             for block in &abandoned {
                 self.block_manager.remove_block(block);
             }
+            if !abandoned.is_empty() {
+                tx.log(EditOp::SetBlocks { inode: inode_id, blocks: blocks.clone() });
+            }
             info!("Abandoned block {} for file: {}", block_id, path);
         }
+        drop(inode_guard);
 
-        Ok(())
+        tx.commit().await.map_err(edit_status)
     }
 
     /// Get DataNode report (cluster health)
@@ -614,6 +717,8 @@ impl ClientNamenodeService {
             block_id, old_generation_stamp
         );
 
+        let mut tx = self.begin().await?;
+
         // Allocate new generation stamp
         let new_generation_stamp = self.block_manager
             .allocate_generation_stamp()
@@ -635,6 +740,20 @@ impl ClientNamenodeService {
 
         // Update block manager with new generation stamp
         self.block_manager.update_generation_stamp(old_block_id, new_block_id);
+
+        // ...and the file's block list, which reads and the image use.
+        if let Some(inode) = self.namespace.get_inode(block_info.inode_id) {
+            let mut inode = inode.write().await;
+            if let Some(b) = inode.blocks.iter_mut().flatten().find(|b| b.block_id == block_id) {
+                b.generation_stamp = new_generation_stamp;
+            }
+        }
+        tx.log(EditOp::UpdateGenerationStamp {
+            inode: block_info.inode_id,
+            block_id,
+            generation_stamp: new_generation_stamp,
+        });
+        tx.commit().await.map_err(edit_status)?;
 
         info!(
             "Updated block {} generation stamp: {} -> {}",
@@ -705,6 +824,7 @@ impl ClientNamenodeService {
             .await
             .map_err(|e| Status::not_found(format!("File not found: {}", e)))?;
 
+        let mut tx = self.begin().await?;
         let mut inode_guard = inode.write().await;
 
         if inode_guard.is_dir {
@@ -767,7 +887,11 @@ impl ClientNamenodeService {
                 "Truncated {} from {} to {} bytes ({} blocks remaining, {} removed)",
                 path, current_length, new_length, blocks.len(), dropped.len()
             );
+            let blocks = blocks.clone();
+            tx.log(EditOp::SetBlocks { inode: inode_guard.id, blocks });
         }
+        drop(inode_guard);
+        tx.commit().await.map_err(edit_status)?;
 
         Ok(true)
     }
@@ -784,6 +908,8 @@ impl ClientNamenodeService {
         if sources.is_empty() {
             return Err(Status::invalid_argument("Sources array cannot be empty"));
         }
+
+        let mut tx = self.begin().await?;
 
         // Look up target file
         let target_inode = self.namespace
@@ -871,6 +997,9 @@ impl ClientNamenodeService {
                 )))?;
         }
 
+        tx.log(EditOp::Concat { target: target.to_string(), sources: sources.to_vec() });
+        tx.commit().await.map_err(edit_status)?;
+
         info!("Successfully concatenated {} files into {}", sources.len(), target);
 
         Ok(())
@@ -949,6 +1078,11 @@ pub struct LocatedBlock {
     pub num_bytes: u64,
     pub offset: u64,
     pub locations: Vec<DatanodeId>,
+}
+
+/// The edit log could not make a change durable.
+fn edit_status(e: std::io::Error) -> Status {
+    Status::unavailable(format!("edit log: {}", e))
 }
 
 /// Map a namespace error onto the status (and so the Hadoop exception)

@@ -378,6 +378,35 @@ impl BlockManager {
         self.default_block_size
     }
 
+    /// The id the next allocated block will get.
+    pub fn next_block_id(&self) -> u64 {
+        self.next_block_id.load(Ordering::SeqCst)
+    }
+
+    /// The next generation stamp to be handed out.
+    pub fn next_generation_stamp(&self) -> u64 {
+        self.next_generation_stamp.load(Ordering::SeqCst)
+    }
+
+    /// Never hand out ids below these (after loading persisted state).
+    pub fn restore_counters(&self, next_block_id: u64, next_generation_stamp: u64) {
+        self.next_block_id.fetch_max(next_block_id, Ordering::SeqCst);
+        self.next_generation_stamp.fetch_max(next_generation_stamp, Ordering::SeqCst);
+    }
+
+    /// Register a recovered file's blocks (their locations come later, from
+    /// block reports).
+    pub fn restore_file(&self, inode_id: u64, blocks: &[crate::metadata::namespace::BlockInfo]) {
+        if blocks.is_empty() {
+            return;
+        }
+        let ids: Vec<BlockId> = blocks.iter().map(|b| BlockId::new(b.block_id, b.generation_stamp)).collect();
+        for (b, id) in blocks.iter().zip(&ids) {
+            self.blocks.insert(*id, BlockInfo { block_id: *id, num_bytes: b.num_bytes, inode_id });
+        }
+        self.file_blocks.insert(inode_id, ids);
+    }
+
     /// Allocate a new generation stamp for pipeline updates
     pub async fn allocate_generation_stamp(&self) -> u64 {
         self.next_generation_stamp.fetch_add(1, Ordering::SeqCst)

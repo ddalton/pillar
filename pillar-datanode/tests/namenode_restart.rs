@@ -1,0 +1,197 @@
+//! A NameNode crash loses nothing that was acknowledged: the namespace is
+//! recovered from its name directory (fsimage + edit log), DataNodes are
+//! told to re-register and report their replicas, and an independent HDFS
+//! client (`hdfs-native`) reads every file back.
+//!
+//! The NameNode runs on its own tokio runtime; shutting that runtime down
+//! drops all of its tasks, listener and name-directory lock at once, as a
+//! killed process would, and edits not yet synced are lost with it.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use hdfs_native::{Client, ClientBuilder, WriteOptions};
+use pillar_datanode::grpc::namenode_client::{DatanodeInfo, NamenodeClient};
+use pillar_datanode::replication::ReplicationCoordinator;
+use pillar_datanode::storage::{BlockStorage, VolumeManager};
+use pillar_datanode::transport::tcp::TcpTransport;
+use pillar_datanode::transport::DataTransport;
+use pillar_namenode::datanode::DatanodeManager;
+use pillar_namenode::metadata::BlockManager;
+use pillar_namenode::{NameNode, NameNodeConfig};
+use tempfile::TempDir;
+
+const MB: usize = 1024 * 1024;
+
+fn free_addr() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| ((i as u64 * 2654435761) >> 7) as u8 ^ seed).collect()
+}
+
+/// A NameNode on its own runtime, plus handles to inspect it.
+struct RunningNameNode {
+    rt: tokio::runtime::Runtime,
+    blocks: Arc<BlockManager>,
+    datanodes: Arc<DatanodeManager>,
+}
+
+async fn start_namenode(addr: SocketAddr, name_dir: &Path) -> RunningNameNode {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let config = NameNodeConfig {
+        rpc_addr: addr,
+        http_addr: free_addr(),
+        etcd_endpoints: vec!["none".into()],
+        name_dir: Some(PathBuf::from(name_dir)),
+        ..Default::default()
+    };
+    let nn = Arc::new(rt.spawn(NameNode::new(config)).await.unwrap().unwrap());
+    let (blocks, datanodes) = (nn.block_manager(), nn.datanode_manager());
+    // Only the runtime holds the NameNode, so shutting it down frees all.
+    rt.spawn(async move {
+        nn.start().await.unwrap();
+    });
+    RunningNameNode { rt, blocks, datanodes }
+}
+
+impl RunningNameNode {
+    async fn crash(self) {
+        let rt = self.rt;
+        tokio::task::spawn_blocking(move || rt.shutdown_timeout(Duration::from_secs(5))).await.unwrap();
+    }
+}
+
+/// Three DataNodes heartbeating every 100 ms. They outlive NameNode restarts.
+async fn start_datanodes(nn_addr: SocketAddr, n: usize) -> Vec<(TempDir, Arc<BlockStorage>)> {
+    let mut dns = Vec::new();
+    for i in 0..n {
+        let dir = TempDir::new().unwrap();
+        let volumes = Arc::new(VolumeManager::new(dir.path(), "BP-test".to_string()).unwrap());
+        let storage = Arc::new(BlockStorage::new(volumes.get_finalized_dir(), volumes.get_tmp_dir()).unwrap());
+        let data_addr = free_addr();
+        let tcp = Arc::new(TcpTransport::new(storage.clone(), data_addr));
+        tokio::spawn({
+            let tcp = tcp.clone();
+            async move {
+                let _ = tcp.start_server().await;
+            }
+        });
+        let info = DatanodeInfo {
+            uuid: format!("dn{i}"),
+            hostname: "127.0.0.1".into(),
+            rpc_port: 0,
+            data_port: data_addr.port(),
+            http_port: 0,
+            supported_transports: vec!["tcp".into()],
+            rdma_port: 0,
+        };
+        let mut client = NamenodeClient::new(nn_addr.to_string(), info, volumes, storage.clone());
+        client.set_replication_coordinator(Arc::new(ReplicationCoordinator::new(
+            storage.clone(),
+            vec![tcp as Arc<dyn DataTransport>],
+        )));
+        client.set_heartbeat_interval(Duration::from_millis(100));
+        let client = Arc::new(client);
+        let mut registered = false;
+        for _ in 0..100 {
+            if client.register().await.is_ok() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(registered, "dn{i} could not register");
+        tokio::spawn(client.start_heartbeat_loop());
+        dns.push((dir, storage));
+    }
+    dns
+}
+
+fn client(addr: SocketAddr) -> Client {
+    ClientBuilder::new().with_url(format!("hdfs://{addr}")).build().unwrap()
+}
+
+async fn write(fs: &Client, path: &str, data: &[u8]) {
+    let opts = WriteOptions { block_size: Some(MB as u64), replication: Some(3), ..Default::default() };
+    let mut w = fs.create(path, opts).await.unwrap();
+    w.write_bytes(Bytes::copy_from_slice(data)).await.unwrap();
+    w.close().await.unwrap();
+}
+
+async fn read(fs: &Client, path: &str) -> Vec<u8> {
+    let r = fs.read(path).await.unwrap();
+    r.read_range(0, r.file_length()).await.unwrap().to_vec()
+}
+
+async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..400 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_survive_a_namenode_crash_and_restart() {
+    let name_dir = TempDir::new().unwrap();
+    let nn_addr = free_addr();
+    let nn = start_namenode(nn_addr, name_dir.path()).await;
+    let _dns = start_datanodes(nn_addr, 3).await;
+    eventually("three live DataNodes", || nn.datanodes.get_live_datanodes().len() == 3).await;
+
+    let big = pattern(5 * MB / 2, 0x5A);
+    let small = b"written before the crash".to_vec();
+    let fs = client(nn_addr);
+    fs.mkdirs("/data/nested", 0o755, true).await.unwrap();
+    write(&fs, "/data/big.bin", &big).await;
+    write(&fs, "/data/tmp.txt", &small).await;
+    fs.rename("/data/tmp.txt", "/data/nested/small.txt", false).await.unwrap();
+    write(&fs, "/data/doomed", b"deleted before the crash").await;
+    fs.delete("/data/doomed", false).await.unwrap();
+    let blocks_before = nn.blocks.get_total_blocks();
+    assert_eq!(blocks_before, 4);
+    drop(fs);
+
+    nn.crash().await;
+    let nn = start_namenode(nn_addr, name_dir.path()).await;
+
+    // The namespace is back before any DataNode reports...
+    assert_eq!(nn.blocks.get_total_blocks(), blocks_before);
+    // ...and the DataNodes re-register and report every replica.
+    eventually("DataNodes re-register", || nn.datanodes.get_live_datanodes().len() == 3).await;
+    eventually("all replicas reported", || {
+        nn.blocks.blocks_snapshot().iter().all(|(_, _, _, holders)| holders.len() == 3)
+    })
+    .await;
+
+    let fs = client(nn_addr);
+    assert_eq!(read(&fs, "/data/big.bin").await, big);
+    assert_eq!(read(&fs, "/data/nested/small.txt").await, small);
+    assert!(fs.get_file_info("/data/tmp.txt").await.is_err());
+    assert!(fs.get_file_info("/data/doomed").await.is_err());
+    let names: Vec<String> = fs.list_status("/data", false).await.unwrap().into_iter().map(|s| s.path).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+
+    // New writes get fresh block ids and work as before.
+    let after = pattern(MB + 17, 0x77);
+    write(&fs, "/data/after.bin", &after).await;
+    assert_eq!(read(&fs, "/data/after.bin").await, after);
+    assert_eq!(nn.blocks.get_total_blocks(), blocks_before + 2);
+
+    // A second crash, right after those writes: still all there.
+    drop(fs);
+    nn.crash().await;
+    let nn = start_namenode(nn_addr, name_dir.path()).await;
+    eventually("DataNodes re-register again", || nn.datanodes.get_live_datanodes().len() == 3).await;
+    let fs = client(nn_addr);
+    assert_eq!(read(&fs, "/data/after.bin").await, after);
+    assert_eq!(read(&fs, "/data/big.bin").await, big);
+    nn.crash().await;
+}
