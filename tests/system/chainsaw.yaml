@@ -35,3 +35,10 @@ spec:
     - podLogs:
         selector: app=pillar-datanode
         tail: 50
+    - podLogs:
+        selector: app.kubernetes.io/name=krb5-kdc
+        tail: 50
+    - podLogs:
+        namespace: krb5-operator
+        selector: app.kubernetes.io/name=krb5-operator
+        tail: 50

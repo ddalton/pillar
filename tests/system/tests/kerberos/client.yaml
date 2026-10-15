@@ -1,0 +1,57 @@
+# The stock Apache Hadoop client with Kerberos: hdfs@PILLAR.TEST's keytab
+# and the realm's krb5.conf from the chart's users Secret (krb5-operator).
+# The NameNode's principal comes from the host the client connects to
+# (nn/_HOST -> nn/pillar-namenode.<namespace>.svc.cluster.local).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hadoop-client-conf
+data:
+  core-site.xml: |
+    <?xml version="1.0"?>
+    <configuration>
+      <property><name>fs.defaultFS</name><value>hdfs://pillar-namenode:9000</value></property>
+      <property><name>hadoop.security.authentication</name><value>kerberos</value></property>
+      <property><name>hadoop.rpc.protection</name><value>privacy</value></property>
+    </configuration>
+  hdfs-site.xml: |
+    <?xml version="1.0"?>
+    <configuration>
+      <property><name>dfs.blocksize</name><value>1048576</value></property>
+      <property><name>dfs.replication</name><value>3</value></property>
+      <property><name>dfs.namenode.kerberos.principal</name><value>nn/_HOST@PILLAR.TEST</value></property>
+      <property><name>dfs.datanode.kerberos.principal</name><value>dn/_HOST@PILLAR.TEST</value></property>
+      <property><name>dfs.block.access.token.enable</name><value>true</value></property>
+    </configuration>
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hadoop-client
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+  - name: client
+    image: apache/hadoop:3.3.6
+    command: [sleep, infinity]
+    env:
+    - name: KRB5_CONFIG
+      value: /krb5/krb5.conf
+    - name: HADOOP_OPTS
+      value: -Djava.security.krb5.conf=/krb5/krb5.conf
+    volumeMounts:
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/core-site.xml
+      subPath: core-site.xml
+    - name: conf
+      mountPath: /opt/hadoop/etc/hadoop/hdfs-site.xml
+      subPath: hdfs-site.xml
+    - name: krb5
+      mountPath: /krb5
+  volumes:
+  - name: conf
+    configMap:
+      name: hadoop-client-conf
+  - name: krb5
+    secret:
+      secretName: pillar-users-keytab

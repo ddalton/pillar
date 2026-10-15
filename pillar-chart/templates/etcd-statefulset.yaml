@@ -64,9 +64,9 @@ spec:
         - name: ETCD_LISTEN_PEER_URLS
           value: "http://0.0.0.0:2380"
         - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
-          value: "http://$(ETCD_NAME).{{ include "pillar.fullname" . }}-etcd.{{ .Release.Namespace }}.svc.cluster.local:2380"
+          value: "http://$(ETCD_NAME).{{ include "pillar.fullname" . }}-etcd.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:2380"
         - name: ETCD_ADVERTISE_CLIENT_URLS
-          value: "http://$(ETCD_NAME).{{ include "pillar.fullname" . }}-etcd.{{ .Release.Namespace }}.svc.cluster.local:2379"
+          value: "http://$(ETCD_NAME).{{ include "pillar.fullname" . }}-etcd.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:2379"
         - name: ETCD_AUTO_COMPACTION_RETENTION
           value: {{ .Values.etcd.autoCompactionRetention | default "1" | quote }}
         - name: ETCD_SNAPSHOT_COUNT

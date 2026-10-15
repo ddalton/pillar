@@ -9,10 +9,13 @@
 #   2. creates a kind cluster (1 control plane + 2 workers) and loads those
 #      images plus the Hadoop client image into it, so no pod pulls a
 #      Pillar image from anywhere else (the manifests say pullPolicy Never);
-#   3. runs chainsaw over tests/ (TESTS=tests/<name> for one test).
+#   3. installs krb5-operator (KRB5_OPERATOR_VERSION, from its release
+#      manifests and ghcr images) for the tests with Kerberos;
+#   4. runs chainsaw over tests/ (TESTS=tests/<name> for one test).
 #
 # Env: CLUSTER (pillar-chainsaw)  BUILD (1)  KEEP (0; 1 = leave the cluster)
 #      KIND_NODE_IMAGE (kindest/node:v1.34.0)  TESTS (tests)
+#      KRB5_OPERATOR_VERSION (0.2.0)
 #      REPORT_DIR (unset; set = write a JUnit report there)
 # Uses a PRIVATE kubeconfig: never touches ~/.kube/config.
 set -euo pipefail
@@ -24,6 +27,7 @@ BUILD="${BUILD:-1}"
 KEEP="${KEEP:-0}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.34.0}"
 HADOOP_IMAGE=apache/hadoop:3.3.6
+KRB5_OPERATOR_VERSION="${KRB5_OPERATOR_VERSION:-0.2.0}"
 export KUBECONFIG="${KUBECONFIG_PRIVATE:-$(mktemp -d)/kubeconfig}"
 
 step() { printf '\n▶ %s\n' "$*" >&2; }
@@ -68,6 +72,11 @@ nodes:
 KIND
 step "load images into the cluster"
 kind load docker-image --name "$CLUSTER" pillar/namenode:system-test pillar/datanode:system-test "$HADOOP_IMAGE"
+
+step "krb5-operator $KRB5_OPERATOR_VERSION"
+ops="https://raw.githubusercontent.com/ddalton/krb5-operator/v$KRB5_OPERATOR_VERSION/deploy"
+kubectl apply --server-side -f "$ops/crds.yaml" -f "$ops/operator.yaml"
+kubectl -n krb5-operator rollout status deploy/krb5-operator --timeout=5m
 
 TESTS="${TESTS:-tests}"
 step "chainsaw: $TESTS"
