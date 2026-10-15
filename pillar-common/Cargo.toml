@@ -18,7 +18,7 @@ pillar-proto = { path = "../pillar-proto" }
 prost = { workspace = true }
 async-trait = { workspace = true }
 # Kerberos (SASL GSSAPI) for Hadoop IPC, and per-call for gRPC
-krb5 = "0.5"
+krb5 = "0.12"
 tonic = { workspace = true }
 tower = { workspace = true }
 http = "1"
