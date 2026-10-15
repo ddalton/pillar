@@ -38,6 +38,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        {{- if .Values.security.kerberos.enabled }}
+        - name: KRB5_CONFIG
+          value: /etc/security/keytabs/krb5.conf
+        {{- end }}
         envFrom:
         # Inject common HDFS configuration
         - configMapRef:
@@ -61,6 +65,17 @@ spec:
         - --transport=auto
         - --rdma-port={{ .Values.datanode.rdma.port }}
         {{- end }}
+        {{- include "pillar.securityArgs" . | nindent 8 }}
+        {{- with .Values.security.dataTransferProtection }}
+        - --data-transfer-protection={{ . }}
+        {{- end }}
+        {{- if .Values.security.kerberos.enabled }}
+        # Each pod's own keytab (<pod>.keytab), read from the Secret's
+        # directory so the key of a pod added by a scale-up reaches it.
+        - --kerberos-keytab=/etc/security/keytabs/$(POD_NAME).keytab
+        - --kerberos-principal=dn/$(POD_NAME).{{ include "pillar.fullname" . }}-datanode.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}@{{ include "pillar.realm" . }}
+        - --namenode-principal={{ include "pillar.namenodePrincipal" . }}
+        {{- end }}
         ports:
         - name: rpc
           containerPort: {{ .Values.datanode.rpcPort }}
@@ -79,6 +94,11 @@ spec:
         volumeMounts:
         - name: storage
           mountPath: /mnt/pillar-data
+        {{- if .Values.security.kerberos.enabled }}
+        - name: keytabs
+          mountPath: /etc/security/keytabs
+          readOnly: true
+        {{- end }}
         resources:
           {{- toYaml .Values.datanode.resources | nindent 10 }}
         # The data port: the DataNode serves no separate RPC port yet, so a
@@ -93,6 +113,12 @@ spec:
             port: data
           initialDelaySeconds: 10
           periodSeconds: 5
+      {{- if .Values.security.kerberos.enabled }}
+      volumes:
+      - name: keytabs
+        secret:
+          secretName: {{ include "pillar.datanodeKeytabSecret" . }}
+      {{- end }}
   volumeClaimTemplates:
   - metadata:
       name: storage

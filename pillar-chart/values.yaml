@@ -223,12 +223,54 @@ service:
     dataPort: 50010
     httpPort: 50075
 
+## The cluster's DNS domain: pods' and Services' names end in
+## <namespace>.svc.<clusterDomain>, and Kerberos principals are named after
+## them.
+clusterDomain: cluster.local
+
 ## Security Configuration
 security:
-  # Kerberos authentication
+  # Kerberos authentication (hadoop.security.authentication=kerberos): the
+  # NameNode is nn/<fullname>-namenode.<namespace>.svc.<clusterDomain>, the
+  # name Hadoop clients derive from nn/_HOST@<realm> for the NameNode's
+  # Service; each DataNode is dn/<pod>.<fullname>-datanode.<namespace>.svc.<clusterDomain>,
+  # which the NameNode accepts as dn/_HOST@<realm>. Block access tokens are on.
   kerberos:
     enabled: false
-    # realm: "EXAMPLE.COM"
-    # kdcServer: "kdc.example.com"
-    # principal: "hdfs/_HOST@EXAMPLE.COM"
-    # keytabPath: "/etc/security/keytabs/hdfs.keytab"
+    # The realm (EXAMPLE.COM).
+    realm: ""
+
+    # Keytabs from krb5-operator (github.com/ddalton/krb5-operator): the
+    # chart creates a KerberosPrincipal for the NameNode, one with a host
+    # principal per DataNode pod (following datanode.replicas), and one for
+    # `users`. The operator must be installed.
+    operator:
+      enabled: true
+      # Run a KDC for this release: a KerberosRealm named <fullname> for
+      # `realm`. Otherwise use the KerberosRealm `realmRef` (its `realm`
+      # must be `realm` above) in `realmNamespace` (default: this one).
+      createRealm: false
+      realmRef: ""
+      realmNamespace: ""
+      # Users' principals (<user>@<realm>), keytab in Secret
+      # <fullname>-users-keytab (`krb5.keytab`, `krb5.conf`).
+      users: [hdfs]
+      # Delete or Retain the principals when the release is uninstalled.
+      deletionPolicy: Delete
+
+    # Without the operator: Secrets laid out as the operator's are.
+    # The NameNode's holds `krb5.keytab` (nn/<NameNode host>) and
+    # `krb5.conf`; the DataNodes' holds `<pod>.keytab` for each pod (its
+    # dn/<pod host>) and `krb5.conf`.
+    namenodeSecret: ""
+    datanodeSecret: ""
+
+  # Protection of Hadoop IPC with Kerberos or tokens (hadoop.rpc.protection):
+  # authentication, integrity, privacy (comma separated for several).
+  rpcProtection: ""
+  # Encrypt block data between clients and DataNodes and between DataNodes
+  # (dfs.encrypt.data.transfer).
+  encryptDataTransfer: false
+  # SASL on DataNodes' data port with block tokens
+  # (dfs.data.transfer.protection): authentication, integrity, privacy.
+  dataTransferProtection: ""

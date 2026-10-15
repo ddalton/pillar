@@ -1,0 +1,77 @@
+{{- if and .Values.security.kerberos.enabled .Values.security.kerberos.operator.enabled }}
+{{- $op := .Values.security.kerberos.operator }}
+{{- $fullname := include "pillar.fullname" . }}
+{{- $realmRef := $op.realmRef }}
+{{- if $op.createRealm }}
+{{- $realmRef = $fullname }}
+# A KDC for this release (krb5-operator).
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosRealm
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  realm: {{ include "pillar.realm" . }}
+---
+{{- else if not $realmRef }}
+{{- fail "security.kerberos.operator: set createRealm, or realmRef to an existing KerberosRealm" }}
+{{- end }}
+# The NameNode's principal, named after its Service.
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosPrincipal
+metadata:
+  name: {{ $fullname }}-namenode
+  labels:
+    app: {{ include "pillar.name" . }}-namenode
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  realmRef: {{ $realmRef }}
+  {{- with $op.realmNamespace }}
+  realmNamespace: {{ . }}
+  {{- end }}
+  principals:
+  - nn/{{ include "pillar.namenodeHost" . }}
+  secretName: {{ include "pillar.namenodeKeytabSecret" . }}
+  deletionPolicy: {{ $op.deletionPolicy }}
+---
+# dn/<pod FQDN> for each DataNode pod: <pod>.keytab in the Secret.
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosPrincipal
+metadata:
+  name: {{ $fullname }}-datanode
+  labels:
+    app: {{ include "pillar.name" . }}-datanode
+    {{- include "pillar.labels" . | nindent 4 }}
+spec:
+  realmRef: {{ $realmRef }}
+  {{- with $op.realmNamespace }}
+  realmNamespace: {{ . }}
+  {{- end }}
+  hostPrincipals:
+    statefulSet: {{ $fullname }}-datanode
+    services: [dn]
+  secretName: {{ include "pillar.datanodeKeytabSecret" . }}
+  deletionPolicy: {{ $op.deletionPolicy }}
+{{- with $op.users }}
+---
+# Users' principals, for clients.
+apiVersion: krb5.ddalton.dev/v1alpha1
+kind: KerberosPrincipal
+metadata:
+  name: {{ $fullname }}-users
+  labels:
+    {{- include "pillar.labels" $ | nindent 4 }}
+spec:
+  realmRef: {{ $realmRef }}
+  {{- with $op.realmNamespace }}
+  realmNamespace: {{ . }}
+  {{- end }}
+  principals:
+  {{- range . }}
+  - {{ . }}
+  {{- end }}
+  secretName: {{ $fullname }}-users-keytab
+  deletionPolicy: {{ $op.deletionPolicy }}
+{{- end }}
+{{- end }}

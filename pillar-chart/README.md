@@ -100,6 +100,61 @@ datanode:
       cpu: 1000m
 ```
 
+## Kerberos
+
+With `security.kerberos.enabled`, the NameNode and the DataNodes
+authenticate with Kerberos, Hadoop clients need a ticket, and DataNodes
+check block access tokens. The keytabs come from
+[krb5-operator](https://github.com/ddalton/krb5-operator) (0.2.0 or later),
+which must be installed:
+
+```bash
+kubectl apply --server-side \
+  -f https://raw.githubusercontent.com/ddalton/krb5-operator/v0.2.0/deploy/crds.yaml \
+  -f https://raw.githubusercontent.com/ddalton/krb5-operator/v0.2.0/deploy/operator.yaml
+
+# A KDC for this release (a KerberosRealm), Kerberos everywhere, private RPC
+# and encrypted block data.
+helm install pillar pillar-chart/ \
+  --set security.kerberos.enabled=true \
+  --set security.kerberos.realm=EXAMPLE.COM \
+  --set security.kerberos.operator.createRealm=true \
+  --set security.rpcProtection=privacy \
+  --set security.encryptDataTransfer=true
+```
+
+To use a realm the operator already runs, set
+`security.kerberos.operator.realmRef` (and `realmNamespace` if it is in
+another namespace; the realm must allow this one) instead of `createRealm`.
+
+The chart creates these `KerberosPrincipal`s:
+
+| Principal | Secret (keys) | Used by |
+|-----------|---------------|---------|
+| `nn/<release>-namenode.<namespace>.svc.<clusterDomain>` | `<release>-namenode-keytab` (`krb5.keytab`, `krb5.conf`) | the NameNode |
+| `dn/<pod>.<release>-datanode.<namespace>.svc.<clusterDomain>`, one per DataNode pod, following `datanode.replicas` and scaling | `<release>-datanode-keytab` (`<pod>.keytab`, `krb5.keytab`, `krb5.conf`) | each DataNode, with its own `<pod>.keytab` |
+| `<user>` for each of `security.kerberos.operator.users` (default `hdfs`) | `<release>-users-keytab` (`krb5.keytab`, `krb5.conf`) | clients |
+
+The NameNode is named after its Service because Hadoop clients derive its
+principal from the host they connect to. Clients set:
+
+```xml
+<property><name>hadoop.security.authentication</name><value>kerberos</value></property>
+<property><name>dfs.namenode.kerberos.principal</name><value>nn/_HOST@EXAMPLE.COM</value></property>
+<!-- with security.rpcProtection -->
+<property><name>hadoop.rpc.protection</name><value>privacy</value></property>
+```
+
+and log in from the users' keytab:
+
+```bash
+KRB5_CONFIG=/krb5/krb5.conf kinit -k -t /krb5/krb5.keytab hdfs@EXAMPLE.COM
+```
+
+Without the operator, put keytabs laid out the same way in Secrets and set
+`security.kerberos.operator.enabled=false`,
+`security.kerberos.namenodeSecret` and `security.kerberos.datanodeSecret`.
+
 ## Usage
 
 ### Applications Access HDFS Directly

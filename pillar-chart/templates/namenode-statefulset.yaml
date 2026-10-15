@@ -44,6 +44,10 @@ spec:
         # Etcd endpoints for HA metadata storage
         - name: ETCD_ENDPOINTS
           value: {{ include "pillar.etcdEndpoints" . | quote }}
+        {{- if .Values.security.kerberos.enabled }}
+        - name: KRB5_CONFIG
+          value: /etc/security/keytabs/krb5.conf
+        {{- end }}
         envFrom:
         - configMapRef:
             name: {{ include "pillar.fullname" . }}-common-config
@@ -59,9 +63,20 @@ spec:
         {{- if gt (int .Values.namenode.replicas) 1 }}
         - --ha-enabled=true
         {{- end }}
+        {{- include "pillar.securityArgs" . | nindent 8 }}
+        {{- if .Values.security.kerberos.enabled }}
+        - --kerberos-keytab=/etc/security/keytabs/krb5.keytab
+        - --kerberos-principal={{ include "pillar.namenodePrincipal" . }}
+        - --datanode-principal=dn/_HOST@{{ include "pillar.realm" . }}
+        {{- end }}
         volumeMounts:
         - name: data
           mountPath: /var/lib/pillar/name
+        {{- if .Values.security.kerberos.enabled }}
+        - name: keytabs
+          mountPath: /etc/security/keytabs
+          readOnly: true
+        {{- end }}
         ports:
         - name: rpc
           containerPort: {{ .Values.namenode.rpcPort }}
@@ -81,10 +96,17 @@ spec:
             port: rpc
           initialDelaySeconds: 10
           periodSeconds: 5
-      {{- if not .Values.namenode.persistence.enabled }}
+      {{- if or (not .Values.namenode.persistence.enabled) .Values.security.kerberos.enabled }}
       volumes:
+      {{- end }}
+      {{- if not .Values.namenode.persistence.enabled }}
       - name: data
         emptyDir: {}
+      {{- end }}
+      {{- if .Values.security.kerberos.enabled }}
+      - name: keytabs
+        secret:
+          secretName: {{ include "pillar.namenodeKeytabSecret" . }}
       {{- end }}
   {{- if .Values.namenode.persistence.enabled }}
   volumeClaimTemplates:

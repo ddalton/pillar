@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/v0.2.15/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: kerberos
+spec:
+  description: >-
+    The Helm chart with Kerberos from krb5-operator (kind.sh installs it):
+    a KDC for the release, the NameNode's keytab, a keytab per DataNode pod
+    and a user's. DataNodes join only with their dn/ principal, the stock
+    Hadoop client needs a ticket, RPC is private and data transfer
+    encrypted. A DataNode added by a scale-up gets its own principal and
+    joins.
+  steps:
+  - name: install
+    try:
+    - script:
+        timeout: 9m
+        content: |
+          set -eu
+          helm install pillar ../../../../pillar-chart --namespace "$NAMESPACE" \
+            --set namenode.image.repository=pillar/namenode --set namenode.image.tag=system-test \
+            --set namenode.image.pullPolicy=Never --set namenode.persistence.size=1Gi \
+            --set datanode.image.repository=pillar/datanode --set datanode.image.tag=system-test \
+            --set datanode.image.pullPolicy=Never \
+            --set namenode.resources.requests.cpu=100m --set namenode.resources.requests.memory=256Mi \
+            --set datanode.resources.requests.cpu=100m --set datanode.resources.requests.memory=256Mi \
+            --set security.kerberos.enabled=true --set security.kerberos.realm=PILLAR.TEST \
+            --set security.kerberos.operator.createRealm=true \
+            --set security.rpcProtection=privacy --set security.encryptDataTransfer=true \
+            --wait --timeout 8m
+    - apply:
+        file: client.yaml
+    - assert:
+        file: ../../common/assert-ready.yaml
+    - script:
+        content: bash ../../common/wait-for-datanodes.sh
+    cleanup:
+    - script:
+        content: helm uninstall pillar --namespace "$NAMESPACE" --wait || true
+  - name: datanodes-authenticate
+    try:
+    - script:
+        content: |
+          set -eu
+          for i in 0 1 2; do
+            kubectl -n "$NAMESPACE" logs "pillar-datanode-$i" |
+              grep -F "authenticated as dn/pillar-datanode-$i.pillar-datanode.$NAMESPACE.svc.cluster.local@PILLAR.TEST (to nn/pillar-namenode.$NAMESPACE.svc.cluster.local@PILLAR.TEST)"
+          done
+  - name: client
+    try:
+    - script:
+        timeout: 5m
+        content: |
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          # Without a ticket the NameNode refuses the client.
+          if timeout 120 hdfs dfs -ls / 2>/tmp/err; then echo "FAIL: listed without a ticket"; exit 1; fi
+          tail -3 /tmp/err
+          kinit -k -t /krb5/krb5.keytab hdfs@PILLAR.TEST
+          klist
+          head -c 2100000 /dev/urandom > /tmp/data.bin
+          hdfs dfs -mkdir -p /secure
+          hdfs dfs -put /tmp/data.bin /secure/data.bin
+          [ "$(hdfs dfs -cat /secure/data.bin | md5sum)" = "$(md5sum < /tmp/data.bin)" ]
+          [ "$(hdfs dfs -stat %u /secure/data.bin)" = hdfs ]
+          echo PASS
+          SCRIPT
+  - name: scale-up
+    try:
+    - script:
+        timeout: 6m
+        content: |
+          set -eu
+          kubectl -n "$NAMESPACE" scale statefulset pillar-datanode --replicas=4
+          kubectl -n "$NAMESPACE" rollout status statefulset pillar-datanode --timeout=5m
+          bash ../../common/wait-for-datanodes.sh 4
+          kubectl -n "$NAMESPACE" get secret pillar-datanode-keytab -o jsonpath='{.data}' | grep -q '"pillar-datanode-3.keytab"'
+          kubectl -n "$NAMESPACE" logs pillar-datanode-3 |
+            grep -F "authenticated as dn/pillar-datanode-3.pillar-datanode.$NAMESPACE.svc.cluster.local@PILLAR.TEST"
+          kubectl -n "$NAMESPACE" exec -i hadoop-client -- bash -s <<'SCRIPT'
+          set -euxo pipefail
+          head -c 1500000 /dev/urandom > /tmp/four.bin
+          hdfs dfs -D dfs.replication=4 -put /tmp/four.bin /secure/four.bin
+          [ "$(hdfs dfs -cat /secure/four.bin | md5sum)" = "$(md5sum < /tmp/four.bin)" ]
+          echo PASS
+          SCRIPT
