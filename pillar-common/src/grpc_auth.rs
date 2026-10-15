@@ -25,7 +25,8 @@
 //! status travels inside it, so it cannot be altered either.
 //!
 //! The NameNode accepts the AP-REQ with its keytab, refuses a token it has
-//! seen before (a replay cache covering the clock-skew window), lets only
+//! seen before (the krb5 crate's replay cache: process-wide, covering the
+//! clock-skew window, as MIT's acceptors do), lets only
 //! DataNode principals (`dn/<any host>@<its realm>` by default) call, and
 //! only at a protection level it allows. The DataNode checks every reply,
 //! so it only takes commands from the real NameNode.
@@ -34,8 +35,7 @@
 //! in the background ([`KerberosClient::spawn_refresher`]), renewing it
 //! before it expires, so no call waits on the KDC.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -43,7 +43,6 @@ use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http_body_util::BodyExt;
 use krb5::token::{ContextKey, PerMessageTokens};
-use sha1::{Digest, Sha1};
 use tonic::body::BoxBody;
 use tonic::server::NamedService;
 use tracing::{info, warn};
@@ -185,15 +184,12 @@ fn decode_reply(mut p: &[u8]) -> Result<(Bytes, http::HeaderMap), String> {
 #[derive(Debug, Clone)]
 pub struct KerberosCaller(pub String);
 
-/// The NameNode side: who may call, at which protection, and the tokens
-/// already used.
+/// The NameNode side: who may call, and at which protection.
 pub struct KerberosAcceptor {
     server: KerberosServer,
     /// The service a caller's principal must have (`dn`), in our realm.
     caller_service: String,
     protection: Protection,
-    /// AP-REQ digests seen, with when they may be forgotten.
-    seen: Mutex<HashMap<[u8; 20], i64>>,
 }
 
 /// An accepted AP-REQ.
@@ -216,7 +212,7 @@ impl KerberosAcceptor {
         if service.is_empty() || realm != server.realm {
             return Err(invalid(format!("callers {} must be <service>/_HOST@{}", callers, server.realm)));
         }
-        Ok(Self { caller_service: service.to_string(), server, protection, seen: Mutex::new(HashMap::new()) })
+        Ok(Self { caller_service: service.to_string(), server, protection })
     }
 
     /// Authenticate one request's AP-REQ.
@@ -236,15 +232,7 @@ impl KerberosAcceptor {
         if !allowed {
             return Err(format!("{} is not a {} principal of {}", principal, self.caller_service, self.server.realm));
         }
-        // An authenticator is good for the skew window either side of now;
-        // remember each token that long, so none is accepted twice.
-        let digest: [u8; 20] = Sha1::digest(&token).into();
-        let t = now();
-        let mut seen = self.seen.lock().unwrap();
-        seen.retain(|_, until| *until > t);
-        if seen.insert(digest, t + 2 * MAX_SKEW_SECS + 1).is_some() {
-            return Err(format!("replayed Kerberos authenticator from {}", principal));
-        }
+        // A replayed AP-REQ was refused above, by the crate's replay cache.
         Ok(Accepted { principal, ap_rep: b64().encode(ap_rep), context })
     }
 }
@@ -555,7 +543,7 @@ mod tests {
             context.step(&b64().decode(accepted.ap_rep).unwrap()).unwrap();
             // The same AP-REQ a second time (captured and replayed).
             let e = nn.accept(Some(&token)).err().unwrap();
-            assert!(e.contains("replayed"), "{e}");
+            assert!(e.contains("replay"), "{e}");
         }
     }
 
