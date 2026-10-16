@@ -355,7 +355,7 @@ pub struct KerberosClient {
     client: krb5::Principal,
     service: krb5::Principal,
     keytab: krb5::Keytab,
-    kdc: krb5::KdcClient,
+    kdc: krb5::AsyncKdcClient,
     ticket: RwLock<Option<krb5::Credentials>>,
     qop: Qop,
 }
@@ -375,15 +375,16 @@ impl KerberosClient {
         let conf = krb5::Krb5Conf::load_default().map_err(|e| invalid(format!("krb5.conf: {}", e)))?;
         let kdc = krb5::KdcClient::from_config(&conf, &client.realm)
             .map_err(|e| invalid(format!("KDCs of {}: {}", client.realm, e)))?;
+        let kdc = krb5::AsyncKdcClient::new(kdc);
         let qop = protection.levels().iter().copied().max().unwrap_or(Qop::Authentication);
         Ok(Self { client, service, keytab, kdc, ticket: RwLock::new(None), qop })
     }
 
-    /// Log in and get a fresh ticket for the service (talks to the KDC:
-    /// blocking). Returns the ticket's end time.
-    pub fn refresh(&self) -> Result<i64, String> {
-        let tgt = self.kdc.login_with_keytab(&self.client, &self.keytab).map_err(|e| format!("login as {}: {}", self.client, e))?;
-        let ticket = self.kdc.service_ticket(&tgt, &self.service).map_err(|e| format!("ticket for {}: {}", self.service, e))?;
+    /// Log in and get a fresh ticket for the service from the KDC.
+    /// Returns the ticket's end time.
+    pub async fn refresh(&self) -> Result<i64, String> {
+        let tgt = self.kdc.login_with_keytab(&self.client, &self.keytab).await.map_err(|e| format!("login as {}: {}", self.client, e))?;
+        let ticket = self.kdc.service_ticket(&tgt, &self.service).await.map_err(|e| format!("ticket for {}: {}", self.service, e))?;
         let end = ticket.endtime;
         *self.ticket.write().unwrap() = Some(ticket);
         Ok(end)
@@ -394,18 +395,13 @@ impl KerberosClient {
     pub fn spawn_refresher(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let this = self.clone();
-                let wait = match tokio::task::spawn_blocking(move || this.refresh()).await {
-                    Ok(Ok(end)) => {
+                let wait = match self.refresh().await {
+                    Ok(end) => {
                         info!("Kerberos: {} has a ticket for {} until {}", self.client, self.service, end);
                         Duration::from_secs((end - now() - 600).max(30) as u64)
                     }
-                    Ok(Err(e)) => {
-                        warn!("Kerberos: {}", e);
-                        Duration::from_secs(30)
-                    }
                     Err(e) => {
-                        warn!("Kerberos ticket refresh panicked: {}", e);
+                        warn!("Kerberos: {}", e);
                         Duration::from_secs(30)
                     }
                 };
@@ -526,7 +522,8 @@ mod tests {
 
     fn client(dir: &std::path::Path, keytab: &str, principal: &str) -> KerberosClient {
         let c = KerberosClient::new(&dir.join(keytab), principal, "nn/localhost@PILLAR.TEST", &Protection::default()).unwrap();
-        c.refresh().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(c.refresh()).unwrap();
         c
     }
 
